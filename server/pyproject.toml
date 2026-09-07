@@ -1,0 +1,9 @@
+[project]
+name = "sheetmind-server"
+version = "2.0.0"
+description = "FastAPI server and analysis runtime for SheetMind"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

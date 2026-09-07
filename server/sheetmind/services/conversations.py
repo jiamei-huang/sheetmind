@@ -1,0 +1,83 @@
+"""
+对话历史管理服务
+"""
+import uuid
+from datetime import datetime
+from typing import List, Dict, Optional
+from sheetmind.database import get_db_connection
+
+
+class ConversationService:
+    """对话历史服务"""
+
+    def add_message(self, task_id: str, role: str, content: str) -> str:
+        """
+        添加对话消息
+        Args:
+            task_id: 任务ID
+            role: 角色 ("user" 或 "assistant")
+            content: 消息内容
+        Returns:
+            conversation_id
+        """
+        conversation_id = str(uuid.uuid4())
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                "INSERT INTO conversations (conversation_id, task_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, task_id, role, content, datetime.now())
+            )
+            conn.commit()
+            return conversation_id
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+
+    def get_conversation_history(self, task_id: str, limit: int = 50) -> List[Dict[str, str]]:
+        """
+        获取对话历史
+        Args:
+            task_id: 任务ID
+            limit: 返回的最大消息数
+        Returns:
+            对话历史列表 [{"role": "user/assistant", "content": "...", "createdAt": "..."}]
+        """
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                "SELECT role, content, created_at FROM conversations WHERE task_id = ? ORDER BY created_at ASC LIMIT ?",
+                (task_id, limit)
+            )
+            rows = cursor.fetchall()
+
+            return [
+                {
+                    "role": row[0],
+                    "content": row[1],
+                    "createdAt": row[2].isoformat() if row[2] and hasattr(row[2], 'isoformat') else (str(row[2]) if row[2] else None)
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+    def clear_conversation(self, task_id: str) -> bool:
+        """清空对话历史"""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("DELETE FROM conversations WHERE task_id = ?", (task_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()

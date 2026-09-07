@@ -1,0 +1,557 @@
+"""
+SheetMind analysis orchestrator.
+
+SheetMindAgent.run(ctx, query, emitter?) is the single entry point for
+one analysis query.  It:
+  1. Emits SSE progress events via the optional emitter
+  2. Executes the skill pipeline (routing → sheet selection → execution → assemble)
+  3. Appends the turn to AnalysisContext.conversation
+  4. Records a Trace
+  5. Returns ResultBlocks.
+"""
+from __future__ import annotations
+
+import logging
+import math
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+from .context import (
+    AnalysisContext,
+    ChartBlock,
+    ColumnMeta,
+    MultiTurnMode,
+    ResultBlocks,
+    RoutingHint,
+    SummaryBlock,
+    TableBlock,
+)
+from .harness.repair_loop import RepairLoop
+from .models.router import ModelRouter
+from .skills.chart_planning import ChartPlanningSkill
+from .skills.code_generation import CodeGenerationSkill
+from .skills.data_profiling import DataProfilingSkill
+from .skills.insight_writing import InsightWritingSkill
+from .skills.routing_classification import RoutingClassificationSkill
+from .skills.semantic_typing import SemanticTypingSkill
+from .skills.sheet_selection import SheetSelectionSkill
+from .streaming.emitter import StreamEmitter
+from .tools.dataframe_loader import DataframeLoaderTool
+from .tools.python_executor import PythonExecutorTool
+from .tools.rule_engine import RuleEngineTool
+from .tracing.storage import get_trace_store
+from .tracing.trace import EVT_ERROR, EVT_RESULT_ASSEMBLED, EVT_ROUTING, Trace
+from .validators.result_validator import ResultValidationError, validate_result
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Chart keyword detection (same bank as ChartPlanningSkill)
+# ---------------------------------------------------------------------------
+_CHART_KWS = [
+    "图", "图表", "折线图", "柱状图", "饼图", "bar", "line", "pie",
+    "chart", "plot", "可视化", "visualization", "图形", "趋势图",
+]
+
+# Maximum rows in TableBlock.rows returned to frontend
+_MAX_TABLE_ROWS = 1000
+
+
+class SheetMindAgent:
+    """
+    Top-level orchestrator for one SheetMind analysis run.
+
+    One instance is safe to reuse across multiple requests (stateless itself;
+    all state lives in AnalysisContext).
+
+    Args:
+        model_router — ModelRouter instance (optional; defaults to singleton
+                       built from DEFAULT_CONFIGS + env overrides)
+    """
+
+    def __init__(self, model_router: Optional[ModelRouter] = None) -> None:
+        self.router = model_router or ModelRouter()
+        self.trace_store = get_trace_store()
+
+        # Instantiate all skills and tools once (reusable, stateless)
+        self.routing_skill = RoutingClassificationSkill(self.router)
+        self.sheet_skill = SheetSelectionSkill(self.router)
+        self.semantic_skill = SemanticTypingSkill(self.router)
+        self.profiling_skill = DataProfilingSkill(self.router)
+        self.code_gen_skill = CodeGenerationSkill(self.router)
+        self.chart_skill = ChartPlanningSkill(self.router)
+        self.insight_skill = InsightWritingSkill(self.router)
+
+        self.df_loader = DataframeLoaderTool()
+        self.rule_engine = RuleEngineTool()
+        self.executor = PythonExecutorTool()
+
+        self.repair_loop = RepairLoop(self.code_gen_skill, self.executor)
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    async def run(
+        self,
+        ctx: AnalysisContext,
+        query: str,
+        emitter: Optional[StreamEmitter] = None,
+    ) -> ResultBlocks:
+        """
+        Run one analysis turn.
+
+        Args:
+            ctx     — AnalysisContext (updated in-place with the new turn)
+            query   — user's natural-language question
+            emitter — optional SSE emitter; if provided, streams progress events
+
+        Returns:
+            ResultBlocks (native result protocol).
+        """
+        trace = Trace(
+            session_trace_id=ctx.trace_id,
+            project_id=ctx.project_id,
+            task_id=ctx.task_id,
+            query=query,
+        )
+
+        try:
+            if emitter:
+                await emitter.emit_thinking()
+
+            result, routing_hint, multiturn_mode = await self._run_pipeline(
+                ctx, query, trace, emitter
+            )
+
+            trace.add_event(
+                EVT_RESULT_ASSEMBLED,
+                output_summary=f"blocks={len(result.blocks)} has_table={result.has_table} has_chart={result.has_chart}",
+            )
+            trace.routing_hint = routing_hint.value if routing_hint else None
+            trace.multiturn_mode = multiturn_mode.value if multiturn_mode else None
+
+            # Persist turn in conversation history
+            ctx.add_user_turn(query)
+            ctx.add_assistant_turn(
+                summary=self._extract_summary(result),
+                result=result,
+                routing_hint=routing_hint,
+                multiturn_mode=multiturn_mode,
+            )
+
+            trace.finish(success=True)
+            self.trace_store.save(trace)
+            logger.info(trace.summary_line())
+
+            if emitter:
+                await emitter.emit_done(result.model_dump())
+
+            return result
+
+        except Exception as exc:
+            logger.exception("SheetMindAgent.run failed for task=%s: %s", ctx.task_id, exc)
+            trace.add_event(EVT_ERROR, error=str(exc))
+            trace.finish(success=False, error=str(exc))
+            self.trace_store.save(trace)
+
+            if emitter:
+                await emitter.emit_error()
+
+            raise
+
+    # ------------------------------------------------------------------
+    # Analysis pipeline
+    # ------------------------------------------------------------------
+
+    async def _run_pipeline(
+        self,
+        ctx: AnalysisContext,
+        query: str,
+        trace: Trace,
+        emitter: Optional[StreamEmitter],
+    ) -> tuple:  # (ResultBlocks, Optional[RoutingHint], Optional[MultiTurnMode])
+        """
+        Execute the full skill pipeline:
+          1. RoutingClassificationSkill → RoutingHint + MultiTurnMode
+          2. SheetSelectionSkill → selected_files
+          3. DataframeLoaderTool → df
+          4. SemanticTypingSkill → field_map
+          5. DataProfilingSkill  → data_summary
+          6a. RULE_ENGINE → RuleEngineTool → result_df
+          6b. CODE_GEN   → RepairLoop (CodeGen + PythonExecutor) → result_df
+          6c. TEXT_ONLY  → skip execution
+          7. ChartPlanningSkill → chart_block (if wants_chart)
+          8. InsightWritingSkill → summary_text
+          9. Assemble + validate ResultBlocks
+        """
+        # ----------------------------------------------------------------
+        # 1. Routing classification
+        # ----------------------------------------------------------------
+        if emitter:
+            await emitter.emit_progress("正在理解您的问题...")
+
+        routing = await self.routing_skill.run(ctx, query)
+        hint: RoutingHint = routing.hint
+        mode: MultiTurnMode = routing.mode
+        is_compound: bool = routing.is_compound
+        wants_chart = hint != RoutingHint.TEXT_ONLY and self._query_wants_chart(query)
+
+        trace.add_event(
+            EVT_ROUTING,
+            output_summary=(
+                f"hint={hint.value} mode={mode.value} conf={routing.confidence:.2f}"
+                + (" compound=True" if is_compound else "")
+            ),
+            metadata={"reasoning": routing.reasoning},
+        )
+        logger.debug("[Pipeline] routing=%s mode=%s", hint.value, mode.value)
+
+        previous_result_df = self._previous_result_dataframe(ctx)
+        if (
+            mode == MultiTurnMode.FOLLOW_UP
+            and wants_chart
+            and self._query_targets_previous_result(query)
+            and previous_result_df is not None
+            and not previous_result_df.empty
+        ):
+            return await self._run_previous_result_chart(
+                ctx=ctx,
+                query=query,
+                previous_result_df=previous_result_df,
+                hint=hint,
+                mode=mode,
+                emitter=emitter,
+            )
+
+        # ----------------------------------------------------------------
+        # 2. Sheet selection
+        # ----------------------------------------------------------------
+        selected_files: List[Dict[str, Any]] = []
+        df: Optional[pd.DataFrame] = None
+        can_reuse_followup_df = mode == MultiTurnMode.FOLLOW_UP and ctx._active_df is not None
+        should_try_load_data = hint != RoutingHint.TEXT_ONLY or can_reuse_followup_df or ctx.active_result is None
+
+        if should_try_load_data and not can_reuse_followup_df:
+            if emitter:
+                await emitter.emit_progress("正在选择数据文件...")
+
+            try:
+                selected_files = await self.sheet_skill.run(ctx, query)
+            except Exception as exc:
+                logger.warning("[Pipeline] sheet selection failed: %s", exc)
+                # Text-only questions can still be answered from conversation if
+                # data selection is unavailable. Data/code paths should surface
+                # the selection error because they cannot execute without rows.
+                if hint == RoutingHint.TEXT_ONLY:
+                    selected_files = []
+                elif not ctx.files:
+                    hint = RoutingHint.TEXT_ONLY
+                else:
+                    raise
+
+        # ----------------------------------------------------------------
+        # 3. DataFrame loading
+        # ----------------------------------------------------------------
+        if should_try_load_data and (selected_files or can_reuse_followup_df):
+            if emitter:
+                await emitter.emit_progress("正在加载数据...")
+
+            df = self.df_loader.run(
+                ctx,
+                selected_files=selected_files,
+                multiturn_mode=mode,
+            )
+
+        # ----------------------------------------------------------------
+        # 4 & 5. Semantic typing + data profiling
+        # ----------------------------------------------------------------
+        field_map = None
+        data_summary = ""
+
+        if df is not None and not df.empty:
+            field_map = await self.semantic_skill.run(ctx, query, df=df)
+            data_summary = await self.profiling_skill.run(ctx, query, df=df, field_map=field_map)
+
+        # ----------------------------------------------------------------
+        # 6. Execution branch
+        # ----------------------------------------------------------------
+        result_df: Optional[pd.DataFrame] = None
+        final_code: str = ""
+        if hint == RoutingHint.RULE_ENGINE and df is not None:
+            if emitter:
+                await emitter.emit_progress("正在筛选数据...")
+            try:
+                result_df = self.rule_engine.run(ctx, query=query, df=df)
+            except Exception as exc:
+                logger.warning("[Pipeline] rule engine failed, falling back to CODE_GEN: %s", exc)
+                # Fall through to CODE_GEN
+                hint = RoutingHint.CODE_GEN
+
+        if hint == RoutingHint.CODE_GEN and df is not None:
+            if emitter:
+                emit_fn = emitter.emit_progress if emitter else None
+            else:
+                emit_fn = None
+
+            result_df, final_code, repairs = await self.repair_loop.run(
+                ctx=ctx,
+                query=query,
+                df=df,
+                data_summary=data_summary,
+                field_map=field_map,
+                wants_chart=wants_chart,
+                is_compound=is_compound,
+                trace=trace,
+                emit_progress=emit_fn,
+            )
+
+            if result_df is None:
+                # All repair attempts exhausted — surface a clean error
+                error_msg = (
+                    "数据查询执行失败，请尝试换一种方式描述您的问题，"
+                    "或检查列名是否正确。"
+                )
+                logger.warning("[Pipeline] repair loop exhausted for task=%s", ctx.task_id)
+                result = ResultBlocks(blocks=[SummaryBlock(content=error_msg)])
+                return result, hint, mode
+
+        # TEXT_ONLY: result_df stays None — we go straight to insight writing
+        if result_df is not None:
+            self._remember_result_dataframe(ctx, input_df=df, result_df=result_df)
+
+        # ----------------------------------------------------------------
+        # 7. Chart planning (only when execution produced data)
+        # ----------------------------------------------------------------
+        chart_block: Optional[ChartBlock] = None
+
+        if wants_chart and result_df is not None and not result_df.empty:
+            if emitter:
+                await emitter.emit_progress("正在生成图表...")
+            chart_block = await self.chart_skill.run(ctx, query, result_df=result_df)
+
+        # ----------------------------------------------------------------
+        # 8. Insight writing
+        # ----------------------------------------------------------------
+        if emitter:
+            await emitter.emit_progress("正在生成分析洞察...")
+
+        if hint == RoutingHint.TEXT_ONLY:
+            scenario = "text_insight"
+        elif chart_block is not None:
+            scenario = "chart"
+        else:
+            scenario = "processing"
+
+        table_block: Optional[TableBlock] = (
+            self._build_table_block(result_df) if result_df is not None else None
+        )
+
+        insight_df = result_df
+        if insight_df is None and hint == RoutingHint.TEXT_ONLY:
+            if df is not None:
+                insight_df = df
+            elif ctx._result_df is not None:
+                insight_df = ctx._result_df
+            else:
+                insight_df = ctx._active_df
+
+        summary_text = await self.insight_skill.run(
+            ctx,
+            query,
+            scenario=scenario,
+            result_df=insight_df,
+            chart_block=chart_block,
+            table_block=table_block,
+        )
+
+        # ----------------------------------------------------------------
+        # 9. Assemble ResultBlocks
+        # ----------------------------------------------------------------
+        blocks: List[Any] = []
+
+        # Summary always first
+        if summary_text:
+            blocks.append(SummaryBlock(content=summary_text))
+
+        # Table
+        if table_block is not None:
+            blocks.append(table_block)
+
+        # Chart
+        if chart_block is not None:
+            blocks.append(chart_block)
+
+        result = ResultBlocks(blocks=blocks)
+
+        # Validate — catch fatal schema errors, log warnings for soft issues
+        try:
+            validate_result(result)
+        except ResultValidationError as exc:
+            logger.warning("[Pipeline] validation error (returning anyway): %s", exc)
+
+        return result, hint, mode
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _query_wants_chart(query: str) -> bool:
+        """Return True if the query contains chart/visualization keywords."""
+        q_lower = query.lower()
+        return any(kw in q_lower for kw in _CHART_KWS)
+
+    @staticmethod
+    def _query_targets_previous_result(query: str) -> bool:
+        """Return True when the user explicitly wants to reuse the prior result."""
+        q_lower = query.lower()
+        refs = [
+            "上面", "上述", "上方", "前面", "刚才", "上一轮", "上个",
+            "基于", "在此基础", "这个结果", "这些结果", "当前结果",
+            "previous result", "above result", "based on",
+        ]
+        return any(ref in q_lower for ref in refs)
+
+    @staticmethod
+    def _previous_result_dataframe(ctx: AnalysisContext) -> Optional[pd.DataFrame]:
+        """Rebuild the previous tabular result as a DataFrame when available."""
+        if isinstance(ctx._result_df, pd.DataFrame) and not ctx._result_df.empty:
+            return ctx._result_df
+
+        result = ctx.active_result or ctx.last_assistant_result()
+        if result is None:
+            return None
+
+        table = result.first_table()
+        if table is None or not table.rows or not table.columns:
+            return None
+
+        try:
+            return pd.DataFrame(table.rows, columns=table.columns)
+        except Exception:
+            return None
+
+    async def _run_previous_result_chart(
+        self,
+        ctx: AnalysisContext,
+        query: str,
+        previous_result_df: pd.DataFrame,
+        hint: RoutingHint,
+        mode: MultiTurnMode,
+        emitter: Optional[StreamEmitter],
+    ) -> tuple:
+        """Render a chart from the last table result without rerunning codegen."""
+        if emitter:
+            await emitter.emit_progress("正在基于上一次结果生成图表...")
+
+        chart_block = await self.chart_skill.run(ctx, query, result_df=previous_result_df)
+        if chart_block is None:
+            result = ResultBlocks(blocks=[
+                SummaryBlock(content="上一次结果无法直接生成图表，请换一种图表描述。")
+            ])
+            return result, hint, mode
+
+        if emitter:
+            await emitter.emit_progress("正在生成分析洞察...")
+
+        summary_text = await self.insight_skill.run(
+            ctx,
+            query,
+            scenario="chart",
+            result_df=previous_result_df,
+            chart_block=chart_block,
+            table_block=None,
+        )
+
+        blocks: List[Any] = []
+        if summary_text:
+            blocks.append(SummaryBlock(content=summary_text))
+        blocks.append(chart_block)
+
+        result = ResultBlocks(blocks=blocks)
+        try:
+            validate_result(result)
+        except ResultValidationError as exc:
+            logger.warning("[Pipeline] previous-result chart validation error: %s", exc)
+        return result, hint, mode
+
+    @staticmethod
+    def _remember_result_dataframe(
+        ctx: AnalysisContext,
+        input_df: Optional[pd.DataFrame],
+        result_df: pd.DataFrame,
+    ) -> None:
+        """
+        Keep the last result available without losing the richer source rows.
+
+        If an operation returned the same columns as the input (typical filters,
+        sorting, and pass-through queries), the result becomes the active working
+        DataFrame for follow-up refinement. Aggregations and Top-N outputs are
+        stored as `_result_df` but do not replace `_active_df`, so later turns can
+        still ask for deeper breakdowns using the original rows.
+        """
+        ctx._result_df = result_df
+
+        if input_df is None:
+            ctx._active_df = result_df
+            return
+
+        if list(result_df.columns) == list(input_df.columns):
+            ctx._active_df = result_df
+
+    @staticmethod
+    def _build_table_block(df: pd.DataFrame) -> Optional[TableBlock]:
+        """Convert a result DataFrame into a TableBlock."""
+        if df is None or df.empty:
+            return None
+
+        # Truncate large results for frontend
+        display_df = df.head(_MAX_TABLE_ROWS)
+
+        columns = list(display_df.columns)
+        rows: List[Dict[str, Any]] = []
+        for _, row in display_df.iterrows():
+            row_dict: Dict[str, Any] = {}
+            for col in columns:
+                val = row[col]
+                # Convert numpy/pandas scalars to Python native types
+                if pd.isna(val) if not isinstance(val, (list, dict)) else False:
+                    row_dict[col] = None
+                elif hasattr(val, "item"):
+                    # numpy scalar → Python native
+                    row_dict[col] = val.item()
+                else:
+                    row_dict[col] = val
+            rows.append(row_dict)
+
+        # Build column metadata
+        col_meta: List[ColumnMeta] = []
+        for col in columns:
+            if pd.api.types.is_numeric_dtype(display_df[col]):
+                ctype = "numeric"
+                # Detect decimal places for floats
+                decimal_places = None
+                if pd.api.types.is_float_dtype(display_df[col]):
+                    decimal_places = 2
+                col_meta.append(ColumnMeta(
+                    name=col, type=ctype, decimal_places=decimal_places
+                ))
+            elif pd.api.types.is_datetime64_any_dtype(display_df[col]):
+                col_meta.append(ColumnMeta(name=col, type="datetime"))
+            else:
+                col_meta.append(ColumnMeta(name=col, type="categorical"))
+
+        return TableBlock(
+            columns=columns,
+            rows=rows,
+            total_rows=len(df),
+            columns_metadata=col_meta,
+        )
+
+    @staticmethod
+    def _extract_summary(result: ResultBlocks) -> str:
+        """Extract the first summary block's content for Turn.content."""
+        summaries = result.all_summaries()
+        return summaries[0] if summaries else ""

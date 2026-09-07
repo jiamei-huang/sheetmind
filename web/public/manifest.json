@@ -1,0 +1,15 @@
+{
+  "short_name": "SheetMind",
+  "name": "SheetMind Data Analysis",
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#111827",
+  "background_color": "#ffffff"
+}

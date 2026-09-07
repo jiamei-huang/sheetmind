@@ -1,0 +1,921 @@
+{
+  "_meta": {
+    "version": "2.0",
+    "created": "2026-08-19",
+    "updated": "2026-08-19",
+    "total": 40,
+    "description": "Synthetic eval cases for SheetMind. Each case defines an input query, expected routing hint, expected result shape, and pass criteria.",
+    "routing_values": {
+      "rule": "Deterministic filter/sort via rule engine — no LLM code generation",
+      "code": "LLM generates pandas code or chart params — aggregation, complex condition, pivot, chart",
+      "text": "Pure LLM text insight — no code execution at all"
+    },
+    "multiturn_mode_values": {
+      "new": "First question or unrelated new topic — load fresh from file",
+      "follow_up": "Refine/continue from active_result — use previous result df",
+      "reset": "User explicitly asks to start over — reload original file"
+    },
+    "categories": {
+      "INT": "Routing classification",
+      "DP": "Data processing",
+      "VIZ": "Visualization",
+      "MT": "Multi-turn",
+      "ERR": "Error handling / edge cases"
+    }
+  },
+  "cases": [
+    {
+      "id": "INT-001",
+      "category": "INT",
+      "description": "Simple date filter → rule",
+      "query": "筛选2024年10月的订单",
+      "schema": {
+        "columns": ["订单ID", "日期", "金额", "状态"],
+        "sample_rows": [
+          {"订单ID": "ORD-001", "日期": "2024-10-15", "金额": 1000, "状态": "已完成"},
+          {"订单ID": "ORD-002", "日期": "2024-09-01", "金额": 500, "状态": "待处理"}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.type == 'data'",
+        "result.data.rows.length > 0",
+        "all rows have '2024-10' in date field"
+      ]
+    },
+    {
+      "id": "INT-002",
+      "category": "INT",
+      "description": "Chart request → code",
+      "query": "按月份生成销售额折线图",
+      "schema": {
+        "columns": ["月份", "销售额"],
+        "sample_rows": [
+          {"月份": "2024-01", "销售额": 50000},
+          {"月份": "2024-02", "销售额": 62000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "result.type == 'chart'",
+        "result.chart.type == 'line'",
+        "result.chart.labels.length > 0",
+        "result.chart.series[0].name includes '销售'"
+      ]
+    },
+    {
+      "id": "INT-003",
+      "category": "INT",
+      "description": "Ambiguous open-ended analysis → text",
+      "query": "帮我分析一下这批数据有什么问题",
+      "schema": {
+        "columns": ["产品", "销量", "退货率"],
+        "sample_rows": [
+          {"产品": "A", "销量": 100, "退货率": 0.45},
+          {"产品": "B", "销量": 200, "退货率": 0.02}
+        ]
+      },
+      "expected_routing": "text",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "insight_only",
+      "pass_criteria": [
+        "result.type == 'insight_only'",
+        "result.suggestion.length > 50"
+      ]
+    },
+    {
+      "id": "INT-004",
+      "category": "INT",
+      "description": "Combined filter + chart → code (chart keyword wins)",
+      "query": "筛选华东区域的数据，并生成各产品销售额柱状图",
+      "schema": {
+        "columns": ["区域", "产品", "销售额"],
+        "sample_rows": [
+          {"区域": "华东", "产品": "A", "销售额": 1000},
+          {"区域": "华南", "产品": "B", "销售额": 2000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "both",
+      "pass_criteria": [
+        "result.type == 'both'",
+        "result.data != null",
+        "result.chart != null",
+        "result.chart.type == 'bar'"
+      ]
+    },
+    {
+      "id": "INT-005",
+      "category": "INT",
+      "description": "Sort-only request → rule",
+      "query": "生成一个Excel导出，按销售额降序排列",
+      "schema": {
+        "columns": ["产品", "销售额", "利润"],
+        "sample_rows": [
+          {"产品": "A", "销售额": 1000, "利润": 200}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.type == 'data'",
+        "result.data.rows sorted descending by 销售额"
+      ]
+    },
+    {
+      "id": "DP-001",
+      "category": "DP",
+      "description": "Date filter — year+month format",
+      "query": "筛选2024年10月的数据",
+      "schema": {
+        "columns": ["日期", "销售额"],
+        "sample_rows": [
+          {"日期": "2024-10-01", "销售额": 5000},
+          {"日期": "2024-10-15", "销售额": 3000},
+          {"日期": "2024-09-30", "销售额": 2000},
+          {"日期": "2024-11-01", "销售额": 4000}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.rows.length == 2",
+        "all rows have date in 2024-10"
+      ]
+    },
+    {
+      "id": "DP-002",
+      "category": "DP",
+      "description": "Date filter — Chinese year/month format",
+      "query": "2025年3月的订单",
+      "schema": {
+        "columns": ["订单时间", "订单金额"],
+        "sample_rows": [
+          {"订单时间": "2025-03-05", "订单金额": 800},
+          {"订单时间": "2025-03-20", "订单金额": 1200},
+          {"订单时间": "2025-02-10", "订单金额": 500}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.rows.length == 2"
+      ]
+    },
+    {
+      "id": "DP-003",
+      "category": "DP",
+      "description": "Numeric aggregation — sum by category (groupby)",
+      "query": "按产品分类统计总销售额",
+      "schema": {
+        "columns": ["产品分类", "SKU", "销售额"],
+        "sample_rows": [
+          {"产品分类": "电子", "SKU": "A1", "销售额": 1000},
+          {"产品分类": "电子", "SKU": "A2", "销售额": 2000},
+          {"产品分类": "服装", "SKU": "B1", "销售额": 500}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.rows.length == 2",
+        "result.data.columns includes '产品分类'",
+        "result.data.columns includes '销售额'",
+        "电子 row 销售额 == 3000"
+      ]
+    },
+    {
+      "id": "DP-004",
+      "category": "DP",
+      "description": "Simple sort descending — rule",
+      "query": "按销售额从高到低排序",
+      "schema": {
+        "columns": ["产品", "销售额"],
+        "sample_rows": [
+          {"产品": "A", "销售额": 500},
+          {"产品": "B", "销售额": 2000},
+          {"产品": "C", "销售额": 1000}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.rows[0] is B (2000)",
+        "result.data.rows[1] is C (1000)",
+        "result.data.rows[2] is A (500)"
+      ]
+    },
+    {
+      "id": "DP-005",
+      "category": "DP",
+      "description": "Simple keyword category filter — rule",
+      "query": "筛选欧洲线下渠道的数据",
+      "schema": {
+        "columns": ["渠道", "销售额", "月份"],
+        "sample_rows": [
+          {"渠道": "欧洲线下", "销售额": 5000, "月份": "2024-10"},
+          {"渠道": "亚洲线上", "销售额": 3000, "月份": "2024-10"},
+          {"渠道": "欧洲线上", "销售额": 2000, "月份": "2024-10"}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.rows.length == 1",
+        "result.data.rows[0].渠道 == '欧洲线下'"
+      ]
+    },
+    {
+      "id": "DP-006",
+      "category": "DP",
+      "description": "Numeric condition filter (大于) — code",
+      "query": "筛选金额大于1000的订单",
+      "schema": {
+        "columns": ["订单ID", "金额"],
+        "sample_rows": [
+          {"订单ID": "A", "金额": 500},
+          {"订单ID": "B", "金额": 1500},
+          {"订单ID": "C", "金额": 2000},
+          {"订单ID": "D", "金额": 800}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.rows.length == 2",
+        "all rows have 金额 > 1000"
+      ]
+    },
+    {
+      "id": "DP-007",
+      "category": "DP",
+      "description": "Top-N query — code",
+      "query": "销售额最高的5个SKU",
+      "schema": {
+        "columns": ["SKU", "销售额"],
+        "sample_rows": [
+          {"SKU": "S1", "销售额": 1000},
+          {"SKU": "S2", "销售额": 5000},
+          {"SKU": "S3", "销售额": 3000},
+          {"SKU": "S4", "销售额": 2000},
+          {"SKU": "S5", "销售额": 4000},
+          {"SKU": "S6", "销售额": 100}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.rows.length == 5",
+        "result.data.rows[0].SKU == 'S2'"
+      ]
+    },
+    {
+      "id": "DP-008",
+      "category": "DP",
+      "description": "Growth rate calculation — code",
+      "query": "计算每月环比增长率",
+      "schema": {
+        "columns": ["月份", "销售额"],
+        "sample_rows": [
+          {"月份": "2024-01", "销售额": 10000},
+          {"月份": "2024-02", "销售额": 12000},
+          {"月份": "2024-03", "销售额": 11000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.columns includes '增长率' or '环比'",
+        "result.data.rows.length == 3 or 2 (first month may have no prior)"
+      ]
+    },
+    {
+      "id": "DP-009",
+      "category": "DP",
+      "description": "Pivot table request — code",
+      "query": "按区域和月份汇总销售额，生成透视表",
+      "schema": {
+        "columns": ["区域", "月份", "销售额"],
+        "sample_rows": [
+          {"区域": "华东", "月份": "2024-01", "销售额": 1000},
+          {"区域": "华东", "月份": "2024-02", "销售额": 2000},
+          {"区域": "华南", "月份": "2024-01", "销售额": 1500}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.columns includes '区域'",
+        "result.data.columns length >= 3 (区域 + 2 months)"
+      ]
+    },
+    {
+      "id": "DP-010",
+      "category": "DP",
+      "description": "Fuzzy column name match — user says 金额 but column is 金额（RMB）",
+      "query": "按地区统计金额",
+      "schema": {
+        "columns": ["地区", "金额（RMB）"],
+        "sample_rows": [
+          {"地区": "北京", "金额（RMB）": 5000},
+          {"地区": "上海", "金额（RMB）": 8000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.columns includes '金额（RMB）'",
+        "no KeyError in execution",
+        "sum is correct"
+      ]
+    },
+    {
+      "id": "VIZ-001",
+      "category": "VIZ",
+      "description": "Monthly sales line chart — code",
+      "query": "生成2024年每月销售额趋势图",
+      "schema": {
+        "columns": ["月份", "销售额"],
+        "sample_rows": [
+          {"月份": "2024-01", "销售额": 50000},
+          {"月份": "2024-02", "销售额": 62000},
+          {"月份": "2024-03", "销售额": 58000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "result.type == 'chart'",
+        "result.chart.type == 'line'",
+        "result.chart.labels.length == 3",
+        "result.chart.series[0].values.length == 3"
+      ]
+    },
+    {
+      "id": "VIZ-002",
+      "category": "VIZ",
+      "description": "Pie chart for category share — code",
+      "query": "各产品类别的销售额占比饼图",
+      "schema": {
+        "columns": ["产品类别", "销售额"],
+        "sample_rows": [
+          {"产品类别": "电子", "销售额": 40000},
+          {"产品类别": "服装", "销售额": 30000},
+          {"产品类别": "食品", "销售额": 15000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "result.chart.type == 'pie'",
+        "result.chart.labels.length == 3",
+        "result.chart.series[0].values sum ~= 85000"
+      ]
+    },
+    {
+      "id": "VIZ-003",
+      "category": "VIZ",
+      "description": "Bar chart — SKU comparison — code",
+      "query": "各SKU销量对比柱状图",
+      "schema": {
+        "columns": ["SKU", "销量"],
+        "sample_rows": [
+          {"SKU": "A1", "销量": 1000},
+          {"SKU": "B2", "销量": 2000},
+          {"SKU": "C3", "销量": 500}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "result.chart.type == 'bar'",
+        "result.chart.labels length == 3"
+      ]
+    },
+    {
+      "id": "VIZ-004",
+      "category": "VIZ",
+      "description": "Multi-series line chart — code",
+      "query": "按渠道分别展示月度销售额趋势",
+      "schema": {
+        "columns": ["月份", "渠道", "销售额"],
+        "sample_rows": [
+          {"月份": "2024-01", "渠道": "线上", "销售额": 30000},
+          {"月份": "2024-01", "渠道": "线下", "销售额": 20000},
+          {"月份": "2024-02", "渠道": "线上", "销售额": 35000},
+          {"月份": "2024-02", "渠道": "线下", "销售额": 18000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "result.chart.series.length == 2",
+        "result.chart.series[*].name includes '线上' and '线下'"
+      ]
+    },
+    {
+      "id": "VIZ-005",
+      "category": "VIZ",
+      "description": "Chart insight should reference max/min values — code",
+      "query": "各地区销售额柱状图",
+      "schema": {
+        "columns": ["地区", "销售额"],
+        "sample_rows": [
+          {"地区": "华东", "销售额": 80000},
+          {"地区": "华南", "销售额": 50000},
+          {"地区": "华北", "销售额": 120000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "result.suggestion contains '华北' or '120000'",
+        "result.suggestion contains 'Insight' or '最高'"
+      ]
+    },
+    {
+      "id": "MT-001",
+      "category": "MT",
+      "description": "Multi-turn: follow-up chart on previous filter result — code + follow_up",
+      "turn": 2,
+      "previous_turn": {
+        "query": "筛选2024年10月的订单",
+        "result_type": "data",
+        "result_rows": 50
+      },
+      "query": "在这些结果上生成按产品的销售额柱状图",
+      "schema": {
+        "columns": ["产品", "销售额", "订单日期"],
+        "sample_rows": []
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "follow_up",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "uses_previous_filtered_rows = true",
+        "chart row count <= 50",
+        "not re-loading from original file"
+      ]
+    },
+    {
+      "id": "MT-002",
+      "category": "MT",
+      "description": "Multi-turn: further numeric condition filter on previous result — code + follow_up",
+      "turn": 2,
+      "previous_turn": {
+        "query": "筛选华东区域数据",
+        "result_type": "data",
+        "result_rows": 100
+      },
+      "query": "继续筛选金额大于5000的",
+      "schema": {
+        "columns": ["区域", "金额"],
+        "sample_rows": []
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "follow_up",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "uses_previous_filtered_rows = true",
+        "result count < 100",
+        "all rows 区域 == '华东'"
+      ]
+    },
+    {
+      "id": "MT-003",
+      "category": "MT",
+      "description": "Multi-turn: explicit reset then chart — code + reset",
+      "turn": 3,
+      "previous_turn": {
+        "query": "筛选2024年10月",
+        "result_type": "data",
+        "result_rows": 30
+      },
+      "query": "回到全部数据，按月份查看趋势",
+      "schema": {
+        "columns": ["月份", "销售额"],
+        "sample_rows": []
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "reset",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "uses_original_data = true (not cached filtered data)",
+        "result.chart.labels.length > 1"
+      ]
+    },
+    {
+      "id": "MT-004",
+      "category": "MT",
+      "description": "Multi-turn: correct wrong chart field — code + follow_up",
+      "turn": 2,
+      "previous_turn": {
+        "query": "生成销售额趋势图",
+        "result_type": "chart",
+        "y_axis": "订单数量"
+      },
+      "query": "Y轴用错了，应该是销售金额，不是订单数量",
+      "schema": {
+        "columns": ["月份", "订单数量", "销售金额"],
+        "sample_rows": []
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "follow_up",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "result.chart.yAxisLabel == '销售金额' or series name includes '销售金额'",
+        "previous y_axis '订单数量' NOT used"
+      ]
+    },
+    {
+      "id": "MT-005",
+      "category": "MT",
+      "description": "Multi-turn: insight question about previous chart — text + follow_up",
+      "turn": 2,
+      "previous_turn": {
+        "query": "生成月度销售额趋势图",
+        "result_type": "chart"
+      },
+      "query": "这个图表说明了什么问题？有什么异常吗？",
+      "schema": {
+        "columns": ["月份", "销售额"],
+        "sample_rows": []
+      },
+      "expected_routing": "text",
+      "expected_multiturn_mode": "follow_up",
+      "expected_result_type": "insight_only",
+      "pass_criteria": [
+        "result.type == 'insight_only'",
+        "result.suggestion references previous chart context"
+      ]
+    },
+    {
+      "id": "ERR-001",
+      "category": "ERR",
+      "description": "Column referenced in query does not exist — rule (sort), graceful fallback",
+      "query": "按利润率降序排序",
+      "schema": {
+        "columns": ["产品", "销售额", "成本"],
+        "sample_rows": [
+          {"产品": "A", "销售额": 1000, "成本": 700}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result does not crash (500 error)",
+        "result.type == 'data' OR result.type contains error block",
+        "result.suggestion mentions column not found, OR gracefully returns original data"
+      ]
+    },
+    {
+      "id": "ERR-002",
+      "category": "ERR",
+      "description": "Empty dataframe after date filter — rule, empty result",
+      "query": "筛选2099年的数据",
+      "schema": {
+        "columns": ["日期", "销售额"],
+        "sample_rows": [
+          {"日期": "2024-01-01", "销售额": 5000}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "no crash",
+        "result.data.rows.length == 0 OR result has friendly empty message"
+      ]
+    },
+    {
+      "id": "ERR-003",
+      "category": "ERR",
+      "description": "Chart request on non-numeric column — code, graceful fallback",
+      "query": "生成名字的折线图",
+      "schema": {
+        "columns": ["姓名", "地区"],
+        "sample_rows": [
+          {"姓名": "张三", "地区": "北京"},
+          {"姓名": "李四", "地区": "上海"}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "no 500 error",
+        "result.suggestion explains no numeric data OR returns a count-based chart"
+      ]
+    },
+    {
+      "id": "ERR-004",
+      "category": "ERR",
+      "description": "Generated code uses non-existent variable — code, repair loop",
+      "query": "将df1和df2合并然后按日期排序",
+      "schema": {
+        "columns": ["日期", "金额"],
+        "sample_rows": [
+          {"日期": "2024-01-01", "金额": 1000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "no NameError crash",
+        "result returns original df or friendly error message",
+        "repair loop triggered if code generation produces bad code"
+      ]
+    },
+    {
+      "id": "ERR-005",
+      "category": "ERR",
+      "description": "Code execution timeout simulation — code, 30s hard kill",
+      "query": "对每一行执行复杂计算",
+      "schema": {
+        "columns": ["ID", "值"],
+        "sample_rows": [
+          {"ID": 1, "值": 2},
+          {"ID": 2, "值": 4},
+          {"ID": 3, "值": 6},
+          {"ID": 4, "值": 8},
+          {"ID": 5, "值": 10},
+          {"ID": 6, "值": 12},
+          {"ID": 7, "值": 14},
+          {"ID": 8, "值": 16},
+          {"ID": 9, "值": 18},
+          {"ID": 10, "值": 20}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "execution completes within 30 seconds",
+        "no server hang"
+      ]
+    },
+    {
+      "id": "ERR-006",
+      "category": "ERR",
+      "description": "Missing data — all null in target column — code, graceful null handling",
+      "query": "统计每个产品的平均利润",
+      "schema": {
+        "columns": ["产品", "利润"],
+        "sample_rows": [
+          {"产品": "A", "利润": null},
+          {"产品": "B", "利润": null}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "no crash",
+        "result.suggestion or result.data explains null/empty situation"
+      ]
+    },
+    {
+      "id": "DP-011",
+      "category": "DP",
+      "description": "Percentage calculation — column share (占比) — code",
+      "query": "计算各渠道销售额占总销售额的百分比",
+      "schema": {
+        "columns": ["渠道", "销售额"],
+        "sample_rows": [
+          {"渠道": "线上", "销售额": 60000},
+          {"渠道": "线下", "销售额": 40000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.columns includes '%' or '占比' or '百分比'",
+        "line-online row shows ~60%",
+        "values sum to 100%"
+      ]
+    },
+    {
+      "id": "DP-012",
+      "category": "DP",
+      "description": "Remove duplicates — code",
+      "query": "去掉重复的订单，保留最新的一条",
+      "schema": {
+        "columns": ["订单ID", "更新时间", "金额"],
+        "sample_rows": [
+          {"订单ID": "ORD-001", "更新时间": "2024-01-01", "金额": 1000},
+          {"订单ID": "ORD-001", "更新时间": "2024-01-02", "金额": 1100},
+          {"订单ID": "ORD-002", "更新时间": "2024-01-01", "金额": 500}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.rows.length == 2",
+        "ORD-001 kept row has 更新时间 2024-01-02"
+      ]
+    },
+    {
+      "id": "DP-013",
+      "category": "DP",
+      "description": "Add computed column — code",
+      "query": "添加一列利润率，计算公式为（金额-成本）/金额",
+      "schema": {
+        "columns": ["产品", "金额", "成本"],
+        "sample_rows": [
+          {"产品": "A", "金额": 1000, "成本": 700},
+          {"产品": "B", "金额": 2000, "成本": 1200}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.columns includes '利润率'",
+        "A row 利润率 ≈ 0.30",
+        "B row 利润率 ≈ 0.40"
+      ]
+    },
+    {
+      "id": "VIZ-006",
+      "category": "VIZ",
+      "description": "Chart with date-based X axis auto-detected as line — code",
+      "query": "展示过去12个月的收入变化",
+      "schema": {
+        "columns": ["月份", "收入"],
+        "sample_rows": [
+          {"月份": "2023-09", "收入": 45000},
+          {"月份": "2023-10", "收入": 52000},
+          {"月份": "2023-11", "收入": 48000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "result.chart.type == 'line' (date X-axis should default to line)",
+        "result.chart.labels in chronological order"
+      ]
+    },
+    {
+      "id": "VIZ-007",
+      "category": "VIZ",
+      "description": "Chart insight references top performer — code",
+      "query": "各SKU的月均销量柱状图",
+      "schema": {
+        "columns": ["SKU", "月均销量"],
+        "sample_rows": [
+          {"SKU": "SKU-A", "月均销量": 500},
+          {"SKU": "SKU-B", "月均销量": 2000},
+          {"SKU": "SKU-C", "月均销量": 800}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "result.suggestion mentions SKU-B or 2000",
+        "result.chart.labels.length == 3"
+      ]
+    },
+    {
+      "id": "VIZ-008",
+      "category": "VIZ",
+      "description": "Streaming SSE events in the expected order",
+      "query": "生成销售额趋势图",
+      "schema": {
+        "columns": ["月份", "销售额"],
+        "sample_rows": [{"月份": "2024-01", "销售额": 5000}]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "chart",
+      "pass_criteria": [
+        "SSE events emitted: thinking → progress → done",
+        "done event contains result.chart",
+        "no error event"
+      ],
+      "note": "Covered by the streaming emitter tests"
+    },
+    {
+      "id": "INT-006",
+      "category": "INT",
+      "description": "English query — date filter → rule",
+      "query": "Show me orders from January 2024",
+      "schema": {
+        "columns": ["Order Date", "Amount"],
+        "sample_rows": [
+          {"Order Date": "2024-01-15", "Amount": 500},
+          {"Order Date": "2024-02-01", "Amount": 300}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.rows.length == 1",
+        "English column names preserved"
+      ]
+    },
+    {
+      "id": "INT-007",
+      "category": "INT",
+      "description": "Mixed Chinese/English — groupby + chart → code",
+      "query": "按Region分组统计total sales，生成bar chart",
+      "schema": {
+        "columns": ["Region", "Total Sales"],
+        "sample_rows": [
+          {"Region": "Asia", "Total Sales": 50000},
+          {"Region": "Europe", "Total Sales": 30000}
+        ]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "both",
+      "pass_criteria": [
+        "result.type == 'both' OR 'data' with chart",
+        "result.chart.type == 'bar'"
+      ]
+    },
+    {
+      "id": "ERR-007",
+      "category": "ERR",
+      "description": "LLM generates code with forbidden import — code, repair loop catches it",
+      "query": "使用sklearn对数据进行分析",
+      "schema": {
+        "columns": ["feature1", "feature2", "label"],
+        "sample_rows": [{"feature1": 1, "feature2": 2, "label": 0}]
+      },
+      "expected_routing": "code",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "no crash from import error",
+        "repair loop catches forbidden import",
+        "result returns graceful fallback or error message"
+      ]
+    },
+    {
+      "id": "DP-014",
+      "category": "DP",
+      "description": "Show all data with correct numeric totals — rule",
+      "query": "展示所有数据",
+      "schema": {
+        "columns": ["产品", "数量", "单价", "金额"],
+        "sample_rows": [
+          {"产品": "A", "数量": 10, "单价": 100, "金额": 1000},
+          {"产品": "B", "数量": 5, "单价": 200, "金额": 1000}
+        ]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "result.data.totals['金额'] == 2000",
+        "result.data.totals['数量'] == 15",
+        "result.data.totals['产品'] == null (categorical, no total)"
+      ]
+    },
+    {
+      "id": "INT-008",
+      "category": "INT",
+      "description": "Vague 'show me the data' query — rule (pass-through)",
+      "query": "看看数据",
+      "schema": {
+        "columns": ["产品", "销售额"],
+        "sample_rows": [{"产品": "A", "销售额": 1000}]
+      },
+      "expected_routing": "rule",
+      "expected_multiturn_mode": "new",
+      "expected_result_type": "data",
+      "pass_criteria": [
+        "does not crash",
+        "returns some form of data preview"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 任务切换动画 */
+@keyframes task-switch {
+  0% {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-task-switch {
+  animation: task-switch 0.3s ease-out;
+}
+
+/* 项目切换动画（如果需要） */
+@keyframes project-switch {
+  0% {
+    opacity: 0;
+    transform: translateX(30px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-project-switch {
+  animation: project-switch 0.4s ease-out;
+}
