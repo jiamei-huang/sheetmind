@@ -117,9 +117,11 @@ class TestRoutingClassificationSkill:
         result = run(self.skill.run(self.ctx, "前10名销售人员"))
         assert result.hint == RoutingHint.CODE_GEN
 
-    def test_text_only_analysis(self):
+    def test_insight_only_analysis(self):
         result = run(self.skill.run(self.ctx, "分析一下这些数据说明什么"))
-        assert result.hint == RoutingHint.TEXT_ONLY
+        assert result.hint == RoutingHint.INSIGHT_ONLY
+        assert result.facets.needs_new_computation is False
+        assert "explain" in result.facets.operation_types
 
     def test_mode_new_by_default(self):
         result = run(self.skill.run(self.ctx, "筛选2024年10月的订单"))
@@ -150,6 +152,15 @@ class TestRoutingClassificationSkill:
         result = run(self.skill.run(self.ctx, "统计销售额"))
         assert isinstance(result.reasoning, str)
         assert len(result.reasoning) > 0
+
+    def test_secondary_facets_for_chart_aggregation(self):
+        result = run(self.skill.run(self.ctx, "按地区汇总销售额并画柱状图"))
+        assert result.hint == RoutingHint.CODE_GEN
+        assert result.facets.needs_new_computation is True
+        assert result.facets.wants_chart is True
+        assert "aggregate" in result.facets.operation_types
+        assert "chart" in result.facets.operation_types
+        assert "销售额" in result.facets.target_fields
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +601,7 @@ class TestBuildTableBlock:
 # ---------------------------------------------------------------------------
 
 class TestSheetMindAgentPipeline:
-    def test_text_only_loads_dataframe_for_insight_without_table_output(self):
+    def test_insight_only_loads_dataframe_for_insight_without_table_output(self):
         from sheetmind.analysis.agent import SheetMindAgent
         from sheetmind.analysis.tracing.trace import Trace
 
@@ -605,10 +616,10 @@ class TestSheetMindAgentPipeline:
             return "华东销售额更高。"
 
         agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
-            hint=RoutingHint.TEXT_ONLY,
+            hint=RoutingHint.INSIGHT_ONLY,
             mode=MultiTurnMode.NEW_QUERY,
             confidence=0.9,
-            reasoning="text insight",
+            reasoning="insight",
         ))
         agent.sheet_skill.run = AsyncMock(return_value=[
             {"fileName": "sales.xlsx", "sheets": ["Sheet1"]},
@@ -620,10 +631,10 @@ class TestSheetMindAgentPipeline:
 
         result, hint, mode = run(agent._run_pipeline(ctx, "这份数据说明什么", Trace(), None))
 
-        assert hint == RoutingHint.TEXT_ONLY
+        assert hint == RoutingHint.INSIGHT_ONLY
         assert mode == MultiTurnMode.NEW_QUERY
         assert agent.df_loader.run.call_count == 1
-        assert seen["scenario"] == "text_insight"
+        assert seen["scenario"] == "insight_only"
         assert seen["result_df"] is df
         assert result.has_summary
         assert not result.has_table
@@ -789,3 +800,79 @@ class TestDataSourceSelection:
         [df] = DataframeLoaderTool()._load_sheets(blob, "tail.xlsx", ["尾程"])
         assert list(df.columns) == ["月份", "平台", "店铺", "费用金额", "平台.1", "店铺.1"]
         assert df.iloc[0]["平台"] == "速卖通"
+
+
+# ---------------------------------------------------------------------------
+# Enhancement acceptance regressions
+# ---------------------------------------------------------------------------
+
+class TestEnhancementAcceptance:
+    def test_semantic_typing_identifies_period_and_identifier(self):
+        skill = SemanticTypingSkill(MockRouter())
+        df = pd.DataFrame({
+            "月份": ["2025-01", "2025-02"],
+            "订单号": ["000001234567", "000001234568"],
+            "金额": [12.5, 20.0],
+        })
+
+        field_map = run(skill.run(make_ctx(), "按月份汇总金额", df=df))
+
+        assert field_map["月份"].type == "datetime-like"
+        assert field_map["订单号"].type == "identifier"
+        assert field_map["订单号"].should_aggregate is False
+        assert field_map["金额"].should_aggregate is True
+        assert field_map["金额"].confidence > 0.8
+
+    def test_field_resolver_prefers_rmb_qualified_metric(self):
+        from sheetmind.analysis.skills.field_resolution import FieldResolver
+
+        skill = SemanticTypingSkill(MockRouter())
+        df = pd.DataFrame({"金额": [10], "金额（RMB）": [70], "金额（USD）": [5]})
+        field_map = run(skill.run(make_ctx(), "人民币金额是多少", df=df))
+
+        match = FieldResolver().resolve("人民币金额是多少", field_map, aggregate_only=True)
+
+        assert match is not None
+        assert match.column == "金额（RMB）"
+
+    def test_profile_exposes_structured_column_metadata(self):
+        skill = DataProfilingSkill(MockRouter())
+        df = pd.DataFrame({"日期": pd.to_datetime(["2025-01-01", "2025-01-02"]), "销售额": [10, 20]})
+        field_map = run(SemanticTypingSkill(MockRouter()).run(make_ctx(), "销售额", df=df))
+
+        profile = run(skill.run(make_ctx(), "销售额", df=df, field_map=field_map))
+
+        assert isinstance(profile, str)
+        assert profile.row_count == 2
+        assert "销售额" in profile.metric_candidates
+        sales_profile = next(column for column in profile.columns if column.name == "销售额")
+        assert sales_profile.numeric_stats["sum"] == 30.0
+
+    def test_chart_planning_does_not_use_identifier_as_y_axis(self):
+        skill = ChartPlanningSkill(MockRouter())
+        df = pd.DataFrame({"SKU": [10001, 10002, 10003], "地区": ["东", "西", "南"], "销售额": [30, 20, 10]})
+        field_map = run(SemanticTypingSkill(MockRouter()).run(make_ctx(), "按地区画图", df=df))
+
+        chart = run(skill.run(make_ctx(), "按地区画柱状图", result_df=df, field_map=field_map))
+
+        assert chart is not None
+        assert [series.name for series in chart.series] == ["销售额"]
+        assert chart.confidence is not None
+        assert chart.reason
+
+    def test_executor_returns_structured_safety_result(self):
+        executor = PythonExecutorTool()
+        detail = executor.run_detailed(make_ctx(), code="import os\nresult_df = df", df=pd.DataFrame({"A": [1]}))
+
+        assert detail.success is False
+        assert detail.safety_violation is True
+        assert detail.error_type == "safety_violation"
+
+    def test_invalid_chart_degrades_to_table_and_summary(self):
+        table = TableBlock(columns=["A"], rows=[{"A": 1}])
+        invalid_chart = ChartBlock(chart_type="bar", labels=["A", "B"], series=[ChartSeries(name="x", values=[1.0])])
+        result = validate_result(ResultBlocks(blocks=[table, invalid_chart]), degrade_invalid_charts=True)
+
+        assert result.has_table
+        assert result.has_chart is False
+        assert result.has_summary

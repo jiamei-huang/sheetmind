@@ -72,12 +72,12 @@ class TestRoutingEnums:
     def test_routing_hint_values(self):
         assert RoutingHint.RULE_ENGINE.value == "rule"
         assert RoutingHint.CODE_GEN.value == "code"
-        assert RoutingHint.TEXT_ONLY.value == "text"
+        assert RoutingHint.INSIGHT_ONLY.value == "insight"
 
     def test_routing_hint_from_string(self):
         assert RoutingHint("rule") is RoutingHint.RULE_ENGINE
         assert RoutingHint("code") is RoutingHint.CODE_GEN
-        assert RoutingHint("text") is RoutingHint.TEXT_ONLY
+        assert RoutingHint("insight") is RoutingHint.INSIGHT_ONLY
 
     def test_multiturn_mode_values(self):
         assert MultiTurnMode.NEW_QUERY.value == "new"
@@ -341,6 +341,11 @@ class TestStreamEmitter:
         assert self._frame_event(frame) == "progress"
         payload = json.loads(frame.strip()[len("data: "):])
         assert payload["message"] == "正在查询..."
+
+    def test_progress_frame_includes_stable_step_id(self):
+        frame = progress_frame("正在加载数据...", step_id="data_loading")
+        payload = json.loads(frame.strip()[len("data: "):])
+        assert payload["step_id"] == "data_loading"
 
     def test_done_frame_contains_result(self):
         result = {"type": "result_blocks", "blocks": []}

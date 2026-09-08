@@ -43,4 +43,8 @@ Uploads use JSON with base64 file content to preserve the current browser workfl
 
 The response uses Server-Sent Events with `thinking`, `progress`, `repairing`, `done`, and `error` event payloads. The `done.result` field contains native ResultBlocks.
 
+`progress` events include a stable `step_id` when the runtime enters a pipeline stage. Values are `routing`, `sheet_selection`, `data_loading`, `semantic_typing`, `data_profiling`, `execution`, `chart_planning`, `insight_writing`, and `validation`; clients should use the message for display and the ID for state tracking.
+
+Chart blocks may include optional `confidence` and `reason` fields. Invalid chart data is omitted during validation so valid table and summary blocks can still be rendered.
+
 `POST /analysis` executes the same flow and returns ResultBlocks as a normal JSON response.

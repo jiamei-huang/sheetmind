@@ -7,6 +7,7 @@ Design:
 - Rule-based keyword matching is the primary path (cheap, instant).
 - LLM fallback only when confidence < 0.55 (rare ambiguous cases).
 - Multi-turn mode is determined first — it takes priority and can influence routing.
+- Secondary intent facets are returned beside the 3-way execution route.
 
 Routing keywords (from spec §7 + phase-1 inventory):
 
@@ -23,7 +24,7 @@ Routing keywords (from spec §7 + phase-1 inventory):
     transform:        透视 pivot 添加列 新增列 合并 merge 去重 dedup
     top-n:            top 最高 最低 前N 前 名 rank
 
-  TEXT_ONLY (when no data op or chart signals):
+  INSIGHT_ONLY (when no new data op is required):
     open-ended:       分析一下 有什么问题 说明什么 洞察 建议 为什么 什么原因 怎么看
                       什么特点 趋势如何 有没有异常 解读 解释
 
@@ -35,7 +36,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ..context import AnalysisContext, MultiTurnMode, RoutingHint
@@ -87,7 +88,7 @@ _RULE_ONLY_KWS = [
     "ascending", "descending",
 ]
 
-_TEXT_ONLY_KWS = [
+_INSIGHT_ONLY_KWS = [
     "分析一下", "有什么问题", "说明什么", "说明了什么", "洞察", "建议", "为什么",
     "什么原因", "怎么看", "什么特点", "趋势如何", "有没有异常", "有什么异常",
     "解读", "解释", "什么规律", "如何改进",
@@ -111,10 +112,35 @@ _COMPLEX_OVERRIDE_KWS = [
     "透视", "pivot", "图", "chart", "plot", "可视化",
 ]
 
+_FILTER_TRIGGER_KWS = ["筛选", "过滤", "filter", "where", "只看", "只要", "显示", "展示"]
+_SORT_TRIGGER_KWS = ["排序", "sort", "order", "降序", "升序", "从高到低", "从低到高"]
+_AGGREGATE_KWS = [
+    "统计", "汇总", "计算", "sum", "count", "avg", "group", "groupby", "聚合",
+    "总计", "合计", "平均", "均值", "最多", "最高", "最大", "最低",
+]
+_TREND_KWS = ["趋势", "变化", "走势", "波动", "trend", "环比", "同比", "增长率"]
+_COMPARE_KWS = ["对比", "比较", "排名", "各个", "各", "compare", "versus", "vs"]
+_ANOMALY_KWS = ["异常", "问题", "风险", "突增", "突降", "离群", "outlier", "anomaly"]
+_CHART_KWS = [
+    "图", "图表", "折线图", "柱状图", "饼图", "bar", "line", "pie",
+    "chart", "plot", "可视化", "visualization", "图形", "趋势图",
+]
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass
 # ---------------------------------------------------------------------------
+
+@dataclass
+class IntentFacets:
+    """Secondary product intent labels that sit beside the execution route."""
+
+    operation_types: List[str] = field(default_factory=list)
+    needs_new_computation: bool = True
+    wants_chart: bool = False
+    uses_previous_result: bool = False
+    target_fields: List[str] = field(default_factory=list)
+
 
 @dataclass
 class RoutingResult:
@@ -123,6 +149,7 @@ class RoutingResult:
     confidence: float
     reasoning: str
     is_compound: bool = False   # True when query contains multiple independent questions
+    facets: IntentFacets = field(default_factory=IntentFacets)
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +163,7 @@ class RoutingClassificationSkill(Skill):
     """
 
     name = "routing_classification"
-    description = "Classify query into RoutingHint (rule/code/text) + MultiTurnMode (new/follow_up/reset)"
+    description = "Classify query into RoutingHint (rule/code/insight) + MultiTurnMode (new/follow_up/reset)"
 
     # Confidence threshold below which we call the LLM
     LLM_THRESHOLD = 0.55
@@ -170,6 +197,7 @@ class RoutingClassificationSkill(Skill):
 
         # Step 4: detect compound / multi-part queries
         is_compound = self._detect_compound(q)
+        facets = self._build_facets(q, hint, mode)
 
         return RoutingResult(
             hint=hint,
@@ -177,6 +205,7 @@ class RoutingClassificationSkill(Skill):
             confidence=confidence,
             reasoning=reasoning,
             is_compound=is_compound,
+            facets=facets,
         )
 
     # ---------------------------------------------------------------------------
@@ -244,13 +273,13 @@ class RoutingClassificationSkill(Skill):
         action_kws = (
             _CODE_GEN_KWS
             + _RULE_ONLY_KWS
-            + _TEXT_ONLY_KWS
+            + _INSIGHT_ONLY_KWS
             + _DETERMINISTIC_EXTREME_SUBJECT_KWS
         )
         return any(kw in p for kw in action_kws)
 
     # Chart-reference words that appear in both chart-creation and text-insight contexts.
-    # When a TEXT_ONLY signal is present alongside ONLY these words (no real agg/calc),
+    # When an INSIGHT_ONLY signal is present alongside ONLY these words (no real agg/calc),
     # the query is likely asking *about* a chart, not asking to *create* one.
     _CHART_REF_ONLY_KWS = frozenset([
         "图表", "图", "折线图", "柱状图", "饼图", "bar", "line", "pie",
@@ -265,19 +294,19 @@ class RoutingClassificationSkill(Skill):
         """Returns (RoutingHint, confidence, reasoning)."""
         q_lower = query.lower()
 
-        # Check TEXT_ONLY signals BEFORE CODE_GEN when all CODE_GEN hits are
+        # Check INSIGHT_ONLY signals BEFORE CODE_GEN when all CODE_GEN hits are
         # chart-reference words only (no aggregation / calculation signals).
         # This prevents "这个图表说明什么" from being misclassified as CODE_GEN.
-        text_hits = [kw for kw in _TEXT_ONLY_KWS if kw in q_lower]
-        if text_hits:
+        insight_hits = [kw for kw in _INSIGHT_ONLY_KWS if kw in q_lower]
+        if insight_hits:
             code_candidates = [kw for kw in _CODE_GEN_KWS if kw in q_lower]
             non_chart_code = [kw for kw in code_candidates if kw not in self._CHART_REF_ONLY_KWS]
             if not non_chart_code:
-                # TEXT_ONLY wins: no real computation signals, just chart-ref words
+                # INSIGHT_ONLY wins: no real computation signals, just chart-ref words
                 return (
-                    RoutingHint.TEXT_ONLY,
+                    RoutingHint.INSIGHT_ONLY,
                     0.85,
-                    f"TEXT_ONLY signals: {text_hits[:3]} (no agg/calc CODE_GEN signals)",
+                    f"INSIGHT_ONLY signals: {insight_hits[:3]} (no agg/calc CODE_GEN signals)",
                 )
 
         # Deterministic "which category costs/sells the most?" questions are
@@ -305,14 +334,14 @@ class RoutingClassificationSkill(Skill):
                 f"CODE_GEN signals: {matched}" + (" + numeric operator" if has_op else ""),
             )
 
-        # Check TEXT_ONLY signals (open-ended, no data op) — second pass for pure text queries
-        text_hits = [kw for kw in _TEXT_ONLY_KWS if kw in q_lower]
+        # Check INSIGHT_ONLY signals (open-ended, no data op) — second pass for pure insight queries
+        insight_hits = [kw for kw in _INSIGHT_ONLY_KWS if kw in q_lower]
         rule_hits = [kw for kw in _RULE_ONLY_KWS if kw in q_lower]
-        if text_hits and not rule_hits:
+        if insight_hits and not rule_hits:
             return (
-                RoutingHint.TEXT_ONLY,
+                RoutingHint.INSIGHT_ONLY,
                 0.85,
-                f"TEXT_ONLY signals: {text_hits[:3]}",
+                f"INSIGHT_ONLY signals: {insight_hits[:3]}",
             )
 
         # Check RULE_ENGINE signals
@@ -355,11 +384,11 @@ class RoutingClassificationSkill(Skill):
         conv_text = ctx.conversation_text(max_turns=4)
         system = (
             "你是 RoutingClassifier，专门判断数据分析查询的执行路径。\n\n"
-            "只输出 JSON，格式：{\"routing\": \"rule\"|\"code\"|\"text\", \"reasoning\": \"一句话说明\"}\n\n"
+            "只输出 JSON，格式：{\"routing\": \"rule\"|\"code\"|\"insight\", \"reasoning\": \"一句话说明\"}\n\n"
             "routing 含义：\n"
             "  rule  — 简单筛选/排序，无需计算，规则引擎可直接执行\n"
             "  code  — 需要聚合/计算/图表/复杂条件，LLM生成pandas代码执行\n"
-            "  text  — 开放式分析问题，无需执行代码，直接回答文字\n\n"
+            "  insight — 不产生新的结构化计算结果，基于已有结果或数据概况写洞察\n\n"
             "注意：判断执行路径，不判断输出格式。"
         )
 
@@ -382,6 +411,73 @@ class RoutingClassificationSkill(Skill):
             data = json.loads(response)
             hint_str = data.get("routing", rule_hint.value)
             reasoning = data.get("reasoning", "LLM routing")
+            if hint_str == "text":
+                hint_str = RoutingHint.INSIGHT_ONLY.value
             return RoutingHint(hint_str), reasoning
         except Exception:
             return rule_hint, f"LLM parse failed; kept rule result: {response[:80]}"
+
+    # ---------------------------------------------------------------------------
+    # Secondary intent facets
+    # ---------------------------------------------------------------------------
+
+    def _build_facets(
+        self,
+        query: str,
+        hint: RoutingHint,
+        mode: MultiTurnMode,
+    ) -> IntentFacets:
+        q_lower = query.lower()
+        operation_types: List[str] = []
+
+        def add(name: str) -> None:
+            if name not in operation_types:
+                operation_types.append(name)
+
+        if any(kw in q_lower for kw in _FILTER_TRIGGER_KWS):
+            add("filter")
+        if any(kw in q_lower for kw in _SORT_TRIGGER_KWS):
+            add("sort")
+        if (
+            any(kw in q_lower for kw in _AGGREGATE_KWS)
+            or (
+                any(kw in q_lower for kw in _DETERMINISTIC_EXTREME_SUBJECT_KWS)
+                and any(kw in q_lower for kw in _DETERMINISTIC_EXTREME_KWS)
+            )
+        ):
+            add("aggregate")
+        if any(kw in q_lower for kw in _TREND_KWS):
+            add("trend")
+        if any(kw in q_lower for kw in _COMPARE_KWS):
+            add("compare")
+        if any(kw in q_lower for kw in _ANOMALY_KWS):
+            add("anomaly")
+        if any(kw in q_lower for kw in _INSIGHT_ONLY_KWS):
+            add("explain")
+
+        wants_chart = any(kw in q_lower for kw in _CHART_KWS)
+        if wants_chart:
+            add("chart")
+
+        uses_previous = mode == MultiTurnMode.FOLLOW_UP
+        needs_new_computation = hint in (RoutingHint.RULE_ENGINE, RoutingHint.CODE_GEN)
+
+        if not operation_types:
+            add("general")
+
+        return IntentFacets(
+            operation_types=operation_types,
+            needs_new_computation=needs_new_computation,
+            wants_chart=wants_chart,
+            uses_previous_result=uses_previous,
+            target_fields=self._extract_target_fields(query),
+        )
+
+    @staticmethod
+    def _extract_target_fields(query: str) -> List[str]:
+        """Best-effort field mentions for trace/debug use before semantic typing."""
+        candidates = [
+            "金额", "人民币金额", "销售额", "收入", "利润", "数量", "费用", "成本",
+            "地区", "区域", "店铺", "产品", "品类", "SKU", "订单号", "日期", "月份",
+        ]
+        return [field for field in candidates if field.lower() in query.lower()]

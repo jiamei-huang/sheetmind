@@ -21,6 +21,8 @@ test("converts native result blocks into the analysis view model", () => {
           chart_type: "bar",
           labels: ["East"],
           series: [{ name: "Sales", values: [1200] }],
+          confidence: 0.91,
+          reason: "categorical X-axis + numeric metric",
         },
         { kind: "summary", content: "East leads sales." },
       ],
@@ -32,6 +34,8 @@ test("converts native result blocks into the analysis view model", () => {
   assert.equal(result.metrics[0].value, 1200);
   assert.equal(result.preview.totalRowCount, 20);
   assert.equal(result.chartData.defaultType, "bar");
+  assert.equal(result.chartData.confidence, 0.91);
+  assert.match(result.chartData.reason, /numeric metric/);
   assert.equal(result.suggestion, "East leads sales.");
   assert.match(result.runtimeNote, /1.*20/);
 });

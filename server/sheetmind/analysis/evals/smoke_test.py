@@ -14,9 +14,9 @@ SheetMind end-to-end smoke test
   Q2  按地区汇总销售额            → CODE_GEN 聚合
   Q3  Top-N 产品               → CODE_GEN top-n
   Q4  柱状图                   → CODE_GEN + 图表
-  Q5  洞察分析                  → TEXT_ONLY
+  Q5  洞察分析                  → INSIGHT_ONLY
   Q6  继续：月度趋势（Q2之后）     → CODE_GEN + FOLLOW_UP 多轮
-  Q7  图表说明什么（Q4之后）      → TEXT_ONLY + FOLLOW_UP 多轮
+  Q7  图表说明什么（Q4之后）      → INSIGHT_ONLY + FOLLOW_UP 多轮
   Q8  重新看所有数据（多轮后）     → RULE_ENGINE + RESET 多轮
 """
 from __future__ import annotations
@@ -163,11 +163,11 @@ CASES = [
     SmokeCase("Q4", "画一个各地区销售额对比柱状图",
               "CODE_GEN：柱状图", "code", "new"),
     SmokeCase("Q5", "这份销售数据说明了什么问题，有什么值得关注的洞察",
-              "TEXT_ONLY：洞察分析", "text", "new"),
+              "INSIGHT_ONLY：洞察分析", "insight", "new"),
     SmokeCase("Q6", "继续，展示华东地区的月度销售趋势折线图",
               "CODE_GEN + FOLLOW_UP：月度趋势（接Q2）", "code", "follow_up"),
     SmokeCase("Q7", "这个图表说明了什么，有什么异常吗",
-              "TEXT_ONLY + FOLLOW_UP：图表洞察（接Q4/Q6）", "text", "follow_up"),
+              "INSIGHT_ONLY + FOLLOW_UP：图表洞察（接Q4/Q6）", "insight", "follow_up"),
     SmokeCase("Q8", "重新看所有完整数据",
               "RULE_ENGINE + RESET：回到全量数据", "rule", "reset"),
 ]

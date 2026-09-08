@@ -21,6 +21,7 @@ from .context import (
     AnalysisContext,
     ChartBlock,
     ColumnMeta,
+    ExecutionPlan,
     MultiTurnMode,
     ResultBlocks,
     RoutingHint,
@@ -181,7 +182,7 @@ class SheetMindAgent:
           5. DataProfilingSkill  → data_summary
           6a. RULE_ENGINE → RuleEngineTool → result_df
           6b. CODE_GEN   → RepairLoop (CodeGen + PythonExecutor) → result_df
-          6c. TEXT_ONLY  → skip execution
+          6c. INSIGHT_ONLY → skip new structured execution
           7. ChartPlanningSkill → chart_block (if wants_chart)
           8. InsightWritingSkill → summary_text
           9. Assemble + validate ResultBlocks
@@ -190,13 +191,26 @@ class SheetMindAgent:
         # 1. Routing classification
         # ----------------------------------------------------------------
         if emitter:
-            await emitter.emit_progress("正在理解您的问题...")
+            await emitter.emit_progress("正在理解您的问题...", step_id="routing")
 
         routing = await self.routing_skill.run(ctx, query)
         hint: RoutingHint = routing.hint
         mode: MultiTurnMode = routing.mode
         is_compound: bool = routing.is_compound
-        wants_chart = hint != RoutingHint.TEXT_ONLY and self._query_wants_chart(query)
+        wants_chart = hint != RoutingHint.INSIGHT_ONLY and (
+            routing.facets.wants_chart or self._query_wants_chart(query)
+        )
+        execution_plan = ExecutionPlan(
+            route=hint,
+            mode=mode,
+            operation_types=routing.facets.operation_types,
+            needs_new_computation=routing.facets.needs_new_computation,
+            wants_chart=wants_chart,
+            uses_previous_result=routing.facets.uses_previous_result,
+            target_fields=routing.facets.target_fields,
+            confidence=routing.confidence,
+        )
+        ctx.execution_plan = execution_plan
 
         trace.add_event(
             EVT_ROUTING,
@@ -204,7 +218,17 @@ class SheetMindAgent:
                 f"hint={hint.value} mode={mode.value} conf={routing.confidence:.2f}"
                 + (" compound=True" if is_compound else "")
             ),
-            metadata={"reasoning": routing.reasoning},
+            metadata={
+                "reasoning": routing.reasoning,
+                "facets": {
+                    "operation_types": routing.facets.operation_types,
+                    "needs_new_computation": routing.facets.needs_new_computation,
+                    "wants_chart": routing.facets.wants_chart,
+                    "uses_previous_result": routing.facets.uses_previous_result,
+                    "target_fields": routing.facets.target_fields,
+                },
+                "execution_plan": execution_plan.model_dump(mode="json"),
+            },
         )
         logger.debug("[Pipeline] routing=%s mode=%s", hint.value, mode.value)
 
@@ -231,23 +255,24 @@ class SheetMindAgent:
         selected_files: List[Dict[str, Any]] = []
         df: Optional[pd.DataFrame] = None
         can_reuse_followup_df = mode == MultiTurnMode.FOLLOW_UP and ctx._active_df is not None
-        should_try_load_data = hint != RoutingHint.TEXT_ONLY or can_reuse_followup_df or ctx.active_result is None
+        should_try_load_data = hint != RoutingHint.INSIGHT_ONLY or can_reuse_followup_df or ctx.active_result is None
 
         if should_try_load_data and not can_reuse_followup_df:
             if emitter:
-                await emitter.emit_progress("正在选择数据文件...")
+                await emitter.emit_progress("正在选择数据文件...", step_id="sheet_selection")
 
             try:
                 selected_files = await self.sheet_skill.run(ctx, query)
+                execution_plan.target_sheets = list(ctx.selected_sheets)
             except Exception as exc:
                 logger.warning("[Pipeline] sheet selection failed: %s", exc)
                 # Text-only questions can still be answered from conversation if
                 # data selection is unavailable. Data/code paths should surface
                 # the selection error because they cannot execute without rows.
-                if hint == RoutingHint.TEXT_ONLY:
+                if hint == RoutingHint.INSIGHT_ONLY:
                     selected_files = []
                 elif not ctx.files:
-                    hint = RoutingHint.TEXT_ONLY
+                    hint = RoutingHint.INSIGHT_ONLY
                 else:
                     raise
 
@@ -256,7 +281,7 @@ class SheetMindAgent:
         # ----------------------------------------------------------------
         if should_try_load_data and (selected_files or can_reuse_followup_df):
             if emitter:
-                await emitter.emit_progress("正在加载数据...")
+                await emitter.emit_progress("正在加载数据...", step_id="data_loading")
 
             df = self.df_loader.run(
                 ctx,
@@ -271,7 +296,11 @@ class SheetMindAgent:
         data_summary = ""
 
         if df is not None and not df.empty:
+            if emitter:
+                await emitter.emit_progress("正在识别字段类型...", step_id="semantic_typing")
             field_map = await self.semantic_skill.run(ctx, query, df=df)
+            if emitter:
+                await emitter.emit_progress("正在生成数据画像...", step_id="data_profiling")
             data_summary = await self.profiling_skill.run(ctx, query, df=df, field_map=field_map)
 
         # ----------------------------------------------------------------
@@ -281,9 +310,9 @@ class SheetMindAgent:
         final_code: str = ""
         if hint == RoutingHint.RULE_ENGINE and df is not None:
             if emitter:
-                await emitter.emit_progress("正在筛选数据...")
+                await emitter.emit_progress("正在筛选数据...", step_id="execution")
             try:
-                result_df = self.rule_engine.run(ctx, query=query, df=df)
+                result_df = self.rule_engine.run(ctx, query=query, df=df, field_map=field_map)
             except Exception as exc:
                 logger.warning("[Pipeline] rule engine failed, falling back to CODE_GEN: %s", exc)
                 # Fall through to CODE_GEN
@@ -291,7 +320,8 @@ class SheetMindAgent:
 
         if hint == RoutingHint.CODE_GEN and df is not None:
             if emitter:
-                emit_fn = emitter.emit_progress if emitter else None
+                async def emit_fn(message: str) -> None:
+                    await emitter.emit_progress(message, step_id="execution")
             else:
                 emit_fn = None
 
@@ -317,7 +347,7 @@ class SheetMindAgent:
                 result = ResultBlocks(blocks=[SummaryBlock(content=error_msg)])
                 return result, hint, mode
 
-        # TEXT_ONLY: result_df stays None — we go straight to insight writing
+        # INSIGHT_ONLY: result_df stays None — we go straight to insight writing
         if result_df is not None:
             self._remember_result_dataframe(ctx, input_df=df, result_df=result_df)
 
@@ -328,17 +358,23 @@ class SheetMindAgent:
 
         if wants_chart and result_df is not None and not result_df.empty:
             if emitter:
-                await emitter.emit_progress("正在生成图表...")
-            chart_block = await self.chart_skill.run(ctx, query, result_df=result_df)
+                await emitter.emit_progress("正在生成图表...", step_id="chart_planning")
+            result_field_map = await self.semantic_skill.run(ctx, query, df=result_df)
+            chart_block = await self.chart_skill.run(
+                ctx,
+                query,
+                result_df=result_df,
+                field_map=result_field_map,
+            )
 
         # ----------------------------------------------------------------
         # 8. Insight writing
         # ----------------------------------------------------------------
         if emitter:
-            await emitter.emit_progress("正在生成分析洞察...")
+            await emitter.emit_progress("正在生成分析洞察...", step_id="insight_writing")
 
-        if hint == RoutingHint.TEXT_ONLY:
-            scenario = "text_insight"
+        if hint == RoutingHint.INSIGHT_ONLY:
+            scenario = "insight_only"
         elif chart_block is not None:
             scenario = "chart"
         else:
@@ -349,7 +385,7 @@ class SheetMindAgent:
         )
 
         insight_df = result_df
-        if insight_df is None and hint == RoutingHint.TEXT_ONLY:
+        if insight_df is None and hint == RoutingHint.INSIGHT_ONLY:
             if df is not None:
                 insight_df = df
             elif ctx._result_df is not None:
@@ -385,11 +421,9 @@ class SheetMindAgent:
 
         result = ResultBlocks(blocks=blocks)
 
-        # Validate — catch fatal schema errors, log warnings for soft issues
-        try:
-            validate_result(result)
-        except ResultValidationError as exc:
-            logger.warning("[Pipeline] validation error (returning anyway): %s", exc)
+        if emitter:
+            await emitter.emit_progress("正在校验结果...", step_id="validation")
+        result = validate_result(result, degrade_invalid_charts=True)
 
         return result, hint, mode
 
@@ -444,9 +478,15 @@ class SheetMindAgent:
     ) -> tuple:
         """Render a chart from the last table result without rerunning codegen."""
         if emitter:
-            await emitter.emit_progress("正在基于上一次结果生成图表...")
+            await emitter.emit_progress("正在基于上一次结果生成图表...", step_id="chart_planning")
 
-        chart_block = await self.chart_skill.run(ctx, query, result_df=previous_result_df)
+        field_map = await self.semantic_skill.run(ctx, query, df=previous_result_df)
+        chart_block = await self.chart_skill.run(
+            ctx,
+            query,
+            result_df=previous_result_df,
+            field_map=field_map,
+        )
         if chart_block is None:
             result = ResultBlocks(blocks=[
                 SummaryBlock(content="上一次结果无法直接生成图表，请换一种图表描述。")
@@ -454,7 +494,7 @@ class SheetMindAgent:
             return result, hint, mode
 
         if emitter:
-            await emitter.emit_progress("正在生成分析洞察...")
+            await emitter.emit_progress("正在生成分析洞察...", step_id="insight_writing")
 
         summary_text = await self.insight_skill.run(
             ctx,
@@ -471,11 +511,7 @@ class SheetMindAgent:
         blocks.append(chart_block)
 
         result = ResultBlocks(blocks=blocks)
-        try:
-            validate_result(result)
-        except ResultValidationError as exc:
-            logger.warning("[Pipeline] previous-result chart validation error: %s", exc)
-        return result, hint, mode
+        return validate_result(result, degrade_invalid_charts=True), hint, mode
 
     @staticmethod
     def _remember_result_dataframe(

@@ -42,6 +42,8 @@ export const toAnalysisViewModel = (payload, prompt) => {
           palette: chart.palette ?? DEFAULT_PALETTE,
           xAxisLabel: chart.x_axis_label,
           yAxisLabel: chart.y_axis_label,
+          confidence: chart.confidence,
+          reason: chart.reason,
         }
       : null,
   };

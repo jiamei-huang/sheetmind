@@ -2,6 +2,14 @@
 
 SheetMind is an Excel analysis application for persistent projects, multi-turn questions, structured charts, and reproducible execution traces.
 
+## Analysis runtime
+
+The backend builds an explicit execution plan for each query, then uses semantic
+field metadata to choose deterministic rules or guarded generated pandas code.
+It recognizes period labels and identifier columns, prefers qualified metrics
+such as RMB amounts, and returns validated table, chart, metric, and summary
+blocks. Invalid chart data degrades to the remaining safe result blocks.
+
 ## Repository layout
 
 ```text
@@ -43,4 +51,4 @@ cd web && npm test
 cd web && npm run build
 ```
 
-See [docs/development.md](docs/development.md) for configuration and [docs/architecture.md](docs/architecture.md) for the system design.
+See [docs/development.md](docs/development.md) for configuration, [docs/architecture.md](docs/architecture.md) for the system design, and [docs/api.md](docs/api.md) for the HTTP protocol.

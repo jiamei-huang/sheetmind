@@ -146,6 +146,12 @@ class RepairLoop:
                         trace.add_event(EVT_REPAIR, output_summary=f"repaired after {attempt} retries")
                 return result_df, code, repairs_used
 
+            # Safety rejections are deterministic policy decisions. Re-prompting
+            # with the rejected code adds cost without a legitimate repair path.
+            if error and "Code contains forbidden pattern" in error:
+                logger.warning("[RepairLoop] safety violation; stopping without retry")
+                return None, last_code, repairs_used
+
             # Failure — build error feedback for next attempt
             logger.warning(
                 "[RepairLoop] attempt %d failed: %s",

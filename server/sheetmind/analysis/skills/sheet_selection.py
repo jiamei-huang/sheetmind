@@ -4,8 +4,8 @@ SheetMind — Sheet Selection Skill
 Selects which files and sheets to use for a query using deterministic
 keyword and recency rules.
 
-Returns a list of SheetSelection dicts:
-  [{"fileName": "sales.xlsx", "sheets": ["Sheet1", "Sheet2"]}]
+Returns a list of explainable SheetSelection dicts:
+  [{"fileName": "sales.xlsx", "sheets": ["Sheet1"], "confidence": 0.88, "reason": "..."}]
 """
 from __future__ import annotations
 
@@ -48,6 +48,9 @@ class SheetSelectionSkill(Skill):
             ) from exc
 
         selector = SheetSelector()
+        # `selected_sheets` is initialized by the UI scope. Keep a snapshot
+        # before this skill writes the resolved result back to the context.
+        requested_scope = set(ctx.selected_sheets)
         try:
             selected = selector.select_sheets(ctx.project_id, query)
         except Exception as exc:
@@ -64,7 +67,26 @@ class SheetSelectionSkill(Skill):
                 "没有找到可用的Excel文件，请先上传数据文件。",
             )
 
-        # Update ctx.selected_sheets with the flat list of sheet names
+        if requested_scope:
+            scoped = []
+            for item in selected:
+                sheets = [sheet for sheet in item.get("sheets", []) if sheet in requested_scope]
+                if sheets:
+                    scoped.append({**item, "sheets": sheets})
+            if scoped:
+                selected = scoped
+
+        # Add a stable explanation without requiring the storage selector to
+        # understand the runtime's user-facing execution plan.
+        for item in selected:
+            sheets = item.get("sheets", [])
+            item.setdefault("confidence", 0.95 if requested_scope else 0.75)
+            item.setdefault(
+                "reason",
+                "within user-selected sheet scope" if requested_scope else "matched file and sheet names to query",
+            )
+
+        # Update ctx.selected_sheets with the flat list of resolved sheet names
         flat_sheets = []
         for item in selected:
             flat_sheets.extend(item.get("sheets", []))

@@ -50,8 +50,11 @@ def thinking_frame(message: str = "正在分析您的问题...") -> str:
     return _sse_frame("thinking", message=message)
 
 
-def progress_frame(message: str) -> str:
-    return _sse_frame("progress", message=message)
+def progress_frame(message: str, step_id: Optional[str] = None) -> str:
+    payload: Dict[str, Any] = {"message": message}
+    if step_id:
+        payload["step_id"] = step_id
+    return _sse_frame("progress", **payload)
 
 
 def repairing_frame(message: str = "修复执行错误，重试中...") -> str:
@@ -97,8 +100,8 @@ class StreamEmitter:
     async def emit_thinking(self, message: str = "正在分析您的问题...") -> None:
         await self.emit(thinking_frame(message))
 
-    async def emit_progress(self, message: str) -> None:
-        await self.emit(progress_frame(message))
+    async def emit_progress(self, message: str, step_id: Optional[str] = None) -> None:
+        await self.emit(progress_frame(message, step_id=step_id))
 
     async def emit_repairing(self, message: str = "修复执行错误，重试中...") -> None:
         await self.emit(repairing_frame(message))

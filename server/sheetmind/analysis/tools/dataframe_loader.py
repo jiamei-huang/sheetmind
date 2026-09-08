@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -30,6 +31,17 @@ logger = logging.getLogger(__name__)
 MAX_ROWS_PER_SHEET: Optional[int] = None
 
 
+@dataclass
+class LoadResult:
+    df: pd.DataFrame
+    source_files: List[str] = field(default_factory=list)
+    source_sheets: List[str] = field(default_factory=list)
+    detected_header_rows: Dict[str, int] = field(default_factory=dict)
+    dropped_empty_rows: int = 0
+    dropped_empty_columns: int = 0
+    warnings: List[str] = field(default_factory=list)
+
+
 class DataframeLoaderTool(Tool):
     """
     Load a pandas DataFrame from Excel file(s) stored in the project.
@@ -39,8 +51,7 @@ class DataframeLoaderTool(Tool):
                         [{"fileName": "...", "sheets": ["Sheet1"]}]
         multiturn_mode: MultiTurnMode — if FOLLOW_UP, reuse ctx._active_df
 
-    Output:
-        pd.DataFrame
+    Output: pd.DataFrame by default, or LoadResult when return_report=True.
     """
 
     name = "dataframe_loader"
@@ -51,6 +62,7 @@ class DataframeLoaderTool(Tool):
         ctx: AnalysisContext,
         selected_files: Optional[List[Dict[str, Any]]] = None,
         multiturn_mode: Optional[MultiTurnMode] = None,
+        return_report: bool = False,
         **kwargs: Any,
     ) -> pd.DataFrame:
         # FOLLOW_UP: reuse the active working DataFrame from the previous turn.
@@ -59,7 +71,9 @@ class DataframeLoaderTool(Tool):
         # do not accidentally erase the richer source rows needed for later turns.
         if multiturn_mode == MultiTurnMode.FOLLOW_UP and ctx._active_df is not None:
             logger.debug("[DataframeLoader] FOLLOW_UP: reusing ctx._active_df")
-            return ctx._active_df
+            report = LoadResult(df=ctx._active_df, warnings=["Reused active dataframe for follow-up."])
+            ctx._load_report = report
+            return report if return_report else report.df
 
         if not selected_files:
             raise ToolError(
@@ -74,6 +88,7 @@ class DataframeLoaderTool(Tool):
 
         excel_service = ExcelService()
         all_dfs: List[pd.DataFrame] = []
+        report = LoadResult(df=pd.DataFrame())
 
         for file_info in selected_files:
             file_name = file_info.get("fileName", "")
@@ -86,8 +101,10 @@ class DataframeLoaderTool(Tool):
                 logger.warning("[DataframeLoader] file not found: %s", file_name)
                 continue
 
-            file_dfs = self._load_sheets(file_bytes, file_name, sheet_names)
+            file_dfs = self._load_sheets(file_bytes, file_name, sheet_names, report=report)
             all_dfs.extend(file_dfs)
+            if file_dfs:
+                report.source_files.append(file_name)
 
         if not all_dfs:
             raise ToolError(
@@ -96,15 +113,20 @@ class DataframeLoaderTool(Tool):
             )
 
         df = self._merge_dfs(all_dfs)
+        report.df = df
+        duplicate_columns = df.columns[df.columns.duplicated()].tolist()
+        if duplicate_columns:
+            report.warnings.append(f"Duplicate column names: {duplicate_columns}")
         # Store in context for FOLLOW_UP access in the next turn.
         ctx._source_df = df
         ctx._active_df = df
+        ctx._load_report = report
         logger.debug(
             "[DataframeLoader] loaded df shape=%s columns=%s",
             df.shape,
             list(df.columns[:5]),
         )
-        return df
+        return report if return_report else df
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -115,6 +137,7 @@ class DataframeLoaderTool(Tool):
         file_bytes: bytes,
         file_name: str,
         sheet_names: List[str],
+        report: Optional[LoadResult] = None,
     ) -> List[pd.DataFrame]:
         dfs: List[pd.DataFrame] = []
         try:
@@ -135,6 +158,9 @@ class DataframeLoaderTool(Tool):
                 continue
             try:
                 header_row = self._detect_header_row(file_bytes, sheet)
+                if report is not None:
+                    report.source_sheets.append(sheet)
+                    report.detected_header_rows[f"{file_name}:{sheet}"] = header_row
                 if header_row > 0:
                     logger.debug(
                         "[DataframeLoader] sheet=%s: header detected at row %d, skipping %d leading row(s)",
@@ -146,7 +172,11 @@ class DataframeLoaderTool(Tool):
                     header=header_row,
                     nrows=MAX_ROWS_PER_SHEET,
                 )
+                original_rows, original_columns = df.shape
                 df = self._clean_df(df)
+                if report is not None:
+                    report.dropped_empty_rows += original_rows - len(df)
+                    report.dropped_empty_columns += original_columns - len(df.columns)
                 if not df.empty:
                     # Warn when the sheet likely has more rows than we loaded.
                     if MAX_ROWS_PER_SHEET is not None and len(df) >= MAX_ROWS_PER_SHEET:
@@ -159,6 +189,8 @@ class DataframeLoaderTool(Tool):
                     dfs.append(df)
             except Exception as exc:
                 logger.warning("[DataframeLoader] failed to read sheet %s: %s", sheet, exc)
+                if report is not None:
+                    report.warnings.append(f"Failed to read {file_name}:{sheet}: {exc}")
 
         return dfs
 

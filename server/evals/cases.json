@@ -8,7 +8,7 @@
     "routing_values": {
       "rule": "Deterministic filter/sort via rule engine — no LLM code generation",
       "code": "LLM generates pandas code or chart params — aggregation, complex condition, pivot, chart",
-      "text": "Pure LLM text insight — no code execution at all"
+      "insight": "LLM writes insight from existing results or lightweight dataframe context — no new structured computation"
     },
     "multiturn_mode_values": {
       "new": "First question or unrelated new topic — load fresh from file",
@@ -70,7 +70,7 @@
     {
       "id": "INT-003",
       "category": "INT",
-      "description": "Ambiguous open-ended analysis → text",
+      "description": "Ambiguous open-ended analysis → insight",
       "query": "帮我分析一下这批数据有什么问题",
       "schema": {
         "columns": ["产品", "销量", "退货率"],
@@ -79,7 +79,7 @@
           {"产品": "B", "销量": 200, "退货率": 0.02}
         ]
       },
-      "expected_routing": "text",
+      "expected_routing": "insight",
       "expected_multiturn_mode": "new",
       "expected_result_type": "insight_only",
       "pass_criteria": [
@@ -551,7 +551,7 @@
     {
       "id": "MT-005",
       "category": "MT",
-      "description": "Multi-turn: insight question about previous chart — text + follow_up",
+      "description": "Multi-turn: insight question about previous chart — insight + follow_up",
       "turn": 2,
       "previous_turn": {
         "query": "生成月度销售额趋势图",
@@ -562,7 +562,7 @@
         "columns": ["月份", "销售额"],
         "sample_rows": []
       },
-      "expected_routing": "text",
+      "expected_routing": "insight",
       "expected_multiturn_mode": "follow_up",
       "expected_result_type": "insight_only",
       "pass_criteria": [

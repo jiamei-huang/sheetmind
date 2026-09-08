@@ -27,7 +27,8 @@ Logs warnings for non-fatal quality issues.
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional
+from numbers import Real
+from typing import Any
 
 from ..context import ChartBlock, ResultBlocks, SummaryBlock, TableBlock
 
@@ -38,10 +39,16 @@ class ResultValidationError(ValueError):
     """Raised when a ResultBlocks object fails fatal validation."""
 
 
-_VALID_CHART_TYPES = {"bar", "line", "pie", "scatter", "area"}
+_VALID_CHART_TYPES = {"bar", "line", "pie"}
+_MAX_CHART_POINTS = 500
+_MAX_CHART_SERIES = 5
 
 
-def validate_result(result: ResultBlocks) -> ResultBlocks:
+def validate_result(
+    result: ResultBlocks,
+    *,
+    degrade_invalid_charts: bool = False,
+) -> ResultBlocks:
     """
     Validate all blocks in `result` in place.
 
@@ -53,6 +60,8 @@ def validate_result(result: ResultBlocks) -> ResultBlocks:
         logger.warning("[ResultValidator] ResultBlocks has no blocks")
         return result
 
+    valid_blocks = []
+    removed_charts = 0
     for i, block in enumerate(result.blocks):
         kind = _block_kind(block)
         try:
@@ -63,11 +72,22 @@ def validate_result(result: ResultBlocks) -> ResultBlocks:
             elif kind == "summary":
                 _validate_summary(block, index=i)
             # metric blocks and unknown kinds are passed through without validation
-        except ResultValidationError:
+        except ResultValidationError as exc:
+            if kind == "chart" and degrade_invalid_charts:
+                logger.warning("[ResultValidator] dropping invalid chart block[%d]: %s", i, exc)
+                removed_charts += 1
+                continue
             raise
         except Exception as exc:
             # Unexpected validation failure should never crash the pipeline
             logger.warning("[ResultValidator] block[%d] unexpected error: %s", i, exc)
+        valid_blocks.append(block)
+
+    if removed_charts:
+        has_summary = any(_block_kind(block) == "summary" for block in valid_blocks)
+        if not has_summary:
+            valid_blocks.insert(0, SummaryBlock(content="图表数据不完整，已保留可用的分析结果。"))
+        result.blocks = valid_blocks
 
     return result
 
@@ -101,15 +121,14 @@ def _validate_table(block: Any, index: int) -> None:
             f"TableBlock[{index}]: rows must be a list, got {type(rows).__name__}"
         )
 
+    if len(rows) > 1000:
+        raise ResultValidationError(f"TableBlock[{index}]: rows exceed frontend cap (1000)")
+
     # Warn: row key mismatch
     col_set = set(columns)
     for j, row in enumerate(rows[:5]):  # spot-check first 5 rows
         if not isinstance(row, dict):
-            logger.warning(
-                "[ResultValidator] TableBlock[%d] row[%d] is not a dict: %s",
-                index, j, type(row).__name__,
-            )
-            continue
+            raise ResultValidationError(f"TableBlock[{index}] row[{j}] must be a dict")
         row_keys = set(row.keys())
         extra = row_keys - col_set
         missing = col_set - row_keys
@@ -123,6 +142,8 @@ def _validate_table(block: Any, index: int) -> None:
                 "[ResultValidator] TableBlock[%d] row[%d] missing keys: %s",
                 index, j, missing,
             )
+        if any(isinstance(value, (dict, list, tuple, set)) for value in row.values()):
+            raise ResultValidationError(f"TableBlock[{index}] row[{j}] contains nested values")
 
     # Warn: high null rate in any numeric-looking column
     if rows and len(rows) > 0:
@@ -166,6 +187,15 @@ def _validate_chart(block: Any, index: int) -> None:
     if not series:
         raise ResultValidationError(f"ChartBlock[{index}]: series list is empty")
 
+    if len(labels) > _MAX_CHART_POINTS:
+        raise ResultValidationError(
+            f"ChartBlock[{index}]: labels exceed frontend cap ({_MAX_CHART_POINTS})"
+        )
+    if len(series) > _MAX_CHART_SERIES:
+        raise ResultValidationError(
+            f"ChartBlock[{index}]: series exceed frontend cap ({_MAX_CHART_SERIES})"
+        )
+
     # Fatal: series values length must match labels
     n_labels = len(labels)
     for k, s in enumerate(series):
@@ -178,6 +208,10 @@ def _validate_chart(block: Any, index: int) -> None:
             raise ResultValidationError(
                 f"ChartBlock[{index}] series[{k}]: "
                 f"values length {len(vals)} != labels length {n_labels}"
+            )
+        if any(value is not None and (isinstance(value, bool) or not isinstance(value, Real)) for value in vals):
+            raise ResultValidationError(
+                f"ChartBlock[{index}] series[{k}] contains non-numeric values"
             )
 
     # Warn: missing y_axis_label

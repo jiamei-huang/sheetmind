@@ -1,104 +1,40 @@
-"""
-SheetMind — Python Executor Tool (Subprocess Sandbox)
-==========================================================
-Runs LLM-generated pandas code against user data in an isolated subprocess.
-
-Security model:
-  - Executes in a SEPARATE subprocess (not in the main FastAPI process)
-  - Hard-kill after 30s (configurable)
-  - Whitelist of allowed imports (only pandas/numpy/stdlib)
-  - Forbidden pattern pre-check (import os, eval, exec, open, etc.)
-  - No network access (checked in pre-scan)
-  - Input/output via temp pickle files (not stdin/stdout)
-
-Repair contract:
-  - Returns (result_df, None) on success
-  - Returns (None, error_message) on failure — the caller (RepairLoop) uses
-    the error_message to ask the model to fix the code and retries.
-
-The wrapper script is generated fresh per execution and deleted on cleanup.
-"""
+"""Subprocess pandas executor with explicit output and safety contracts."""
 from __future__ import annotations
 
 import logging
 import os
 import pickle
+import re
 import subprocess
 import sys
 import tempfile
 import textwrap
+from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Optional, Tuple
 
 import pandas as pd
 
 from ..context import AnalysisContext
-from .base import Tool, ToolError
+from .base import Tool
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Security: pre-execution code scan
-# ---------------------------------------------------------------------------
-
-import re
-
-# These patterns are rejected before subprocess is even started
 _FORBIDDEN_PATTERNS = [
-    re.compile(r"\bimport\s+os\b"),
-    re.compile(r"\bimport\s+sys\b"),
-    re.compile(r"\bimport\s+subprocess\b"),
-    re.compile(r"\bimport\s+socket\b"),
-    re.compile(r"\bimport\s+requests?\b"),
-    re.compile(r"\bimport\s+urllib\b"),
-    re.compile(r"\bimport\s+shutil\b"),
-    re.compile(r"\bimport\s+pickle\b"),
-    re.compile(r"\bimport\s+shelve\b"),
-    re.compile(r"\bimport\s+builtins\b"),
-    re.compile(r"\bimport\s+importlib\b"),
-    re.compile(r"\bimport\s+ctypes\b"),
-    re.compile(r"\bimport\s+threading\b"),
-    re.compile(r"\bimport\s+multiprocessing\b"),
-    re.compile(r"\b__import__\s*\("),
-    re.compile(r"\beval\s*\("),
-    re.compile(r"\bexec\s*\("),
-    re.compile(r"\bcompile\s*\("),
-    re.compile(r"\bopen\s*\([^)]*['\"][wWaA]"),  # open(..., "w") / open(..., "a")
-    re.compile(r"\bpd\.read_[a-z]+\s*\("),          # pd.read_csv, pd.read_excel, …
-    re.compile(r"\b\.to_csv\b|\b\.to_excel\b|\b\.to_pickle\b|\b\.to_parquet\b"),
-    re.compile(r"\bos\."),
-    re.compile(r"\bsys\."),
+    re.compile(pattern) for pattern in (
+        r"\bimport\s+(?:os|sys|subprocess|socket|requests?|urllib|shutil|pickle|shelve|builtins|importlib|ctypes|threading|multiprocessing)\b",
+        r"\b__import__\s*\(", r"\b(?:eval|exec|compile)\s*\(",
+        r"\bopen\s*\([^)]*['\"][wWaA]", r"\bpd\.read_[a-z]+\s*\(",
+        r"\b\.to_(?:csv|excel|pickle|parquet)\b", r"\b(?:os|sys)\.",
+    )
 ]
 
-# Allowed import prefixes (user code may have these, though we discourage all imports)
-_ALLOWED_IMPORTS = {
-    "pandas", "pd", "numpy", "np", "json", "re", "math", "datetime",
-    "collections", "functools", "itertools", "operator", "string",
-    "unicodedata", "decimal",
-}
-
-
-def _check_forbidden(code: str) -> Optional[str]:
-    """Return an error string if the code contains a forbidden pattern, else None."""
-    for pattern in _FORBIDDEN_PATTERNS:
-        if pattern.search(code):
-            return f"Code contains forbidden pattern: {pattern.pattern!r}"
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Subprocess wrapper script template
-# ---------------------------------------------------------------------------
-
 _WRAPPER_TEMPLATE = textwrap.dedent("""\
-    import sys, io, json, re, math, datetime
-    from collections import defaultdict, Counter, OrderedDict
-    from functools import reduce
-    from itertools import chain, groupby as itertools_groupby
+    import sys, math, datetime
     import pandas as pd
     import numpy as np
-
-    # Load input DataFrame
     import pickle as _pickle
+
     with open(sys.argv[1], 'rb') as _f:
         df = _pickle.load(_f)
 
@@ -106,38 +42,36 @@ _WRAPPER_TEMPLATE = textwrap.dedent("""\
     {user_code}
     # ---- User code end ----
 
-    # Validate result
     if 'result_df' not in dir():
-        print("EXECUTOR_ERROR: result_df not defined after code execution", file=sys.stderr)
+        print('EXECUTOR_ERROR: result_df not defined after code execution', file=sys.stderr)
         sys.exit(1)
     if not isinstance(result_df, pd.DataFrame):
-        print(f"EXECUTOR_ERROR: result_df must be a DataFrame, got {{type(result_df).__name__}}", file=sys.stderr)
+        print(f'EXECUTOR_ERROR: result_df must be a DataFrame, got {{type(result_df).__name__}}', file=sys.stderr)
         sys.exit(1)
-
-    # Save output
     with open(sys.argv[2], 'wb') as _f:
         _pickle.dump(result_df, _f)
-    print(f"OK rows={{len(result_df)}}")
 """)
 
 
-# ---------------------------------------------------------------------------
-# Tool implementation
-# ---------------------------------------------------------------------------
+@dataclass
+class ExecutionResult:
+    success: bool
+    result_df: Optional[pd.DataFrame]
+    error: Optional[str]
+    runtime_ms: int
+    output_shape: Optional[Tuple[int, int]]
+    safety_violation: bool = False
+    error_type: Optional[str] = None
+
 
 class PythonExecutorTool(Tool):
-    """
-    Execute LLM-generated pandas code in a sandboxed subprocess.
-
-    Returns:
-        (result_df, None)           on success
-        (None, error_message_str)   on failure (for RepairLoop)
-    """
-
     name = "python_executor"
-    description = "Run pandas code in isolated subprocess (30s timeout, import whitelist)"
+    description = "Run pandas code in an isolated process with output caps"
 
-    DEFAULT_TIMEOUT = 30  # seconds
+    DEFAULT_TIMEOUT = 30
+    MAX_OUTPUT_ROWS = 100_000
+    MAX_OUTPUT_COLUMNS = 100
+    MAX_MEMORY_BYTES = 768 * 1024 * 1024
 
     def __init__(self, timeout: int = DEFAULT_TIMEOUT) -> None:
         self.timeout = timeout
@@ -149,84 +83,124 @@ class PythonExecutorTool(Tool):
         df: Optional[pd.DataFrame] = None,
         **kwargs: Any,
     ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-        """
-        Execute `code` with `df` available as the `df` variable.
+        """Legacy tuple API retained for the repair loop and external callers."""
+        result = self.run_detailed(ctx, code=code, df=df, **kwargs)
+        return result.result_df, result.error
 
-        Returns:
-            (result_df, None)     — success
-            (None, error_str)     — failure (caller should retry or return error)
-        """
+    def run_detailed(
+        self,
+        ctx: AnalysisContext,
+        code: str = "",
+        df: Optional[pd.DataFrame] = None,
+        **kwargs: Any,
+    ) -> ExecutionResult:
+        started = perf_counter()
+
+        def fail(message: str, error_type: str, *, safety: bool = False) -> ExecutionResult:
+            return ExecutionResult(
+                success=False,
+                result_df=None,
+                error=message,
+                runtime_ms=int((perf_counter() - started) * 1000),
+                output_shape=None,
+                safety_violation=safety,
+                error_type=error_type,
+            )
+
         if not code or not code.strip():
-            return None, "Empty code string"
-
+            return fail("Empty code string", "empty_code")
         if df is None or df.empty:
-            return None, "No input DataFrame provided"
+            return fail("No input DataFrame provided", "missing_input")
 
-        # Pre-execution security scan
-        forbidden_error = _check_forbidden(code)
-        if forbidden_error:
-            logger.warning("[PythonExecutor] Forbidden code rejected: %s", forbidden_error)
-            return None, forbidden_error
+        forbidden = self._check_forbidden(code)
+        if forbidden:
+            logger.warning("[PythonExecutor] forbidden code rejected: %s", forbidden)
+            return fail(forbidden, "safety_violation", safety=True)
 
         tmp_dir = tempfile.mkdtemp(prefix="sheetmind_exec_")
         input_path = os.path.join(tmp_dir, "input.pkl")
         output_path = os.path.join(tmp_dir, "output.pkl")
         script_path = os.path.join(tmp_dir, "wrapper.py")
-
         try:
-            # Write input df
-            with open(input_path, "wb") as f:
-                pickle.dump(df, f)
+            with open(input_path, "wb") as file:
+                pickle.dump(df, file)
+            wrapper = _WRAPPER_TEMPLATE.format(user_code=textwrap.indent(code.strip(), "    "))
+            with open(script_path, "w", encoding="utf-8") as file:
+                file.write(wrapper)
 
-            # Write wrapper script
-            indented_code = textwrap.indent(code.strip(), "    ")
-            wrapper_code = _WRAPPER_TEMPLATE.format(user_code=indented_code)
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write(wrapper_code)
-
-            # Execute in subprocess
-            python_exe = sys.executable
-            result = subprocess.run(
-                [python_exe, script_path, input_path, output_path],
+            completed = subprocess.run(
+                [sys.executable, script_path, input_path, output_path],
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
                 cwd=tmp_dir,
+                preexec_fn=self._limit_resources if os.name == "posix" else None,
             )
-
-            if result.returncode != 0:
-                stderr = result.stderr.strip()
-                stdout = result.stdout.strip()
-                error_msg = stderr or stdout or "Code execution failed (unknown error)"
-                logger.debug("[PythonExecutor] execution failed:\nSTDOUT: %s\nSTDERR: %s", stdout, stderr)
-                return None, error_msg
-
-            # Read result
+            if completed.returncode != 0:
+                error = completed.stderr.strip() or completed.stdout.strip() or "Code execution failed"
+                return fail(error, self._classify_error(error))
             if not os.path.exists(output_path):
-                return None, "Code executed but result_df was not saved (check code logic)"
+                return fail("Code executed but result_df was not saved", "output_contract")
 
-            with open(output_path, "rb") as f:
-                result_df = pickle.load(f)
+            with open(output_path, "rb") as file:
+                result_df = pickle.load(file)
+            contract_error = self._validate_output(result_df)
+            if contract_error:
+                return fail(contract_error, "output_contract")
 
-            logger.debug(
-                "[PythonExecutor] success: shape=%s columns=%s",
-                result_df.shape,
-                list(result_df.columns[:5]),
+            return ExecutionResult(
+                success=True,
+                result_df=result_df,
+                error=None,
+                runtime_ms=int((perf_counter() - started) * 1000),
+                output_shape=(len(result_df), len(result_df.columns)),
             )
-            return result_df, None
-
         except subprocess.TimeoutExpired:
-            logger.warning("[PythonExecutor] execution timed out after %ds", self.timeout)
-            return None, f"执行超时（超过 {self.timeout} 秒），请简化查询或减少数据量。"
-
+            return fail(f"执行超时（超过 {self.timeout} 秒），请简化查询或减少数据量。", "timeout")
         except Exception as exc:
             logger.exception("[PythonExecutor] unexpected error: %s", exc)
-            return None, f"执行过程中发生意外错误: {exc}"
-
+            return fail(f"执行过程中发生意外错误: {exc}", "runtime_error")
         finally:
-            # Always clean up temp files
             import shutil
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _check_forbidden(code: str) -> Optional[str]:
+        for pattern in _FORBIDDEN_PATTERNS:
+            if pattern.search(code):
+                return f"Code contains forbidden pattern: {pattern.pattern!r}"
+        return None
+
+    @classmethod
+    def _validate_output(cls, result_df: Any) -> Optional[str]:
+        if not isinstance(result_df, pd.DataFrame):
+            return "result_df must be a DataFrame"
+        if len(result_df) > cls.MAX_OUTPUT_ROWS:
+            return f"result_df exceeds row cap ({cls.MAX_OUTPUT_ROWS})"
+        if len(result_df.columns) == 0 or len(result_df.columns) > cls.MAX_OUTPUT_COLUMNS:
+            return f"result_df must contain 1-{cls.MAX_OUTPUT_COLUMNS} columns"
+        if result_df.columns.isna().any() or any(not str(column).strip() for column in result_df.columns):
+            return "result_df contains invalid column names"
+        return None
+
+    @staticmethod
+    def _classify_error(error: str) -> str:
+        lowered = error.lower()
+        if "syntaxerror" in lowered:
+            return "syntax_error"
+        if "keyerror" in lowered:
+            return "missing_column"
+        if "memoryerror" in lowered:
+            return "memory_limit"
+        if "result_df" in lowered:
+            return "output_contract"
+        return "runtime_error"
+
+    def _limit_resources(self) -> None:
+        """Best-effort POSIX limits; unavailable platforms continue with timeout only."""
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (self.MAX_MEMORY_BYTES, self.MAX_MEMORY_BYTES))
+            resource.setrlimit(resource.RLIMIT_CPU, (self.timeout, self.timeout + 1))
+        except Exception:
+            pass

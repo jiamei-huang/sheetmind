@@ -31,12 +31,13 @@ class RoutingHint(str, Enum):
                    No LLM code generation needed.
     CODE_GEN     — LLM generates pandas code: aggregation, pivot, Top-N,
                    growth rate, chart parameter extraction, complex conditions.
-    TEXT_ONLY    — no code execution; LLM writes insight text directly.
+    INSIGHT_ONLY — no new structured computation; LLM writes insight text from
+                   existing results or lightweight dataframe context.
                    e.g. "what anomalies are there?", "what does this trend mean?"
     """
     RULE_ENGINE = "rule"
     CODE_GEN    = "code"
-    TEXT_ONLY   = "text"
+    INSIGHT_ONLY = "insight"
 
 
 class MultiTurnMode(str, Enum):
@@ -53,6 +54,20 @@ class MultiTurnMode(str, Enum):
     NEW_QUERY  = "new"
     FOLLOW_UP  = "follow_up"
     RESET      = "reset"
+
+
+class ExecutionPlan(BaseModel):
+    """Shared, inspectable contract for one routed analysis turn."""
+
+    route: RoutingHint
+    mode: MultiTurnMode
+    operation_types: List[str] = Field(default_factory=list)
+    needs_new_computation: bool = True
+    wants_chart: bool = False
+    uses_previous_result: bool = False
+    target_fields: List[str] = Field(default_factory=list)
+    target_sheets: List[str] = Field(default_factory=list)
+    confidence: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +138,8 @@ class ChartBlock(BaseModel):
     palette: Optional[List[str]] = None
     x_axis_label: Optional[str] = None
     y_axis_label: Optional[str] = None
+    confidence: Optional[float] = None
+    reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +229,14 @@ class AnalysisContext(BaseModel):
     selected_sheets: List[str] = Field(default_factory=list)
     conversation: List[Turn] = Field(default_factory=list)
     active_result: Optional[ResultBlocks] = None
+    execution_plan: Optional[ExecutionPlan] = None
     trace_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
     # Runtime-only, not serialized
     _active_df: Any = PrivateAttr(default=None)
     _source_df: Any = PrivateAttr(default=None)
     _result_df: Any = PrivateAttr(default=None)
+    _load_report: Any = PrivateAttr(default=None)
 
     # -------------------------------------------------------------------
     # Conversation helpers

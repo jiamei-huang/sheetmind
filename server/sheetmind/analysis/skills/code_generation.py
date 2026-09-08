@@ -24,7 +24,8 @@ import pandas as pd
 from ..context import AnalysisContext
 from ..models.configs import ModelRole
 from .base import Skill, SkillError
-from .data_profiling import DataProfilingSkill
+from .data_profiling import DataProfile
+from .field_resolution import FieldResolver
 from .semantic_typing import SemanticFieldMap
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,9 @@ _SYSTEM_PROMPT = """\
 - 聚合后用 .reset_index() 保持 DataFrame 类型
 - 空值处理：必要时使用 .dropna() 或 .fillna(0)
 - 数值列转换：pd.to_numeric(df['列'], errors='coerce')
-- 列名模糊匹配：如果确切列名不在 df.columns，用 [c for c in df.columns if '关键词' in c][0] 找到它
+- 只能使用下方“字段元数据”列出的列名；禁止猜测或按位置选择列
+- identifier 类型（SKU、订单号、客户 ID 等）绝不能求和、均值或作为图表数值轴；需要统计时用 nunique()
+- 用户查询带货币/单位限定词时，必须选用同样限定词的字段（如“人民币金额”优先“金额（RMB）”）
 
 【输出格式】
 只返回纯 Python 代码，不包含 ```python 标记、注释或解释文字。
@@ -78,7 +81,7 @@ class CodeGenerationSkill(Skill):
         ctx: AnalysisContext,
         query: str,
         df: Optional[pd.DataFrame] = None,
-        data_summary: str = "",
+        data_summary: str | DataProfile = "",
         field_map: Optional[SemanticFieldMap] = None,
         error_feedback: Optional[str] = None,
         wants_chart: bool = False,
@@ -136,7 +139,7 @@ class CodeGenerationSkill(Skill):
         self,
         query: str,
         df: Optional[pd.DataFrame],
-        data_summary: str,
+        data_summary: str | DataProfile,
         field_map: Optional[SemanticFieldMap],
         error_feedback: Optional[str],
         wants_chart: bool,
@@ -152,14 +155,23 @@ class CodeGenerationSkill(Skill):
             cols = list(df.columns)
             parts.append(f"【数据信息】\n列名：{cols}\n行数：{len(df)}")
 
-        # Field map aliases (top 5 ambiguous columns)
+        # Field metadata gives the model a constrained, explicit field contract.
         if field_map:
-            aliases_lines = []
-            for col, info in list(field_map.items())[:5]:
-                if len(info.aliases) > 1:
-                    aliases_lines.append(f"  {col!r} → 别名: {info.aliases[1:3]}, 类型: {info.type}")
-            if aliases_lines:
-                parts.append("【列别名参考】\n" + "\n".join(aliases_lines))
+            metadata_lines = []
+            for col, info in list(field_map.items())[:20]:
+                metadata_lines.append(
+                    f"  {col!r}: type={info.type}, role={info.semantic_role}, "
+                    f"should_aggregate={info.should_aggregate}, qualifiers={info.qualifiers}, "
+                    f"recommended_aliases={info.aliases[:4]}"
+                )
+            parts.append("【字段元数据】\n" + "\n".join(metadata_lines))
+
+            matches = FieldResolver().rank(query, field_map, aggregate_only=True)[:3]
+            if matches:
+                parts.append(
+                    "【字段解析建议】\n"
+                    + "\n".join(f"  {match.column!r}（{match.reason}）" for match in matches)
+                )
 
         # Compound query hint — instruct LLM to answer each sub-question separately
         # and stack results into one result_df with a '问题' label column

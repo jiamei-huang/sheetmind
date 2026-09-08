@@ -6,7 +6,7 @@ Generates a natural-language summary (SummaryBlock content) using the LLM.
 Three scenarios:
   1. "processing"   — brief description of what the data processing did (20-50 chars)
   2. "chart"        — chart trend/highlight analysis (100-300 chars), with structured emojis
-  3. "text_insight" — open-ended data analysis (200-500 chars), when RoutingHint == TEXT_ONLY
+  3. "insight_only" — open-ended data analysis (200-500 chars), when RoutingHint == INSIGHT_ONLY
 
 The structured chart insight format from old TextGenerationAgent:
   **Insight：**
@@ -36,7 +36,7 @@ class InsightWritingSkill(Skill):
     Scenario selection (via `scenario` kwarg):
       "processing"   → brief description of what was processed
       "chart"        → chart analysis with emoji highlights
-      "text_insight" → open-ended analysis text
+      "insight_only" → open-ended analysis text
     """
 
     name = "insight_writing"
@@ -65,7 +65,7 @@ class InsightWritingSkill(Skill):
 
         if scenario == "chart" and chart_block is not None:
             user_msg = self._chart_insight_prompt(query, chart_block, result_df)
-        elif scenario == "text_insight":
+        elif scenario in {"insight_only", "text_insight"}:
             user_msg = self._text_insight_prompt(query, result_df, ctx)
         else:
             # "processing" — brief description
@@ -117,6 +117,7 @@ class InsightWritingSkill(Skill):
         return (
             f"用户查询：{query}\n"
             f"处理结果：{rows} 行，列：{cols}"
+            f"\n\n已计算事实：\n{InsightWritingSkill._facts_block(result_df)}"
             f"{data_str}\n\n"
             "请严格根据上方实际数据，用一句话（20-50字）说明关键发现（如谁最高/最低），"
             "禁止引用数据中不存在的名称。"
@@ -160,6 +161,7 @@ class InsightWritingSkill(Skill):
             f"标签数量：{len(chart.labels)} | 系列数量：{len(chart.series)}\n"
             f"Y轴范围：最大={max_val:.2f}，最小={min_val:.2f}，均值={avg_val:.2f} {unit}\n"
             f"最高值标签：{max_label} | 最低值标签：{min_label}\n"
+            f"已计算事实：\n{InsightWritingSkill._facts_block(result_df)}\n"
             f"用户查询：{query}\n\n"
             "请用以下格式输出图表洞察（100-300字）：\n"
             "**Insight：**\n\n"
@@ -188,9 +190,33 @@ class InsightWritingSkill(Skill):
         return (
             f"用户查询：{query}\n\n"
             + (f"对话历史：\n{conv}\n\n" if conv else "")
+            + f"已计算事实：\n{InsightWritingSkill._facts_block(result_df)}\n\n"
             + (f"数据信息：\n{data_summary}\n\n" if data_summary else "")
-            + "请根据以上信息提供专业数据洞察（200-500字），包括关键发现、数据模式和业务建议。"
+            + "请只根据已计算事实和数据信息提供专业数据洞察（200-500字），包括关键发现、数据模式和业务建议。"
         )
+
+    @staticmethod
+    def _facts_block(result_df: Optional[pd.DataFrame]) -> str:
+        """Create a compact, deterministic facts block that anchors LLM prose."""
+        if result_df is None or result_df.empty:
+            return "无可用的结构化计算结果。"
+
+        facts = [f"行数={len(result_df)}，列数={len(result_df.columns)}"]
+        numeric_cols = list(result_df.select_dtypes(include="number").columns[:3])
+        for col in numeric_cols:
+            values = pd.to_numeric(result_df[col], errors="coerce").dropna()
+            if not values.empty:
+                facts.append(
+                    f"{col}: total={values.sum():.2f}, max={values.max():.2f}, min={values.min():.2f}"
+                )
+
+        category_cols = list(result_df.select_dtypes(exclude="number").columns[:2])
+        for col in category_cols:
+            values = result_df[col].dropna().astype(str)
+            if not values.empty:
+                top = values.value_counts().head(3)
+                facts.append(f"{col} top={', '.join(f'{name}({count})' for name, count in top.items())}")
+        return "\n".join(facts)
 
     # ------------------------------------------------------------------
     # Fallback (no LLM)
@@ -213,6 +239,6 @@ class InsightWritingSkill(Skill):
             return "图表已生成。"
 
         if result_df is not None:
-            return f"已处理数据，共 {len(result_df)} 行。"
+            return f"已处理数据。{InsightWritingSkill._facts_block(result_df)}"
 
         return "分析完成。"
