@@ -5,126 +5,82 @@ Returns RoutingHint (rule / code / text) + MultiTurnMode (new / follow_up / rese
 
 Design:
 - Rule-based keyword matching is the primary path (cheap, instant).
+- Keyword banks live in analysis/config/routing_rules.json so routing language
+  can be tuned without editing this module.
 - LLM fallback only when confidence < 0.55 (rare ambiguous cases).
 - Multi-turn mode is determined first — it takes priority and can influence routing.
 - Secondary intent facets are returned beside the 3-way execution route.
 
-Routing keywords (from spec §7 + phase-1 inventory):
-
-  RULE_ENGINE:
-    filter keywords:  筛选 过滤 filter where 显示 展示
-    date keywords:    年 月 date year month
-    sort keywords:    排序 sort order 从高到低 从低到高 ascending descending
-    AND no CODE_GEN signals
-
-  CODE_GEN (override RULE_ENGINE when present):
-    agg/calc:         统计 汇总 计算 sum count avg group groupby 聚合
-    numeric cond:     大于 小于 不低于 不高于 > < between 占比 增长率 环比 百分比
-    chart/viz:        图表 折线图 柱状图 饼图 bar line pie chart plot trend 趋势图 可视化 图形 visualization
-    transform:        透视 pivot 添加列 新增列 合并 merge 去重 dedup
-    top-n:            top 最高 最低 前N 前 名 rank
-
-  INSIGHT_ONLY (when no new data op is required):
-    open-ended:       分析一下 有什么问题 说明什么 洞察 建议 为什么 什么原因 怎么看
-                      什么特点 趋势如何 有没有异常 解读 解释
-
-Multi-turn mode signals:
-  RESET:     重新 全部数据 所有数据 完整数据 reset all data 从头
-  FOLLOW_UP: 这些 继续 在此基础上 进一步 based on 这个 这批 刚才 上面 再 AND active_result exists
+Routing rules:
+- CODE_GEN signals override ordinary RULE_ENGINE signals.
+- INSIGHT_ONLY wins for chart-reference explanation queries such as
+  "这个图表说明什么".
+- Low-confidence matches fall back to the routing LLM.
 """
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..context import AnalysisContext, MultiTurnMode, RoutingHint
 from ..models.configs import ModelRole
-from .base import Skill, SkillError
+from .base import Skill
 
 
 # ---------------------------------------------------------------------------
-# Keyword banks
+# Routing rule config
 # ---------------------------------------------------------------------------
 
-_RESET_KWS = [
-    "重新", "全部数据", "所有数据", "完整数据", "reset", "all data", "从头",
-]
+_ROUTING_RULES_PATH = Path(__file__).resolve().parents[1] / "config" / "routing_rules.json"
 
-_FOLLOW_UP_KWS = [
-    "这些", "继续", "在此基础上", "进一步", "based on",
-    "这个", "这批", "刚才", "上面", "再",
-    # Correction/adjustment of the previous result (e.g. "Y轴用错了，应该是...")
-    "用错", "改成", "换成", "改为", "修改", "不对",
-]
 
-_CODE_GEN_KWS = [
-    # aggregation / calculation
-    "统计", "汇总", "计算", "sum", "count", "avg", "group", "groupby", "聚合",
-    # numeric condition
-    "大于", "小于", "不低于", "不高于", "between", "占比", "增长率", "环比",
-    "百分比", "比例", "份额",
-    # chart / visualization
-    "图表", "折线图", "柱状图", "饼图", "bar", "line", "pie", "chart",
-    "plot", "trend", "趋势图", "可视化", "图形", "visualization", "图",
-    # trend / time-series words (even without 图 suffix)
-    "趋势", "变化", "走势", "波动",
-    # complex transform
-    "透视", "pivot", "添加列", "新增列", "合并", "merge", "去重", "dedup",
-    "rank",
-    # top-n
-    "top", "最高", "最低", "前", "名",
-]
+def _load_routing_rules() -> Dict[str, Any]:
+    with _ROUTING_RULES_PATH.open("r", encoding="utf-8") as fp:
+        data = json.load(fp)
 
-# Operator symbols handled separately
-_CODE_GEN_OPS = re.compile(r"[><≥≤]")
+    groups = data.get("keyword_groups")
+    if not isinstance(groups, dict):
+        raise ValueError(f"routing rules must contain keyword_groups: {_ROUTING_RULES_PATH}")
+    return data
 
-_RULE_ONLY_KWS = [
-    "筛选", "过滤", "filter", "where", "显示", "展示",
-    "年", "月", "date", "year", "month",
-    "排序", "sort", "order", "从高到低", "从低到高",
-    "升序", "降序", "排列",
-    "ascending", "descending",
-]
 
-_INSIGHT_ONLY_KWS = [
-    "分析一下", "有什么问题", "说明什么", "说明了什么", "洞察", "建议", "为什么",
-    "什么原因", "怎么看", "什么特点", "趋势如何", "有没有异常", "有什么异常",
-    "解读", "解释", "什么规律", "如何改进",
-    "什么问题", "什么意义", "什么意思", "什么情况",
-    "能说明", "反映了什么", "体现了什么",
-]
+_ROUTING_RULES = _load_routing_rules()
+_KEYWORD_GROUPS: Dict[str, Any] = _ROUTING_RULES["keyword_groups"]
 
-# Short vague queries → default to rule (pass-through data view)
-_VAGUE_KWS = ["看看", "看一下", "数据", "全部", "所有", "一览"]
 
-_DETERMINISTIC_EXTREME_KWS = [
-    "最多", "最高", "最大", "最贵", "花费最多", "费用最高", "金额最高",
-]
+def _keywords(group_name: str) -> List[str]:
+    values = _KEYWORD_GROUPS.get(group_name, [])
+    if not isinstance(values, list):
+        raise ValueError(f"routing keyword group must be a list: {group_name}")
+    return [str(value) for value in values]
 
-_DETERMINISTIC_EXTREME_SUBJECT_KWS = [
-    "哪个", "哪家", "哪一个", "哪类", "哪种", "who", "which",
-]
 
-_COMPLEX_OVERRIDE_KWS = [
-    "前", "top", "趋势", "变化", "增长率", "环比", "占比", "比例",
-    "透视", "pivot", "图", "chart", "plot", "可视化",
+_RESET_KWS = _keywords("reset")
+_FOLLOW_UP_KWS = _keywords("follow_up")
+_CODE_GEN_KWS = _keywords("code_gen")
+_RULE_ONLY_KWS = _keywords("rule_only")
+_INSIGHT_ONLY_KWS = _keywords("insight_only")
+_VAGUE_KWS = _keywords("vague")
+_DETERMINISTIC_EXTREME_KWS = _keywords("deterministic_extreme")
+_DETERMINISTIC_EXTREME_SUBJECT_KWS = _keywords("deterministic_extreme_subject")
+_COMPLEX_OVERRIDE_KWS = _keywords("complex_override")
+_FILTER_TRIGGER_KWS = _keywords("filter_trigger")
+_SORT_TRIGGER_KWS = _keywords("sort_trigger")
+_AGGREGATE_KWS = _keywords("aggregate")
+_TREND_KWS = _keywords("trend")
+_COMPARE_KWS = _keywords("compare")
+_ANOMALY_KWS = _keywords("anomaly")
+_CHART_KWS = _keywords("chart")
+_CHART_REF_ONLY_KWS = frozenset(_keywords("chart_reference_only"))
+_TARGET_FIELD_CANDIDATES = [
+    str(value) for value in _ROUTING_RULES.get("target_field_candidates", [])
 ]
-
-_FILTER_TRIGGER_KWS = ["筛选", "过滤", "filter", "where", "只看", "只要", "显示", "展示"]
-_SORT_TRIGGER_KWS = ["排序", "sort", "order", "降序", "升序", "从高到低", "从低到高"]
-_AGGREGATE_KWS = [
-    "统计", "汇总", "计算", "sum", "count", "avg", "group", "groupby", "聚合",
-    "总计", "合计", "平均", "均值", "最多", "最高", "最大", "最低",
-]
-_TREND_KWS = ["趋势", "变化", "走势", "波动", "trend", "环比", "同比", "增长率"]
-_COMPARE_KWS = ["对比", "比较", "排名", "各个", "各", "compare", "versus", "vs"]
-_ANOMALY_KWS = ["异常", "问题", "风险", "突增", "突降", "离群", "outlier", "anomaly"]
-_CHART_KWS = [
-    "图", "图表", "折线图", "柱状图", "饼图", "bar", "line", "pie",
-    "chart", "plot", "可视化", "visualization", "图形", "趋势图",
-]
+_CODE_GEN_OPS = re.compile(
+    str(_ROUTING_RULES.get("operators", {}).get("code_gen_regex", r"[><≥≤]"))
+)
 
 
 # ---------------------------------------------------------------------------
@@ -278,14 +234,6 @@ class RoutingClassificationSkill(Skill):
         )
         return any(kw in p for kw in action_kws)
 
-    # Chart-reference words that appear in both chart-creation and text-insight contexts.
-    # When an INSIGHT_ONLY signal is present alongside ONLY these words (no real agg/calc),
-    # the query is likely asking *about* a chart, not asking to *create* one.
-    _CHART_REF_ONLY_KWS = frozenset([
-        "图表", "图", "折线图", "柱状图", "饼图", "bar", "line", "pie",
-        "chart", "plot", "可视化", "visualization", "图形",
-    ])
-
     # ---------------------------------------------------------------------------
     # Rule-based classification
     # ---------------------------------------------------------------------------
@@ -300,7 +248,7 @@ class RoutingClassificationSkill(Skill):
         insight_hits = [kw for kw in _INSIGHT_ONLY_KWS if kw in q_lower]
         if insight_hits:
             code_candidates = [kw for kw in _CODE_GEN_KWS if kw in q_lower]
-            non_chart_code = [kw for kw in code_candidates if kw not in self._CHART_REF_ONLY_KWS]
+            non_chart_code = [kw for kw in code_candidates if kw not in _CHART_REF_ONLY_KWS]
             if not non_chart_code:
                 # INSIGHT_ONLY wins: no real computation signals, just chart-ref words
                 return (
@@ -476,8 +424,4 @@ class RoutingClassificationSkill(Skill):
     @staticmethod
     def _extract_target_fields(query: str) -> List[str]:
         """Best-effort field mentions for trace/debug use before semantic typing."""
-        candidates = [
-            "金额", "人民币金额", "销售额", "收入", "利润", "数量", "费用", "成本",
-            "地区", "区域", "店铺", "产品", "品类", "SKU", "订单号", "日期", "月份",
-        ]
-        return [field for field in candidates if field.lower() in query.lower()]
+        return [field for field in _TARGET_FIELD_CANDIDATES if field.lower() in query.lower()]

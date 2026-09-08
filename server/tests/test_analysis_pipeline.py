@@ -39,6 +39,7 @@ from sheetmind.analysis.context import (
 )
 from sheetmind.analysis.models.configs import ModelRole
 from sheetmind.analysis.models.router import ModelRouter
+from sheetmind.analysis.skills import routing_classification as routing_rules_module
 from sheetmind.analysis.skills.chart_planning import ChartPlanningSkill
 from sheetmind.analysis.skills.data_profiling import DataProfilingSkill
 from sheetmind.analysis.skills.routing_classification import (
@@ -161,6 +162,13 @@ class TestRoutingClassificationSkill:
         assert "aggregate" in result.facets.operation_types
         assert "chart" in result.facets.operation_types
         assert "销售额" in result.facets.target_fields
+
+    def test_routing_rules_are_loaded_from_config_file(self):
+        assert routing_rules_module._ROUTING_RULES_PATH.name == "routing_rules.json"
+        assert routing_rules_module._ROUTING_RULES_PATH.exists()
+        assert "汇总" in routing_rules_module._CODE_GEN_KWS
+        assert "筛选" in routing_rules_module._RULE_ONLY_KWS
+        assert "说明什么" in routing_rules_module._INSIGHT_ONLY_KWS
 
 
 # ---------------------------------------------------------------------------
