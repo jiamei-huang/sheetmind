@@ -67,6 +67,7 @@ class ExecutionPlan(BaseModel):
     uses_previous_result: bool = False
     target_fields: List[str] = Field(default_factory=list)
     target_sheets: List[str] = Field(default_factory=list)
+    required_source_columns: List[str] = Field(default_factory=list)
     confidence: float = 0.0
 
 

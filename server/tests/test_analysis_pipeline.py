@@ -551,6 +551,28 @@ class TestRepairLoop:
         from sheetmind.analysis.harness.repair_loop import MAX_REPAIRS
         assert self.mock_code_gen.run.call_count == 1 + MAX_REPAIRS
 
+    def test_required_columns_are_validated_before_execution(self):
+        self.df = pd.DataFrame({"金额": [10], "金额（USD）": [5]})
+        self.mock_code_gen.run = AsyncMock(side_effect=[
+            "result_df = pd.DataFrame({'total': [df['金额'].sum()]})",
+            "result_df = pd.DataFrame({'total': [df['金额（USD）'].sum()]})",
+        ])
+        self.mock_executor.run = MagicMock(return_value=(pd.DataFrame({"total": [5]}), None))
+
+        result_df, code, repairs = run(
+            self.loop.run(
+                self.ctx,
+                "金额（USD）是多少",
+                self.df,
+                required_columns=["金额（USD）"],
+            )
+        )
+
+        assert result_df is not None
+        assert repairs == 1
+        assert "金额（USD）" in code
+        assert self.mock_executor.run.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # SheetMindAgent._build_table_block helper
@@ -834,6 +856,16 @@ class TestEnhancementAcceptance:
 
         assert match is not None
         assert match.column == "金额（RMB）"
+
+    def test_semantic_typing_identifies_usd_qualified_metric(self):
+        skill = SemanticTypingSkill(MockRouter())
+        df = pd.DataFrame({"金额": [10], "金额（USD）": [5]})
+
+        field_map = run(skill.run(make_ctx(), "金额（USD）是多少", df=df))
+
+        assert field_map["金额（USD）"].type == "numeric"
+        assert "usd" in field_map["金额（USD）"].qualifiers
+        assert "金额USD" in field_map["金额（USD）"].aliases
 
     def test_profile_exposes_structured_column_metadata(self):
         skill = DataProfilingSkill(MockRouter())

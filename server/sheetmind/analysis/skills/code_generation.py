@@ -16,8 +16,9 @@ Returns the generated code as a plain string.
 """
 from __future__ import annotations
 
+import ast
 import logging
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import pandas as pd
 
@@ -86,6 +87,7 @@ class CodeGenerationSkill(Skill):
         error_feedback: Optional[str] = None,
         wants_chart: bool = False,
         is_compound: bool = False,
+        required_columns: Optional[list[str]] = None,
         **kwargs: Any,
     ) -> str:
         """
@@ -99,6 +101,7 @@ class CodeGenerationSkill(Skill):
             field_map     — column alias map from SemanticTypingSkill
             error_feedback — if set, previous code + error (triggers repair mode)
             wants_chart   — if True, hint to the model to produce chart-ready aggregated data
+            required_columns — source dataframe columns that must be referenced
 
         Returns:
             Generated Python code string (no markdown, no imports).
@@ -114,6 +117,7 @@ class CodeGenerationSkill(Skill):
             error_feedback=error_feedback,
             wants_chart=wants_chart,
             is_compound=is_compound,
+            required_columns=required_columns,
             ctx=ctx,
         )
 
@@ -144,6 +148,7 @@ class CodeGenerationSkill(Skill):
         error_feedback: Optional[str],
         wants_chart: bool,
         is_compound: bool,
+        required_columns: Optional[list[str]],
         ctx: AnalysisContext,
     ) -> str:
         parts = []
@@ -172,6 +177,13 @@ class CodeGenerationSkill(Skill):
                     "【字段解析建议】\n"
                     + "\n".join(f"  {match.column!r}（{match.reason}）" for match in matches)
                 )
+
+        if required_columns:
+            parts.append(
+                "【强制字段约束】\n"
+                f"用户查询已解析到这些源数据列，生成代码必须直接引用：{required_columns!r}\n"
+                "不要改用相似但未限定的列名；例如用户问 USD/RMB 时，必须使用对应货币字段。"
+            )
 
         # Compound query hint — instruct LLM to answer each sub-question separately
         # and stack results into one result_df with a '问题' label column
@@ -229,3 +241,35 @@ class CodeGenerationSkill(Skill):
             inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
             code = "\n".join(inner)
         return code.strip()
+
+    @staticmethod
+    def validate_required_columns(
+        code: str,
+        required_columns: Optional[list[str]],
+        available_columns: Optional[Iterable[str]] = None,
+    ) -> Optional[str]:
+        """Return an error message when generated code ignores required source columns."""
+        if not required_columns:
+            return None
+
+        available = set(str(col) for col in available_columns) if available_columns is not None else None
+        referenced: set[str] = set()
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                value = node.value
+                if available is None or value in available:
+                    referenced.add(value)
+
+        missing = [column for column in required_columns if column not in referenced]
+        if not missing:
+            return None
+
+        return (
+            "字段约束失败：生成代码没有引用必须字段 "
+            f"{missing!r}。请改用这些精确列名，不能使用相似的未限定列。"
+        )

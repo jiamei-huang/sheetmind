@@ -33,9 +33,10 @@ from .models.router import ModelRouter
 from .skills.chart_planning import ChartPlanningSkill
 from .skills.code_generation import CodeGenerationSkill
 from .skills.data_profiling import DataProfilingSkill
+from .skills.field_resolution import FieldResolver, query_qualifiers
 from .skills.insight_writing import InsightWritingSkill
 from .skills.routing_classification import RoutingClassificationSkill
-from .skills.semantic_typing import SemanticTypingSkill
+from .skills.semantic_typing import SemanticFieldMap, SemanticTypingSkill
 from .skills.sheet_selection import SheetSelectionSkill
 from .streaming.emitter import StreamEmitter
 from .tools.dataframe_loader import DataframeLoaderTool
@@ -294,11 +295,14 @@ class SheetMindAgent:
         # ----------------------------------------------------------------
         field_map = None
         data_summary = ""
+        required_columns: List[str] = []
 
         if df is not None and not df.empty:
             if emitter:
                 await emitter.emit_progress("正在识别字段类型...", step_id="semantic_typing")
             field_map = await self.semantic_skill.run(ctx, query, df=df)
+            required_columns = self._required_source_columns(query, field_map)
+            execution_plan.required_source_columns = required_columns
             if emitter:
                 await emitter.emit_progress("正在生成数据画像...", step_id="data_profiling")
             data_summary = await self.profiling_skill.run(ctx, query, df=df, field_map=field_map)
@@ -333,6 +337,7 @@ class SheetMindAgent:
                 field_map=field_map,
                 wants_chart=wants_chart,
                 is_compound=is_compound,
+                required_columns=required_columns,
                 trace=trace,
                 emit_progress=emit_fn,
             )
@@ -426,6 +431,18 @@ class SheetMindAgent:
         result = validate_result(result, degrade_invalid_charts=True)
 
         return result, hint, mode
+
+    # ------------------------------------------------------------------
+    # Field resolution helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _required_source_columns(query: str, field_map: Optional[SemanticFieldMap]) -> List[str]:
+        if not field_map or not query_qualifiers(query):
+            return []
+
+        match = FieldResolver().resolve(query, field_map, aggregate_only=True)
+        return [match.column] if match else []
 
     # ------------------------------------------------------------------
     # Helpers
