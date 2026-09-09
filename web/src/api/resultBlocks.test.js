@@ -47,3 +47,50 @@ test("rejects obsolete response shapes", () => {
     /无法识别/
   );
 });
+
+
+test("keeps every table block as a named preview", () => {
+  const result = toAnalysisViewModel(
+    {
+      type: "result_blocks",
+      blocks: [
+        {
+          kind: "table",
+          title: "筛选2025年数据",
+          columns: ["year", "amount"],
+          rows: [{ year: 2025, amount: 100 }],
+        },
+        {
+          kind: "table",
+          title: "按金额降序排序",
+          columns: ["year", "amount"],
+          rows: [{ year: 2024, amount: 999 }],
+        },
+      ],
+    },
+    "两个独立问题"
+  );
+
+  assert.equal(result.previews.length, 2);
+  assert.equal(result.previews[0].title, "筛选2025年数据");
+  assert.equal(result.previews[1].rows[0].amount, 999);
+  assert.deepEqual(result.preview, result.previews[0]);
+});
+
+
+test("keeps every chart block as a named visualization", () => {
+  const result = toAnalysisViewModel(
+    {
+      type: "result_blocks",
+      blocks: [
+        { kind: "chart", title: "地区销售额", chart_type: "bar", labels: ["华东"], series: [{ name: "销售额", values: [10] }] },
+        { kind: "chart", title: "月度趋势", chart_type: "line", labels: ["1月"], series: [{ name: "销售额", values: [20] }] },
+      ],
+    },
+    "生成两个图"
+  );
+
+  assert.equal(result.chartDatas.length, 2);
+  assert.equal(result.chartDatas[1].title, "月度趋势");
+  assert.deepEqual(result.chartData, result.chartDatas[0]);
+});

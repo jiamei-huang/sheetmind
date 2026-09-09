@@ -56,6 +56,22 @@ class MultiTurnMode(str, Enum):
     RESET      = "reset"
 
 
+class ExecutionStep(BaseModel):
+    """One validated, atomic operation in a query execution plan."""
+
+    step_id: str
+    query: str
+    route: RoutingHint
+    depends_on: List[str] = Field(default_factory=list)
+    input_source: Literal["source", "previous_result", "step"] = "source"
+    operation_types: List[str] = Field(default_factory=list)
+    needs_new_computation: bool = True
+    wants_chart: bool = False
+    target_fields: List[str] = Field(default_factory=list)
+    required_source_columns: List[str] = Field(default_factory=list)
+    confidence: float = 0.0
+
+
 class ExecutionPlan(BaseModel):
     """Shared, inspectable contract for one routed analysis turn."""
 
@@ -69,6 +85,10 @@ class ExecutionPlan(BaseModel):
     target_sheets: List[str] = Field(default_factory=list)
     required_source_columns: List[str] = Field(default_factory=list)
     confidence: float = 0.0
+    steps: List[ExecutionStep] = Field(default_factory=list)
+    planner_used: bool = False
+    planner_source: Literal["single", "llm", "rule_fallback"] = "single"
+    reasoning: str = ""
 
 
 # ---------------------------------------------------------------------------

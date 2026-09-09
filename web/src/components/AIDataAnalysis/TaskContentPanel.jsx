@@ -302,10 +302,12 @@ const TaskContentPanel = ({
   const renderSingleResult = (result, resultIndex) => {
     const {
       type, // "data" | "chart" | "both" | "insights-only"
-      preview,
+      preview: primaryPreview,
+      previews = [],
       suggestion,
       processedAt,
-      chartData,
+      chartData: primaryChartData,
+      chartDatas = [],
       runtimeNote,
       metrics = [],
     } = result;
@@ -314,6 +316,17 @@ const TaskContentPanel = ({
     const showData = type === "data" || type === "both";
     const showChart = type === "chart" || type === "both";
     const showSuggestion = suggestion && suggestion.trim();
+
+    const availablePreviews = previews.length > 0
+      ? previews
+      : primaryPreview
+        ? [primaryPreview]
+        : [];
+    const activePreviewIndex = Math.min(
+      Math.max(task.activePreviewIndex ?? 0, 0),
+      Math.max(availablePreviews.length - 1, 0)
+    );
+    const preview = availablePreviews[activePreviewIndex] ?? null;
 
     const previewColumns = preview?.columns ?? [];
     const previewRowsRaw = preview?.rows ?? [];
@@ -357,6 +370,17 @@ const TaskContentPanel = ({
         ? totalsFromResult
         : buildPreviewTotals(previewColumns, previewRows);
 
+    const availableCharts = chartDatas.length > 0
+      ? chartDatas
+      : primaryChartData
+        ? [primaryChartData]
+        : [];
+    const activeChartIndex = Math.min(
+      Math.max(task.activeChartIndex ?? 0, 0),
+      Math.max(availableCharts.length - 1, 0)
+    );
+    const chartData = availableCharts[activeChartIndex] ?? null;
+
     const defaultChartType = CHART_TYPES.includes(chartData?.defaultType)
       ? chartData.defaultType
       : CHART_TYPES[0];
@@ -384,9 +408,42 @@ const TaskContentPanel = ({
         {/* Data Processing / Both: 展示数据表 */}
         {showData && previewColumns.length > 0 && (
           <div className="bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden mb-6">
+              {availablePreviews.length > 1 && (
+                <div
+                  role="tablist"
+                  aria-label="分析结果"
+                  className="flex overflow-x-auto border-b border-slate-200 bg-slate-50 px-3"
+                >
+                  {availablePreviews.map((item, index) => {
+                    const isActive = index === activePreviewIndex;
+                    return (
+                      <button
+                        key={`${item.title}-${index}`}
+                        type="button"
+                        role="tab"
+                        aria-selected={isActive}
+                        title={item.title}
+                        onClick={() => onUpdateTask?.(
+                          task.id,
+                          () => ({ activePreviewIndex: index, currentPage: 1 })
+                        )}
+                        className={`min-w-0 max-w-56 shrink-0 border-b-2 px-3 py-2 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-inset ${
+                          isActive
+                            ? "border-blue-600 bg-white text-blue-700"
+                            : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-800"
+                        }`}
+                      >
+                        <span className="block truncate">{item.title}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
               <div className="px-4 py-3 border-b border-slate-100 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex flex-col gap-1">
-                  <h5 className="text-sm font-semibold text-gray-900">Data Preview</h5>
+                  <h5 className="text-sm font-semibold text-gray-900">
+                    {availablePreviews.length > 1 ? preview.title : "Data Preview"}
+                  </h5>
                   <div className="flex flex-wrap items-center gap-2 text-xs text-gray-600">
                     <span>Total Rows Processed: {totalRowsProcessed.toLocaleString()}</span>
                     {isPreviewTruncated && (
@@ -406,9 +463,9 @@ const TaskContentPanel = ({
                   Export
                 </button>
               </div>
-              {(runtimeNote || isPreviewTruncated) && (
+              {((availablePreviews.length === 1 && runtimeNote) || isPreviewTruncated) && (
                 <div className="px-4 py-2 border-b border-amber-100 bg-amber-50 text-xs text-amber-800">
-                  {runtimeNote || "后端会按全量数据执行分析，前端表格只展示预览行以保持页面流畅。"}
+                  {(availablePreviews.length === 1 && runtimeNote) || "后端会按全量数据执行分析，前端表格只展示预览行以保持页面流畅。"}
                 </div>
               )}
               <div className="overflow-auto">
@@ -517,8 +574,41 @@ const TaskContentPanel = ({
         {/* Visualization / Both: 展示图表 */}
         {showChart && chartData && (
           <div className="bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden mb-6">
+            {availableCharts.length > 1 && (
+              <div
+                role="tablist"
+                aria-label="分析图表"
+                className="flex overflow-x-auto border-b border-slate-200 bg-slate-50 px-3"
+              >
+                {availableCharts.map((item, index) => {
+                  const isActive = index === activeChartIndex;
+                  return (
+                    <button
+                      key={`${item.title}-${index}`}
+                      type="button"
+                      role="tab"
+                      aria-selected={isActive}
+                      title={item.title}
+                      onClick={() => onUpdateTask?.(
+                        task.id,
+                        () => ({ activeChartIndex: index, chartDataPage: 1 })
+                      )}
+                      className={`min-w-0 max-w-56 shrink-0 border-b-2 px-3 py-2 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-inset ${
+                        isActive
+                          ? "border-blue-600 bg-white text-blue-700"
+                          : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-800"
+                      }`}
+                    >
+                      <span className="block truncate">{item.title}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
-              <h5 className="text-sm font-semibold text-gray-900">Visualization</h5>
+              <h5 className="text-sm font-semibold text-gray-900">
+                {availableCharts.length > 1 ? chartData.title : "Visualization"}
+              </h5>
               <div className="flex items-center gap-2">
                 <div className="flex items-center">
                   {VISUALIZATION_MODES.map((mode, index) => {

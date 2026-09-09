@@ -31,6 +31,7 @@ from sheetmind.analysis.context import (
     AnalysisContext,
     ChartBlock,
     ChartSeries,
+    ExecutionStep,
     MultiTurnMode,
     ResultBlocks,
     RoutingHint,
@@ -39,10 +40,12 @@ from sheetmind.analysis.context import (
 )
 from sheetmind.analysis.models.configs import ModelRole
 from sheetmind.analysis.models.router import ModelRouter
+from sheetmind.analysis.skills.query_planning import QueryPlan, QueryPlanningSkill
 from sheetmind.analysis.skills import routing_classification as routing_rules_module
 from sheetmind.analysis.skills.chart_planning import ChartPlanningSkill
 from sheetmind.analysis.skills.data_profiling import DataProfilingSkill
 from sheetmind.analysis.skills.routing_classification import (
+    IntentFacets,
     RoutingClassificationSkill,
     RoutingResult,
 )
@@ -70,9 +73,11 @@ class MockModelProvider:
     """Returns deterministic responses — no real API calls."""
     def __init__(self, response: str = '{"routing":"code","reasoning":"mock"}'):
         self._response = response
+        self.calls = 0
 
     async def complete(self, messages, system="", max_tokens=512, temperature=0.0,
                        json_mode=False, **kwargs):
+        self.calls += 1
         return self._response
 
 
@@ -138,6 +143,12 @@ class TestRoutingClassificationSkill:
         result = run(self.skill.run(ctx, "重新看全部数据"))
         assert result.mode == MultiTurnMode.RESET
 
+    def test_internal_sequence_does_not_reuse_previous_turn(self):
+        ctx = make_ctx(with_active_result=True)
+        result = run(self.skill.run(ctx, "先筛选2025年数据，再按店铺汇总金额"))
+        assert result.mode == MultiTurnMode.NEW_QUERY
+        assert result.structure.requires_planning is True
+
     def test_numeric_operator_triggers_code_gen(self):
         result = run(self.skill.run(self.ctx, "金额 > 10000 的订单"))
         assert result.hint == RoutingHint.CODE_GEN
@@ -166,9 +177,100 @@ class TestRoutingClassificationSkill:
     def test_routing_rules_are_loaded_from_config_file(self):
         assert routing_rules_module._ROUTING_RULES_PATH.name == "routing_rules.json"
         assert routing_rules_module._ROUTING_RULES_PATH.exists()
+        assert "level_1" in routing_rules_module._ROUTING_RULES
+        assert "level_2" in routing_rules_module._ROUTING_RULES
         assert "汇总" in routing_rules_module._CODE_GEN_KWS
         assert "筛选" in routing_rules_module._RULE_ONLY_KWS
         assert "说明什么" in routing_rules_module._INSIGHT_ONLY_KWS
+
+
+# ---------------------------------------------------------------------------
+# QueryPlanningSkill
+# ---------------------------------------------------------------------------
+
+class TestQueryPlanningSkill:
+    def test_decomposes_dependent_mixed_route_query(self):
+        response = """{
+          "steps": [
+            {"query": "筛选2025年数据", "depends_on": []},
+            {"query": "按店铺汇总人民币金额", "depends_on": ["s1"]},
+            {"query": "取金额最高的前5个店铺", "depends_on": ["s2"]},
+            {"query": "分析这些店铺金额差异的原因", "depends_on": ["s3"]}
+          ],
+          "reasoning": "先计算再解释",
+          "confidence": 0.93
+        }"""
+        router = MockRouter(response)
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx()
+        query = "筛选2025年数据，再按店铺汇总人民币金额，找最高5个，然后分析原因"
+
+        routing = run(routing_skill.run(ctx, query))
+        plan = run(planning_skill.run(ctx, query, routing=routing))
+
+        assert plan.is_multi_step is True
+        assert plan.source == "llm"
+        assert [step.route for step in plan.steps] == [
+            RoutingHint.RULE_ENGINE,
+            RoutingHint.CODE_GEN,
+            RoutingHint.CODE_GEN,
+            RoutingHint.INSIGHT_ONLY,
+        ]
+        assert [step.depends_on for step in plan.steps] == [
+            [], ["s1"], ["s2"], ["s3"],
+        ]
+
+    def test_simple_query_skips_planning_model(self):
+        router = MockRouter("not-json")
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx()
+
+        routing = run(routing_skill.run(ctx, "筛选2025年数据"))
+        plan = run(planning_skill.run(ctx, "筛选2025年数据", routing=routing))
+
+        assert plan.source == "single"
+        assert len(plan.steps) == 1
+        assert router._mock.calls == 0
+
+    def test_invalid_llm_plan_falls_back_to_sequential_rules(self):
+        router = MockRouter('{"unexpected": true}')
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx()
+        query = "先筛选2025年数据，然后按店铺汇总金额"
+
+        routing = run(routing_skill.run(ctx, query))
+        plan = run(planning_skill.run(ctx, query, routing=routing))
+
+        assert plan.source == "rule_fallback"
+        assert [step.route for step in plan.steps] == [
+            RoutingHint.RULE_ENGINE,
+            RoutingHint.CODE_GEN,
+        ]
+        assert plan.steps[1].depends_on == ["s1"]
+
+    def test_llm_plan_cannot_drop_qualified_field(self):
+        response = """{
+          "steps": [
+            {"query": "筛选2025年数据", "depends_on": []},
+            {"query": "按店铺汇总金额", "depends_on": ["s1"]}
+          ],
+          "reasoning": "two steps",
+          "confidence": 0.9
+        }"""
+        router = MockRouter(response)
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx()
+        query = "先筛选2025年数据，然后按店铺汇总金额（RMB）"
+
+        routing = run(routing_skill.run(ctx, query))
+        plan = run(planning_skill.run(ctx, query, routing=routing))
+
+        assert plan.source == "rule_fallback"
+        assert "金额（RMB）" in plan.steps[-1].query
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +733,98 @@ class TestBuildTableBlock:
 # ---------------------------------------------------------------------------
 
 class TestSheetMindAgentPipeline:
+    def test_executes_each_planned_step_from_its_dependency_result(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({
+            "日期": ["2024-01-01", "2025-01-01", "2025-02-01"],
+            "店铺": ["A", "A", "B"],
+            "金额（RMB）": [999, 100, 300],
+        })
+        query = "筛选2025年数据，再按店铺汇总人民币金额，找最高5个，然后分析原因"
+        plan = QueryPlan(
+            steps=[
+                ExecutionStep(step_id="s1", query="筛选2025年数据", route=RoutingHint.RULE_ENGINE),
+                ExecutionStep(step_id="s2", query="按店铺汇总人民币金额", route=RoutingHint.CODE_GEN, depends_on=["s1"], input_source="step"),
+                ExecutionStep(step_id="s3", query="取金额最高的前5个店铺", route=RoutingHint.CODE_GEN, depends_on=["s2"], input_source="step"),
+                ExecutionStep(step_id="s4", query="分析金额差异的原因", route=RoutingHint.INSIGHT_ONLY, depends_on=["s3"], input_source="step", needs_new_computation=False),
+            ],
+            is_multi_step=True,
+            source="llm",
+            confidence=0.93,
+            reasoning="dependent plan",
+        )
+        seen_inputs = []
+
+        async def execute_code(*args, **kwargs):
+            input_df = kwargs["df"]
+            seen_inputs.append(input_df.copy())
+            if len(seen_inputs) == 1:
+                grouped = input_df.groupby("店铺", as_index=False)["金额（RMB）"].sum()
+                return grouped, "result = grouped", 0
+            return input_df.sort_values("金额（RMB）", ascending=False).head(5), "result = df", 0
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.9,
+            reasoning="compound",
+            is_compound=True,
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.sheet_skill.run = AsyncMock(return_value=[{"fileName": "sales.xlsx", "sheets": ["Sheet1"]}])
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock(side_effect=execute_code)
+        agent.insight_skill.run = AsyncMock(return_value="B店金额最高。")
+
+        result = run(agent.run(ctx, query))
+
+        assert len(seen_inputs) == 2
+        assert set(seen_inputs[0]["日期"].str[:4]) == {"2025"}
+        assert list(seen_inputs[1].columns) == ["店铺", "金额（RMB）"]
+        assert result.first_table().rows[0]["店铺"] == "B"
+        assert ctx.execution_plan is not None
+        assert len(ctx.execution_plan.steps) == 4
+
+    def test_returns_each_independent_terminal_result(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({
+            "日期": ["2024-01-01", "2025-01-01", "2025-02-01"],
+            "金额": [999, 100, 300],
+        })
+        plan = QueryPlan(
+            steps=[
+                ExecutionStep(step_id="s1", query="筛选2025年数据", route=RoutingHint.RULE_ENGINE),
+                ExecutionStep(step_id="s2", query="按金额降序排序", route=RoutingHint.RULE_ENGINE),
+            ],
+            is_multi_step=True,
+            source="rule_fallback",
+            confidence=0.8,
+        )
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.RULE_ENGINE,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.8,
+            reasoning="parallel",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.sheet_skill.run = AsyncMock(return_value=[{"fileName": "sales.xlsx", "sheets": ["Sheet1"]}])
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.insight_skill.run = AsyncMock(return_value="已分别完成筛选和排序。")
+
+        result = run(agent.run(ctx, "筛选2025年数据，同时按金额降序排序"))
+
+        tables = [block for block in result.blocks if block.kind == "table"]
+        assert len(tables) == 2
+        assert [table.title for table in tables] == ["筛选2025年数据", "按金额降序排序"]
+        assert len(tables[0].rows) == 2
+        assert tables[1].rows[0]["金额"] == 999
+
     def test_insight_only_loads_dataframe_for_insight_without_table_output(self):
         from sheetmind.analysis.agent import SheetMindAgent
         from sheetmind.analysis.tracing.trace import Trace
@@ -729,6 +923,7 @@ class TestSheetMindAgentPipeline:
             confidence=0.9,
             reasoning="follow-up chart",
             is_compound=True,
+            facets=IntentFacets(wants_chart=True),
         ))
         agent.df_loader.run = MagicMock(side_effect=AssertionError("should not load source data"))
         agent.repair_loop.run = AsyncMock(side_effect=AssertionError("should not codegen"))

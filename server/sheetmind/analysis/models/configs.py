@@ -11,6 +11,7 @@ Environment override syntax:
 e.g.
     SHEETMIND_MODEL_CODE_GENERATION_ID=claude-sonnet-5
     SHEETMIND_MODEL_ROUTING_ID=gpt-4o-mini
+    SHEETMIND_MODEL_QUERY_PLANNING_ID=gpt-4o-mini
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ class ModelRole(str, Enum):
     Stable Chinese writing models handle insight text generation.
     """
     ROUTING          = "routing"           # 3-way RoutingHint, low stakes
+    QUERY_PLANNING   = "query_planning"    # multi-step decomposition + dependencies
     SEMANTIC_TYPING  = "semantic_typing"   # column type inference
     SHEET_SELECTION  = "sheet_selection"   # pick relevant sheets from query
     CODE_GENERATION  = "code_generation"   # generate pandas code
@@ -59,6 +61,13 @@ DEFAULT_CONFIGS: Dict[ModelRole, ModelConfig] = {
         max_tokens=256,
         temperature=0.0,
         timeout_seconds=15,
+    ),
+    ModelRole.QUERY_PLANNING: ModelConfig(
+        provider="openai",
+        model_id="gpt-4o-mini",
+        max_tokens=1024,
+        temperature=0.0,
+        timeout_seconds=20,
     ),
     ModelRole.SEMANTIC_TYPING: ModelConfig(
         provider="openai",

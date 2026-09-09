@@ -12,7 +12,6 @@ one analysis query.  It:
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -22,6 +21,7 @@ from .context import (
     ChartBlock,
     ColumnMeta,
     ExecutionPlan,
+    ExecutionStep,
     MultiTurnMode,
     ResultBlocks,
     RoutingHint,
@@ -35,7 +35,11 @@ from .skills.code_generation import CodeGenerationSkill
 from .skills.data_profiling import DataProfilingSkill
 from .skills.field_resolution import FieldResolver, query_qualifiers
 from .skills.insight_writing import InsightWritingSkill
-from .skills.routing_classification import RoutingClassificationSkill
+from .skills.query_planning import QueryPlan, QueryPlanningSkill
+from .skills.routing_classification import (
+    RoutingClassificationSkill,
+    RoutingResult,
+)
 from .skills.semantic_typing import SemanticFieldMap, SemanticTypingSkill
 from .skills.sheet_selection import SheetSelectionSkill
 from .streaming.emitter import StreamEmitter
@@ -44,17 +48,9 @@ from .tools.python_executor import PythonExecutorTool
 from .tools.rule_engine import RuleEngineTool
 from .tracing.storage import get_trace_store
 from .tracing.trace import EVT_ERROR, EVT_RESULT_ASSEMBLED, EVT_ROUTING, Trace
-from .validators.result_validator import ResultValidationError, validate_result
+from .validators.result_validator import validate_result
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Chart keyword detection (same bank as ChartPlanningSkill)
-# ---------------------------------------------------------------------------
-_CHART_KWS = [
-    "图", "图表", "折线图", "柱状图", "饼图", "bar", "line", "pie",
-    "chart", "plot", "可视化", "visualization", "图形", "趋势图",
-]
 
 # Maximum rows in TableBlock.rows returned to frontend
 _MAX_TABLE_ROWS = 1000
@@ -78,6 +74,7 @@ class SheetMindAgent:
 
         # Instantiate all skills and tools once (reusable, stateless)
         self.routing_skill = RoutingClassificationSkill(self.router)
+        self.planning_skill = QueryPlanningSkill(self.router, self.routing_skill)
         self.sheet_skill = SheetSelectionSkill(self.router)
         self.semantic_skill = SemanticTypingSkill(self.router)
         self.profiling_skill = DataProfilingSkill(self.router)
@@ -176,17 +173,13 @@ class SheetMindAgent:
     ) -> tuple:  # (ResultBlocks, Optional[RoutingHint], Optional[MultiTurnMode])
         """
         Execute the full skill pipeline:
-          1. RoutingClassificationSkill → RoutingHint + MultiTurnMode
-          2. SheetSelectionSkill → selected_files
-          3. DataframeLoaderTool → df
-          4. SemanticTypingSkill → field_map
-          5. DataProfilingSkill  → data_summary
-          6a. RULE_ENGINE → RuleEngineTool → result_df
-          6b. CODE_GEN   → RepairLoop (CodeGen + PythonExecutor) → result_df
-          6c. INSIGHT_ONLY → skip new structured execution
-          7. ChartPlanningSkill → chart_block (if wants_chart)
-          8. InsightWritingSkill → summary_text
-          9. Assemble + validate ResultBlocks
+          1. RoutingClassificationSkill → query structure + coarse route
+          2. QueryPlanningSkill → validated atomic steps + dependencies
+          3. SheetSelectionSkill + DataframeLoaderTool → source df
+          4. Execute each step against its declared source/dependency result
+          5. ChartPlanningSkill → chart blocks (if requested)
+          6. InsightWritingSkill → summary_text
+          7. Assemble + validate ResultBlocks
         """
         # ----------------------------------------------------------------
         # 1. Routing classification
@@ -197,41 +190,7 @@ class SheetMindAgent:
         routing = await self.routing_skill.run(ctx, query)
         hint: RoutingHint = routing.hint
         mode: MultiTurnMode = routing.mode
-        is_compound: bool = routing.is_compound
-        wants_chart = hint != RoutingHint.INSIGHT_ONLY and (
-            routing.facets.wants_chart or self._query_wants_chart(query)
-        )
-        execution_plan = ExecutionPlan(
-            route=hint,
-            mode=mode,
-            operation_types=routing.facets.operation_types,
-            needs_new_computation=routing.facets.needs_new_computation,
-            wants_chart=wants_chart,
-            uses_previous_result=routing.facets.uses_previous_result,
-            target_fields=routing.facets.target_fields,
-            confidence=routing.confidence,
-        )
-        ctx.execution_plan = execution_plan
-
-        trace.add_event(
-            EVT_ROUTING,
-            output_summary=(
-                f"hint={hint.value} mode={mode.value} conf={routing.confidence:.2f}"
-                + (" compound=True" if is_compound else "")
-            ),
-            metadata={
-                "reasoning": routing.reasoning,
-                "facets": {
-                    "operation_types": routing.facets.operation_types,
-                    "needs_new_computation": routing.facets.needs_new_computation,
-                    "wants_chart": routing.facets.wants_chart,
-                    "uses_previous_result": routing.facets.uses_previous_result,
-                    "target_fields": routing.facets.target_fields,
-                },
-                "execution_plan": execution_plan.model_dump(mode="json"),
-            },
-        )
-        logger.debug("[Pipeline] routing=%s mode=%s", hint.value, mode.value)
+        wants_chart = hint != RoutingHint.INSIGHT_ONLY and routing.facets.wants_chart
 
         previous_result_df = self._previous_result_dataframe(ctx)
         if (
@@ -241,6 +200,13 @@ class SheetMindAgent:
             and previous_result_df is not None
             and not previous_result_df.empty
         ):
+            shortcut_plan = QueryPlan(
+                steps=[QueryPlanningSkill._single_step(query, routing)],
+                confidence=routing.confidence,
+                reasoning="Direct presentation from the previous result.",
+            )
+            ctx.execution_plan = self._build_execution_plan(shortcut_plan, routing, wants_chart)
+            self._trace_execution_plan(trace, ctx.execution_plan, routing)
             return await self._run_previous_result_chart(
                 ctx=ctx,
                 query=query,
@@ -250,13 +216,33 @@ class SheetMindAgent:
                 emitter=emitter,
             )
 
+        if (routing.structure.requires_planning or routing.is_compound) and emitter:
+            await emitter.emit_progress("正在拆解多步骤任务...", step_id="query_planning")
+        query_plan = await self.planning_skill.run(ctx, query, routing=routing)
+        execution_plan = self._build_execution_plan(query_plan, routing, wants_chart)
+        ctx.execution_plan = execution_plan
+        hint = execution_plan.route
+        wants_chart = execution_plan.wants_chart
+        self._trace_execution_plan(trace, execution_plan, routing)
+        logger.debug(
+            "[Pipeline] routing=%s mode=%s steps=%d planner=%s",
+            hint.value,
+            mode.value,
+            len(query_plan.steps),
+            query_plan.source,
+        )
+
         # ----------------------------------------------------------------
         # 2. Sheet selection
         # ----------------------------------------------------------------
         selected_files: List[Dict[str, Any]] = []
         df: Optional[pd.DataFrame] = None
         can_reuse_followup_df = mode == MultiTurnMode.FOLLOW_UP and ctx._active_df is not None
-        should_try_load_data = hint != RoutingHint.INSIGHT_ONLY or can_reuse_followup_df or ctx.active_result is None
+        should_try_load_data = (
+            any(step.needs_new_computation for step in query_plan.steps)
+            or can_reuse_followup_df
+            or ctx.active_result is None
+        )
 
         if should_try_load_data and not can_reuse_followup_df:
             if emitter:
@@ -274,6 +260,11 @@ class SheetMindAgent:
                     selected_files = []
                 elif not ctx.files:
                     hint = RoutingHint.INSIGHT_ONLY
+                    for step in query_plan.steps:
+                        step.route = RoutingHint.INSIGHT_ONLY
+                        step.needs_new_computation = False
+                    execution_plan.route = RoutingHint.INSIGHT_ONLY
+                    execution_plan.needs_new_computation = False
                 else:
                     raise
 
@@ -291,86 +282,53 @@ class SheetMindAgent:
             )
 
         # ----------------------------------------------------------------
-        # 4 & 5. Semantic typing + data profiling
+        # 4. Execute validated plan steps in dependency order
         # ----------------------------------------------------------------
-        field_map = None
-        data_summary = ""
-        required_columns: List[str] = []
-
-        if df is not None and not df.empty:
-            if emitter:
-                await emitter.emit_progress("正在识别字段类型...", step_id="semantic_typing")
-            field_map = await self.semantic_skill.run(ctx, query, df=df)
-            required_columns = self._required_source_columns(query, field_map)
-            execution_plan.required_source_columns = required_columns
-            if emitter:
-                await emitter.emit_progress("正在生成数据画像...", step_id="data_profiling")
-            data_summary = await self.profiling_skill.run(ctx, query, df=df, field_map=field_map)
-
-        # ----------------------------------------------------------------
-        # 6. Execution branch
-        # ----------------------------------------------------------------
-        result_df: Optional[pd.DataFrame] = None
-        final_code: str = ""
-        if hint == RoutingHint.RULE_ENGINE and df is not None:
-            if emitter:
-                await emitter.emit_progress("正在筛选数据...", step_id="execution")
-            try:
-                result_df = self.rule_engine.run(ctx, query=query, df=df, field_map=field_map)
-            except Exception as exc:
-                logger.warning("[Pipeline] rule engine failed, falling back to CODE_GEN: %s", exc)
-                # Fall through to CODE_GEN
-                hint = RoutingHint.CODE_GEN
-
-        if hint == RoutingHint.CODE_GEN and df is not None:
-            if emitter:
-                async def emit_fn(message: str) -> None:
-                    await emitter.emit_progress(message, step_id="execution")
-            else:
-                emit_fn = None
-
-            result_df, final_code, repairs = await self.repair_loop.run(
-                ctx=ctx,
-                query=query,
-                df=df,
-                data_summary=data_summary,
-                field_map=field_map,
-                wants_chart=wants_chart,
-                is_compound=is_compound,
-                required_columns=required_columns,
-                trace=trace,
-                emit_progress=emit_fn,
+        result_df, visible_results, step_outputs, execution_failed = await self._execute_plan_steps(
+            ctx=ctx,
+            plan=query_plan,
+            source_df=df,
+            previous_result_df=previous_result_df,
+            execution_plan=execution_plan,
+            trace=trace,
+            emitter=emitter,
+        )
+        if execution_failed:
+            error_msg = (
+                "数据查询执行失败，请尝试换一种方式描述您的问题，"
+                "或检查列名是否正确。"
             )
-
-            if result_df is None:
-                # All repair attempts exhausted — surface a clean error
-                error_msg = (
-                    "数据查询执行失败，请尝试换一种方式描述您的问题，"
-                    "或检查列名是否正确。"
-                )
-                logger.warning("[Pipeline] repair loop exhausted for task=%s", ctx.task_id)
-                result = ResultBlocks(blocks=[SummaryBlock(content=error_msg)])
-                return result, hint, mode
-
-        # INSIGHT_ONLY: result_df stays None — we go straight to insight writing
-        if result_df is not None:
-            self._remember_result_dataframe(ctx, input_df=df, result_df=result_df)
+            logger.warning("[Pipeline] planned execution failed for task=%s", ctx.task_id)
+            return ResultBlocks(blocks=[SummaryBlock(content=error_msg)]), hint, mode
 
         # ----------------------------------------------------------------
-        # 7. Chart planning (only when execution produced data)
+        # 5. Chart planning for the result requested by each chart step
         # ----------------------------------------------------------------
-        chart_block: Optional[ChartBlock] = None
+        chart_blocks: List[ChartBlock] = []
+        chart_requests = [step for step in query_plan.steps if step.wants_chart]
+        if wants_chart and not chart_requests and query_plan.steps:
+            chart_requests = [query_plan.steps[-1]]
 
-        if wants_chart and result_df is not None and not result_df.empty:
+        for step in chart_requests[:3]:
+            chart_df = step_outputs.get(step.step_id)
+            if chart_df is None:
+                chart_df = result_df
+            if chart_df is None or chart_df.empty:
+                continue
             if emitter:
                 await emitter.emit_progress("正在生成图表...", step_id="chart_planning")
-            result_field_map = await self.semantic_skill.run(ctx, query, df=result_df)
-            chart_block = await self.chart_skill.run(
+            result_field_map = await self.semantic_skill.run(ctx, step.query, df=chart_df)
+            chart = await self.chart_skill.run(
                 ctx,
-                query,
-                result_df=result_df,
+                step.query,
+                result_df=chart_df,
                 field_map=result_field_map,
             )
+            if chart is not None:
+                chart.title = step.query
+                chart_blocks.append(chart)
+
+        chart_block = chart_blocks[0] if chart_blocks else None
 
         # ----------------------------------------------------------------
         # 8. Insight writing
@@ -378,16 +336,24 @@ class SheetMindAgent:
         if emitter:
             await emitter.emit_progress("正在生成分析洞察...", step_id="insight_writing")
 
-        if hint == RoutingHint.INSIGHT_ONLY:
+        last_step_is_insight = bool(
+            query_plan.steps and query_plan.steps[-1].route == RoutingHint.INSIGHT_ONLY
+        )
+        if hint == RoutingHint.INSIGHT_ONLY or last_step_is_insight:
             scenario = "insight_only"
         elif chart_block is not None:
             scenario = "chart"
         else:
             scenario = "processing"
 
-        table_block: Optional[TableBlock] = (
-            self._build_table_block(result_df) if result_df is not None else None
-        )
+        table_blocks: List[TableBlock] = []
+        for step, step_df in visible_results:
+            table = self._build_table_block(step_df)
+            if table is not None:
+                if len(visible_results) > 1:
+                    table.title = step.query
+                table_blocks.append(table)
+        table_block = table_blocks[-1] if table_blocks else None
 
         insight_df = result_df
         if insight_df is None and hint == RoutingHint.INSIGHT_ONLY:
@@ -416,13 +382,10 @@ class SheetMindAgent:
         if summary_text:
             blocks.append(SummaryBlock(content=summary_text))
 
-        # Table
-        if table_block is not None:
-            blocks.append(table_block)
+        # Tables from independent terminal branches, or the final sequential step.
+        blocks.extend(table_blocks)
 
-        # Chart
-        if chart_block is not None:
-            blocks.append(chart_block)
+        blocks.extend(chart_blocks)
 
         result = ResultBlocks(blocks=blocks)
 
@@ -431,6 +394,209 @@ class SheetMindAgent:
         result = validate_result(result, degrade_invalid_charts=True)
 
         return result, hint, mode
+
+    async def _execute_plan_steps(
+        self,
+        ctx: AnalysisContext,
+        plan: QueryPlan,
+        source_df: Optional[pd.DataFrame],
+        previous_result_df: Optional[pd.DataFrame],
+        execution_plan: ExecutionPlan,
+        trace: Trace,
+        emitter: Optional[StreamEmitter],
+    ) -> tuple[
+        Optional[pd.DataFrame],
+        List[tuple[ExecutionStep, pd.DataFrame]],
+        Dict[str, pd.DataFrame],
+        bool,
+    ]:
+        """Execute an already validated plan; dependencies may only point backward."""
+        outputs: Dict[str, pd.DataFrame] = {}
+        computed: List[tuple[ExecutionStep, pd.DataFrame]] = []
+        required_columns: List[str] = []
+
+        for index, step in enumerate(plan.steps, start=1):
+            input_df = self._step_input_dataframe(
+                step,
+                outputs=outputs,
+                source_df=source_df,
+                previous_result_df=previous_result_df,
+            )
+            if input_df is None:
+                if step.needs_new_computation:
+                    logger.warning("[Pipeline] no input dataframe for step=%s", step.step_id)
+                    return None, [], outputs, True
+                continue
+
+            if not step.needs_new_computation or step.route == RoutingHint.INSIGHT_ONLY:
+                outputs[step.step_id] = input_df
+                continue
+
+            if emitter:
+                await emitter.emit_progress(
+                    f"正在执行第 {index}/{len(plan.steps)} 步...",
+                    step_id="execution",
+                )
+
+            if input_df.empty:
+                outputs[step.step_id] = input_df.copy()
+                computed.append((step, outputs[step.step_id]))
+                continue
+
+            if emitter:
+                await emitter.emit_progress("正在识别字段类型...", step_id="semantic_typing")
+            field_map = await self.semantic_skill.run(ctx, step.query, df=input_df)
+            step.required_source_columns = self._required_source_columns(step.query, field_map)
+            for column in step.required_source_columns:
+                if column not in required_columns:
+                    required_columns.append(column)
+
+            if emitter:
+                await emitter.emit_progress("正在生成数据画像...", step_id="data_profiling")
+            data_summary = await self.profiling_skill.run(
+                ctx,
+                step.query,
+                df=input_df,
+                field_map=field_map,
+            )
+
+            result: Optional[pd.DataFrame] = None
+            if step.route == RoutingHint.RULE_ENGINE:
+                try:
+                    result = self.rule_engine.run(
+                        ctx,
+                        query=step.query,
+                        df=input_df,
+                        field_map=field_map,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[Pipeline] rule step %s fell back to CODE_GEN: %s",
+                        step.step_id,
+                        exc,
+                    )
+                    step.route = RoutingHint.CODE_GEN
+
+            if step.route == RoutingHint.CODE_GEN and result is None:
+                if emitter:
+                    async def emit_fn(message: str) -> None:
+                        await emitter.emit_progress(message, step_id="execution")
+                else:
+                    emit_fn = None
+                result, _code, _repairs = await self.repair_loop.run(
+                    ctx=ctx,
+                    query=step.query,
+                    df=input_df,
+                    data_summary=data_summary,
+                    field_map=field_map,
+                    wants_chart=step.wants_chart,
+                    is_compound=False,
+                    required_columns=step.required_source_columns,
+                    trace=trace,
+                    emit_progress=emit_fn,
+                )
+
+            if result is None:
+                return None, [], outputs, True
+
+            outputs[step.step_id] = result
+            computed.append((step, result))
+            self._remember_result_dataframe(ctx, input_df=input_df, result_df=result)
+
+        execution_plan.required_source_columns = required_columns
+        consumed_by_computation = {
+            dependency
+            for step in plan.steps
+            if step.needs_new_computation
+            for dependency in step.depends_on
+        }
+        visible = [item for item in computed if item[0].step_id not in consumed_by_computation]
+        final_result = computed[-1][1] if computed else None
+        return final_result, visible, outputs, False
+
+    @staticmethod
+    def _step_input_dataframe(
+        step: ExecutionStep,
+        outputs: Dict[str, pd.DataFrame],
+        source_df: Optional[pd.DataFrame],
+        previous_result_df: Optional[pd.DataFrame],
+    ) -> Optional[pd.DataFrame]:
+        if len(step.depends_on) > 1:
+            return None
+        if step.depends_on:
+            return outputs.get(step.depends_on[0])
+        if step.input_source == "previous_result" and previous_result_df is not None:
+            return previous_result_df
+        return source_df
+
+    @staticmethod
+    def _build_execution_plan(
+        plan: QueryPlan,
+        routing: RoutingResult,
+        wants_chart: bool,
+    ) -> ExecutionPlan:
+        def unique(values: List[str]) -> List[str]:
+            return list(dict.fromkeys(values))
+
+        routes = [step.route for step in plan.steps]
+        if RoutingHint.CODE_GEN in routes:
+            primary_route = RoutingHint.CODE_GEN
+        elif RoutingHint.RULE_ENGINE in routes:
+            primary_route = RoutingHint.RULE_ENGINE
+        else:
+            primary_route = RoutingHint.INSIGHT_ONLY
+
+        operation_types = unique([
+            operation
+            for step in plan.steps
+            for operation in step.operation_types
+        ]) or list(routing.facets.operation_types)
+        target_fields = unique([
+            target
+            for step in plan.steps
+            for target in step.target_fields
+        ]) or list(routing.facets.target_fields)
+
+        return ExecutionPlan(
+            route=primary_route,
+            mode=routing.mode,
+            operation_types=operation_types,
+            needs_new_computation=any(step.needs_new_computation for step in plan.steps),
+            wants_chart=wants_chart or any(step.wants_chart for step in plan.steps),
+            uses_previous_result=(
+                routing.facets.uses_previous_result
+                or any(step.input_source == "previous_result" for step in plan.steps)
+            ),
+            target_fields=target_fields,
+            confidence=plan.confidence,
+            steps=plan.steps,
+            planner_used=plan.is_multi_step,
+            planner_source=plan.source,
+            reasoning=plan.reasoning,
+        )
+
+    @staticmethod
+    def _trace_execution_plan(
+        trace: Trace,
+        execution_plan: ExecutionPlan,
+        routing: RoutingResult,
+    ) -> None:
+        trace.add_event(
+            EVT_ROUTING,
+            output_summary=(
+                f"hint={execution_plan.route.value} mode={execution_plan.mode.value} "
+                f"conf={execution_plan.confidence:.2f} steps={len(execution_plan.steps)}"
+            ),
+            metadata={
+                "reasoning": routing.reasoning,
+                "structure": {
+                    "requires_planning": routing.structure.requires_planning,
+                    "score": routing.structure.score,
+                    "signals": routing.structure.signals,
+                },
+                "execution_plan": execution_plan.model_dump(mode="json"),
+            },
+        )
 
     # ------------------------------------------------------------------
     # Field resolution helpers
@@ -447,12 +613,6 @@ class SheetMindAgent:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _query_wants_chart(query: str) -> bool:
-        """Return True if the query contains chart/visualization keywords."""
-        q_lower = query.lower()
-        return any(kw in q_lower for kw in _CHART_KWS)
 
     @staticmethod
     def _query_targets_previous_result(query: str) -> bool:

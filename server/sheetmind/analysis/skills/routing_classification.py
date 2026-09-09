@@ -4,9 +4,11 @@ SheetMind — Routing Classification Skill
 Returns RoutingHint (rule / code / text) + MultiTurnMode (new / follow_up / reset).
 
 Design:
-- Rule-based keyword matching is the primary path (cheap, instant).
-- Keyword banks live in analysis/config/routing_rules.json so routing language
-  can be tuned without editing this module.
+- Level 1 classifies query structure: multi-turn mode and whether the query
+  needs dependency-aware planning.
+- Level 2 classifies each atomic operation into an execution route and facets.
+- Both rule levels live in analysis/config/routing_rules.json so routing
+  language can be tuned without editing this module.
 - LLM fallback only when confidence < 0.55 (rare ambiguous cases).
 - Multi-turn mode is determined first — it takes priority and can influence routing.
 - Secondary intent facets are returned beside the 3-way execution route.
@@ -41,40 +43,45 @@ def _load_routing_rules() -> Dict[str, Any]:
     with _ROUTING_RULES_PATH.open("r", encoding="utf-8") as fp:
         data = json.load(fp)
 
-    groups = data.get("keyword_groups")
-    if not isinstance(groups, dict):
-        raise ValueError(f"routing rules must contain keyword_groups: {_ROUTING_RULES_PATH}")
+    if not isinstance(data.get("level_1"), dict) or not isinstance(data.get("level_2"), dict):
+        raise ValueError(f"routing rules must contain level_1 and level_2: {_ROUTING_RULES_PATH}")
     return data
 
 
 _ROUTING_RULES = _load_routing_rules()
-_KEYWORD_GROUPS: Dict[str, Any] = _ROUTING_RULES["keyword_groups"]
+_LEVEL_1_GROUPS: Dict[str, Any] = _ROUTING_RULES["level_1"].get("keyword_groups", {})
+_ROUTE_GROUPS: Dict[str, Any] = _ROUTING_RULES["level_2"].get("route_keywords", {})
+_FACET_GROUPS: Dict[str, Any] = _ROUTING_RULES["level_2"].get("facet_keywords", {})
+_LEVEL_1_THRESHOLDS: Dict[str, Any] = _ROUTING_RULES["level_1"].get("thresholds", {})
 
 
-def _keywords(group_name: str) -> List[str]:
-    values = _KEYWORD_GROUPS.get(group_name, [])
+def _keywords(groups: Dict[str, Any], group_name: str) -> List[str]:
+    values = groups.get(group_name, [])
     if not isinstance(values, list):
         raise ValueError(f"routing keyword group must be a list: {group_name}")
     return [str(value) for value in values]
 
 
-_RESET_KWS = _keywords("reset")
-_FOLLOW_UP_KWS = _keywords("follow_up")
-_CODE_GEN_KWS = _keywords("code_gen")
-_RULE_ONLY_KWS = _keywords("rule_only")
-_INSIGHT_ONLY_KWS = _keywords("insight_only")
-_VAGUE_KWS = _keywords("vague")
-_DETERMINISTIC_EXTREME_KWS = _keywords("deterministic_extreme")
-_DETERMINISTIC_EXTREME_SUBJECT_KWS = _keywords("deterministic_extreme_subject")
-_COMPLEX_OVERRIDE_KWS = _keywords("complex_override")
-_FILTER_TRIGGER_KWS = _keywords("filter_trigger")
-_SORT_TRIGGER_KWS = _keywords("sort_trigger")
-_AGGREGATE_KWS = _keywords("aggregate")
-_TREND_KWS = _keywords("trend")
-_COMPARE_KWS = _keywords("compare")
-_ANOMALY_KWS = _keywords("anomaly")
-_CHART_KWS = _keywords("chart")
-_CHART_REF_ONLY_KWS = frozenset(_keywords("chart_reference_only"))
+_RESET_KWS = _keywords(_LEVEL_1_GROUPS, "reset")
+_FOLLOW_UP_KWS = _keywords(_LEVEL_1_GROUPS, "follow_up")
+_SEQUENCE_KWS = _keywords(_LEVEL_1_GROUPS, "sequence")
+_PARALLEL_KWS = _keywords(_LEVEL_1_GROUPS, "parallel")
+_DEPENDENCY_KWS = _keywords(_LEVEL_1_GROUPS, "dependency")
+_CODE_GEN_KWS = _keywords(_ROUTE_GROUPS, "code_gen")
+_RULE_ONLY_KWS = _keywords(_ROUTE_GROUPS, "rule_only")
+_INSIGHT_ONLY_KWS = _keywords(_ROUTE_GROUPS, "insight_only")
+_VAGUE_KWS = _keywords(_ROUTE_GROUPS, "vague")
+_DETERMINISTIC_EXTREME_KWS = _keywords(_ROUTE_GROUPS, "deterministic_extreme")
+_DETERMINISTIC_EXTREME_SUBJECT_KWS = _keywords(_ROUTE_GROUPS, "deterministic_extreme_subject")
+_COMPLEX_OVERRIDE_KWS = _keywords(_ROUTE_GROUPS, "complex_override")
+_FILTER_TRIGGER_KWS = _keywords(_FACET_GROUPS, "filter_trigger")
+_SORT_TRIGGER_KWS = _keywords(_FACET_GROUPS, "sort_trigger")
+_AGGREGATE_KWS = _keywords(_FACET_GROUPS, "aggregate")
+_TREND_KWS = _keywords(_FACET_GROUPS, "trend")
+_COMPARE_KWS = _keywords(_FACET_GROUPS, "compare")
+_ANOMALY_KWS = _keywords(_FACET_GROUPS, "anomaly")
+_CHART_KWS = _keywords(_FACET_GROUPS, "chart")
+_CHART_REF_ONLY_KWS = frozenset(_keywords(_ROUTE_GROUPS, "chart_reference_only"))
 _TARGET_FIELD_CANDIDATES = [
     str(value) for value in _ROUTING_RULES.get("target_field_candidates", [])
 ]
@@ -99,13 +106,23 @@ class IntentFacets:
 
 
 @dataclass
+class QueryStructure:
+    """Level-1 result describing query shape before atomic route selection."""
+
+    requires_planning: bool = False
+    score: int = 0
+    signals: List[str] = field(default_factory=list)
+
+
+@dataclass
 class RoutingResult:
     hint: RoutingHint
     mode: MultiTurnMode
     confidence: float
     reasoning: str
-    is_compound: bool = False   # True when query contains multiple independent questions
+    is_compound: bool = False   # Compatibility alias for structure.requires_planning
     facets: IntentFacets = field(default_factory=IntentFacets)
+    structure: QueryStructure = field(default_factory=QueryStructure)
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +138,8 @@ class RoutingClassificationSkill(Skill):
     name = "routing_classification"
     description = "Classify query into RoutingHint (rule/code/insight) + MultiTurnMode (new/follow_up/reset)"
 
-    # Confidence threshold below which we call the LLM
-    LLM_THRESHOLD = 0.55
+    # Confidence threshold below which an atomic query calls the routing LLM.
+    LLM_THRESHOLD = float(_LEVEL_1_THRESHOLDS.get("llm_routing_confidence", 0.55))
 
     # ---------------------------------------------------------------------------
     # Public
@@ -132,18 +149,21 @@ class RoutingClassificationSkill(Skill):
         self,
         ctx: AnalysisContext,
         query: str,
+        atomic: bool = False,
         **kwargs: Any,
     ) -> RoutingResult:
         q = query.strip()
 
-        # Step 1: determine multi-turn mode
+        # Level 1: determine conversation mode and query structure.
         mode = self._detect_multiturn_mode(q, ctx)
+        structure = QueryStructure() if atomic else self._classify_structure(q)
 
-        # Step 2: rule-based routing hint
+        # Level 2: classify the execution route for this query. For a planned
+        # query this is only a coarse top-level hint; every atomic step is
+        # classified again by QueryPlanningSkill.
         hint, confidence, reasoning = self._rule_classify(q)
 
-        # Step 3: LLM fallback if ambiguous
-        if confidence < self.LLM_THRESHOLD:
+        if confidence < self.LLM_THRESHOLD and not structure.requires_planning:
             try:
                 hint, reasoning = await self._llm_classify(q, ctx, hint)
                 confidence = 0.80
@@ -151,8 +171,6 @@ class RoutingClassificationSkill(Skill):
                 # Don't fail the whole request on routing LLM error — fall back to rule result
                 reasoning += f" (LLM fallback failed: {exc})"
 
-        # Step 4: detect compound / multi-part queries
-        is_compound = self._detect_compound(q)
         facets = self._build_facets(q, hint, mode)
 
         return RoutingResult(
@@ -160,8 +178,9 @@ class RoutingClassificationSkill(Skill):
             mode=mode,
             confidence=confidence,
             reasoning=reasoning,
-            is_compound=is_compound,
+            is_compound=structure.requires_planning,
             facets=facets,
+            structure=structure,
         )
 
     # ---------------------------------------------------------------------------
@@ -192,25 +211,63 @@ class RoutingClassificationSkill(Skill):
     # ---------------------------------------------------------------------------
 
     @staticmethod
-    def _detect_compound(query: str) -> bool:
+    def _classify_structure(query: str) -> QueryStructure:
         """
-        Return True when the query contains two or more independent analytical
-        questions that each need separate computation.
-
-        Heuristic: split on Chinese sentence terminators (。？) and connector
-        phrases; if ≥ 2 segments are non-trivial (≥ 6 chars) the query is
-        treated as compound so CodeGenerationSkill can produce a combined result.
+        Score level-1 structural evidence. A single weak conjunction is not
+        enough; explicit sequencing/dependency or multiple analytical clauses
+        activates QueryPlanningSkill.
         """
-        import re
-
-        # Split on sentence boundaries and common compound connectors
-        parts = re.split(r'[。？?]|另外|同时|还有|以及|并且|此外', query)
+        q_lower = query.lower()
+        boundary_pattern = str(
+            _ROUTING_RULES["level_1"].get("patterns", {}).get(
+                "clause_boundary_regex", r"[。！？!?；;]"
+            )
+        )
+        parallel_pattern = "|".join(
+            re.escape(keyword) for keyword in sorted(_PARALLEL_KWS, key=len, reverse=True)
+        )
+        split_pattern = (
+            f"(?:{boundary_pattern})|(?:{parallel_pattern})"
+            if parallel_pattern
+            else boundary_pattern
+        )
+        parts = re.split(split_pattern, query)
         meaningful = [
             p.strip()
             for p in parts
             if len(p.strip()) >= 6 and RoutingClassificationSkill._looks_independent_question(p)
         ]
-        return len(meaningful) >= 2
+        signals: List[str] = []
+        score = 0
+
+        sequence_hits = [kw for kw in _SEQUENCE_KWS if kw in q_lower]
+        dependency_hits = [kw for kw in _DEPENDENCY_KWS if kw in q_lower]
+        parallel_hits = [kw for kw in _PARALLEL_KWS if kw in q_lower]
+
+        if sequence_hits:
+            score += 2
+            signals.append(f"sequence:{sequence_hits[0]}")
+        if dependency_hits:
+            score += 2
+            signals.append(f"dependency:{dependency_hits[0]}")
+        if len(meaningful) >= 2:
+            score += 2
+            signals.append(f"analytical_clauses:{len(meaningful)}")
+        elif parallel_hits:
+            score += 1
+            signals.append(f"parallel:{parallel_hits[0]}")
+
+        threshold = int(_LEVEL_1_THRESHOLDS.get("planning_score", 2))
+        return QueryStructure(
+            requires_planning=score >= threshold,
+            score=score,
+            signals=signals,
+        )
+
+    @staticmethod
+    def _detect_compound(query: str) -> bool:
+        """Compatibility wrapper for callers that only need a boolean."""
+        return RoutingClassificationSkill._classify_structure(query).requires_planning
 
     @staticmethod
     def _looks_independent_question(part: str) -> bool:

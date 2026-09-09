@@ -192,7 +192,7 @@ function AIDataAnalysis({
         onShowToast?.({ title: "导出失败", message: "无图表数据可导出", type: "error" });
         return;
       }
-      const chartData = result.chartData;
+      const chartData = result.chartDatas?.[targetTask.activeChartIndex ?? 0] ?? result.chartData;
 
       try {
         onShowToast?.({ title: "导出中", message: "正在生成图表图片...", type: "info", autoClose: true });
@@ -233,7 +233,8 @@ function AIDataAnalysis({
         onShowToast?.({ title: "导出失败", message: "无图表数据可导出", type: "error" });
         return;
       }
-      const { labels, series } = result.chartData;
+      const chartData = result.chartDatas?.[targetTask.activeChartIndex ?? 0] ?? result.chartData;
+      const { labels, series } = chartData;
 
       try {
         const headers = ["Label", ...series.map((s) => s.name)];
@@ -696,7 +697,7 @@ function AIDataAnalysis({
           exportMenuTaskId={exportMenuTaskId}
           onToggleExportMenu={toggleExportMenuForTask}
           chartContainerRefs={chartContainerRefs}
-          onUpdateTask={updateTask}
+          onUpdateTask={effectiveUpdateTask}
         />
       </div>
 

@@ -21,6 +21,8 @@ from .context import (
     ChartBlock,
     ChartSeries,
     ColumnMeta,
+    ExecutionPlan,
+    ExecutionStep,
     FileRef,
     MetricBlock,
     MultiTurnMode,
@@ -50,6 +52,8 @@ __all__ = [
     "ChartBlock",
     "ChartSeries",
     "ColumnMeta",
+    "ExecutionPlan",
+    "ExecutionStep",
     # Routing enums
     "RoutingHint",
     "MultiTurnMode",

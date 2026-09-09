@@ -7,7 +7,8 @@ Browser (React)
   -> FastAPI routes
     -> project, file, task, and conversation services
     -> SheetMindAgent
-      -> routing and sheet-selection skills
+      -> two-level routing and dependency-aware query planning
+      -> sheet-selection and semantic field skills
       -> dataframe tools and guarded Python execution
       -> chart and insight skills
       -> ResultBlocks
@@ -37,7 +38,14 @@ Model access is replaceable through `ModelRouter` and `ModelProvider`. Generated
 
 ## Analysis routing
 
-`RoutingClassificationSkill` is the first intent layer. It classifies a user query by execution path:
+Intent handling has two rule levels configured in `server/sheetmind/analysis/config/routing_rules.json`:
+
+- Level 1 identifies multi-turn mode and structural signals such as sequential steps, parallel questions, and dependencies.
+- Level 2 classifies an atomic operation by execution route and produces operation facets.
+
+Simple queries remain on the rule-first fast path. When Level 1 detects a multi-operation query, `QueryPlanningSkill` asks the planning model to decompose it into validated atomic steps. Each step is then classified independently by Level 2; low-confidence atomic routes can still use the routing model fallback.
+
+The available execution routes are:
 
 | Routing hint | Meaning | New structured computation |
 |---|---|---|
@@ -53,7 +61,9 @@ The same skill also emits secondary routing facets for debugging and future Stud
 - `uses_previous_result`: whether the turn is a follow-up that refers to prior results.
 - `target_fields`: best-effort field mentions before semantic typing runs.
 
-`SheetMindAgent` converts this into an `ExecutionPlan` held in the runtime context and trace. The plan records the route, multi-turn mode, requested fields/sheets, chart intent, previous-result use, and routing confidence.
+`QueryPlanningSkill` returns ordered `ExecutionStep` records containing a route, dependency IDs, input source, operations, chart intent, fields, and confidence. Dependencies may only reference prior steps, and planning output is rejected if it drops currency qualifiers or numeric constraints. Invalid model output falls back to deterministic clause splitting.
+
+`SheetMindAgent` stores the resulting `ExecutionPlan` in runtime context and trace. Dependent steps consume the declared prior result; independent steps consume the original source and may produce multiple named result blocks. Semantic typing, profiling, field resolution, code-generation field contracts, and executor validation are applied to every computational step.
 
 ## Semantic data contract
 
@@ -72,7 +82,7 @@ The same skill also emits secondary routing facets for debugging and future Stud
 
 `ChartPlanningSkill` uses semantic metadata to choose axes, supports period labels as time axes, limits crowded categorical charts with `Other`, and records a confidence and reason. `ResultValidator` enforces frontend table/chart caps and drops an invalid chart while retaining valid table and summary blocks.
 
-Insights receive computed facts rather than raw prompt-only context. SSE progress frames carry stable step IDs: `routing`, `sheet_selection`, `data_loading`, `semantic_typing`, `data_profiling`, `execution`, `chart_planning`, `insight_writing`, and `validation`.
+Insights receive computed facts rather than raw prompt-only context. SSE progress frames carry stable step IDs: `routing`, `query_planning`, `sheet_selection`, `data_loading`, `semantic_typing`, `data_profiling`, `execution`, `chart_planning`, `insight_writing`, and `validation`.
 
 ## Result protocol
 

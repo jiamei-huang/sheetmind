@@ -44,6 +44,6 @@ npm run build
 
 ## Model configuration
 
-The runtime uses an OpenAI-compatible client. `OPENAI_API_KEY` and `OPENAI_BASE_URL` configure the connection. Role-specific `SHEETMIND_MODEL_*_ID` variables allow cheaper models for routing and stronger models for generated code.
+The runtime uses an OpenAI-compatible client. `OPENAI_API_KEY` and `OPENAI_BASE_URL` configure the connection. Role-specific `SHEETMIND_MODEL_*_ID` variables allow cheaper models for routing and query planning while reserving stronger models for generated code. `SHEETMIND_MODEL_QUERY_PLANNING_ID` controls multi-step decomposition independently from `SHEETMIND_MODEL_ROUTING_ID`.
 
 Never commit `.env`, local databases, uploaded workbooks, logs, or generated build output.
