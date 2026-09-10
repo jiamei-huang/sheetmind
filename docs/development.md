@@ -46,6 +46,6 @@ npm run build
 
 The runtime uses an OpenAI-compatible client. `OPENAI_API_KEY` and `OPENAI_BASE_URL` configure the connection. Role-specific `SHEETMIND_MODEL_*_ID` variables allow cheaper models for routing and query planning while reserving stronger models for generated code. `SHEETMIND_MODEL_QUERY_PLANNING_ID` controls semantic structure detection and dependency-aware decomposition. `SHEETMIND_MODEL_ROUTING_ID` only supplements low-confidence atomic operation/output intents; deterministic local rules still choose the execution route.
 
-Routing vocabulary is configured in `server/sheetmind/analysis/config/routing_rules.json`. Add data work terms under `level_2.operation_terms` and presentation terms under `level_2.output_terms`; do not add execution-engine keyword groups. Route behavior belongs to the operation-combination decision in `RoutingClassificationSkill`, while result-block behavior belongs to `OutputPlanningSkill`.
+Routing vocabulary is configured in `server/sheetmind/analysis/config/routing_rules.json`. Add data work terms under `level_2.operation_terms` and presentation terms under `level_2.output_terms`; do not add execution-engine keyword groups. Derived intent and Route behavior belong to the signal-combination rules in `RoutingClassificationSkill`, while result-block behavior belongs to `OutputPlanningSkill`. Every new ambiguity rule must include a positive example and a nearby negative example in routing tests.
 
 Never commit `.env`, local databases, uploaded workbooks, logs, or generated build output.

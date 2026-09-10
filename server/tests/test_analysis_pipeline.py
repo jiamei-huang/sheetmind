@@ -317,6 +317,38 @@ class TestRoutingClassificationSkill:
         assert "trend" in result.operation_intent.types
         assert result.output_intent.formats == ["chart"]
 
+    def test_asking_how_to_read_trend_infers_insight_not_chart_creation(self):
+        result = run(self.skill.run(self.ctx, "怎么看 SKU 销售额趋势"))
+
+        assert result.hint == RoutingHint.CODE_GEN
+        assert {"trend", "explain"} <= set(result.operation_intent.types)
+        assert "chart_data_prep" not in result.operation_intent.types
+        assert result.output_intent.formats == ["insight"]
+        assert result.structure.needs_semantic_planning is True
+
+    def test_viewing_how_trend_behaves_infers_insight_not_chart_creation(self):
+        result = run(self.skill.run(self.ctx, "查看 SKU 销售额趋势如何"))
+
+        assert {"trend", "explain"} <= set(result.operation_intent.types)
+        assert "chart_data_prep" not in result.operation_intent.types
+        assert result.output_intent.formats == ["insight"]
+
+    def test_visualize_trend_infers_chart_output(self):
+        result = run(self.skill.run(self.ctx, "可视化 SKU 销售额趋势"))
+
+        assert result.hint == RoutingHint.CODE_GEN
+        assert "trend" in result.operation_intent.types
+        assert "chart_data_prep" in result.operation_intent.types
+        assert result.output_intent.formats == ["chart"]
+
+    def test_generate_generic_file_does_not_infer_excel_or_chart(self):
+        result = run(self.skill.run(self.ctx, "生成文件"))
+
+        assert result.output_intent.formats == ["auto"]
+        assert result.output_intent.explicit is False
+        assert "chart_data_prep" not in result.operation_intent.types
+        assert result.structure.needs_semantic_planning is True
+
     def test_normalized_relative_month_has_date_filter_operation(self):
         result = run(self.skill.run(
             self.ctx,
@@ -399,6 +431,8 @@ class TestRoutingClassificationSkill:
         assert "筛选" in routing_rules_module._OPERATION_TERMS["filter"]
         assert "展示" not in routing_rules_module._OPERATION_TERMS["filter"]
         assert "excel" in routing_rules_module._OUTPUT_TERMS["export_excel"]
+        assert "看" not in routing_rules_module._OUTPUT_TERMS["display_action"]
+        assert "可视化" in routing_rules_module._OUTPUT_TERMS["visualization_action"]
 
 
 # ---------------------------------------------------------------------------

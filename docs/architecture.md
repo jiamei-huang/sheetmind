@@ -40,15 +40,48 @@ Model access is replaceable through `ModelRouter` and `ModelProvider`. Generated
 
 ## Analysis routing
 
-Intent handling is split into five decisions:
+Intent handling is split into six decisions:
 
 1. **Query Normalization** deterministically preserves the original query while producing a machine-oriented version. It normalizes Unicode punctuation and whitespace, converts contextual Chinese numerals, and expands relative dates into explicit half-open ranges. It does not use an LLM.
 2. **Structure Detection** uses high-precision rules for explicit sequencing, parallel questions, dependencies, and clearly simple queries. Complex or ambiguous shapes are sent to `QueryPlanningSkill`, whose model may confirm one atomic operation or return multiple dependency-ordered steps.
-3. **Intent Extraction** independently produces `OperationIntent` and `OutputIntent`. Operation terms describe work such as filtering, aggregation, trend calculation, and anomaly detection. Output terms describe presentation such as a table, chart, insight, or Excel export. Neither vocabulary names an execution engine.
-4. **Route Decision** uses only `OperationIntent`. Computation operations select `CODE_GEN`; filter/sort/pass-through operations select `RULE_ENGINE`; explanation without new computation selects `INSIGHT_ONLY`. A low-confidence atomic query may ask the routing model for additional operation and output intents, but the model cannot directly select or override the route.
-5. **Output Planning** runs after execution planning and uses `OutputIntent` to decide which result blocks to assemble. For example, an explicit chart request may return a chart and summary without a redundant table, while Excel export preserves tabular output.
+3. **Intent Signal Extraction** independently collects raw operation and output signals. Operation terms describe work such as filtering, aggregation, trend calculation, and anomaly detection. Output terms describe presentation such as a table, chart, insight, or Excel export. Neither vocabulary names an execution engine.
+4. **Derived Intent Rules** combine raw signals and resolve ambiguous wording before routing. For example, display plus trend derives a chart request, while explain plus trend derives an insight request and suppresses chart creation. These rules are deterministic and covered by regression tests.
+5. **Route Decision** uses only `OperationIntent`. Computation operations select `CODE_GEN`; filter/sort/pass-through operations select `RULE_ENGINE`; explanation without new computation selects `INSIGHT_ONLY`. A low-confidence atomic query may ask the routing model for additional operation and output intents, but the model cannot directly select or override the route.
+6. **Output Planning** runs after execution planning and uses `OutputIntent` to decide which result blocks to assemble. For example, an explicit chart request may return a chart and summary without a redundant table, while Excel export preserves tabular output.
 
 This keeps explicit simple queries on a zero-model fast path while using semantic understanding where a mistaken structural guess would be costly. Every planned atomic step crosses the same signal-extraction and route-decision interface.
+
+### Derived intent rules (意图派生与消歧规则)
+
+词库只抽取原始语义信号，不使用某个关键词直接决定执行 Route。原始信号经过以下组合规则后，形成最终的 `OperationIntent` 与 `OutputIntent`：
+
+- 同时命中异常语义与查找语义时，派生 `anomaly_detect`；仅出现“异常”不直接假设用户要求执行异常检测。
+- 明确图表类型，或明确提出绘图、展示趋势、可视化时，派生 `chart` 和 `chart_data_prep`。
+- “说明什么、怎么看、趋势如何、为什么”等解释语义优先于展示语义。“怎么看趋势”表示先计算趋势再解释，不表示创建图表。
+- 只有导出语义与 Excel、xlsx、电子表格或工作簿同时出现时，才派生 `export_excel`。“生成文件”本身不等于导出 Excel。
+- “分析 + 指标”保留为 `analysis_request + auto`，交给语义规划判断需要哪些计算与解释，不默认创建图表。
+- “哪个 + 最高/最低”等明确极值问题保留 `which + extreme`，Route Decision 可稳定选择 `RULE_ENGINE`。
+- “展示、显示、查看”不派生筛选。只有“筛选、过滤、只看、满足条件”等明确条件语义才派生 `filter`。
+- 对已有图表的解释请求不创建新图。例如“这个柱状图说明了什么”派生 `explain + insight`。
+
+最终行为示例：
+
+| 用户 Query | Operation Intent | Output Intent | 规划与执行结果 |
+|---|---|---|---|
+| `生成 Excel` | `pass_through` | `export_excel` | `RULE_ENGINE`，导出当前表格结果 |
+| `汇总各地区销售额并导出 Excel` | `aggregate` | `export_excel` | `CODE_GEN`，先汇总再导出 |
+| `生成文件` | `general` | `auto` | 信息不足，进入语义规划，不假设 Excel 或图表 |
+| `查看 SKU 销售额趋势` | `trend + chart_data_prep` | `chart` | `CODE_GEN`，计算趋势并生成图表 |
+| `展示 SKU 销售额趋势` | `trend + chart_data_prep` | `chart` | `CODE_GEN`，计算趋势并生成图表 |
+| `可视化 SKU 销售额趋势` | `trend + chart_data_prep` | `chart` | `CODE_GEN`，计算趋势并生成图表 |
+| `怎么看 SKU 销售额趋势` | `trend + explain` | `insight` | 进入语义规划，按“计算趋势 -> 解释趋势”执行，不强制画图 |
+| `查看 SKU 销售额趋势如何` | `trend + explain` | `insight` | 进入语义规划，按“计算趋势 -> 解释趋势”执行，不强制画图 |
+| `分析 SKU 销售额` | `analysis_request` | `auto` | 进入语义规划，不默认画图 |
+| `这个柱状图说明了什么` | `explain` | `insight` | `INSIGHT_ONLY`，解释已有结果，不创建新图 |
+| `找出退货率异常的地区` | `anomaly + anomaly_detect` | `auto` | `CODE_GEN`，执行异常检测 |
+| `哪个店铺金额最高` | `which + extreme` | `auto` | `RULE_ENGINE`，执行确定性极值查询 |
+| `展示华东数据` | `vague` | `auto` | `RULE_ENGINE`，不把“展示”误判为筛选 |
+| `筛选华东地区的数据` | `filter` | `auto` | `RULE_ENGINE`，执行明确筛选 |
 
 The available execution routes are:
 

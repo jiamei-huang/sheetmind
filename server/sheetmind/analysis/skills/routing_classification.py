@@ -217,6 +217,7 @@ class RoutingClassificationSkill(Skill):
     @classmethod
     def _extract_intents(cls, query: str) -> tuple[OperationIntent, OutputIntent]:
         """Extract operation and output meaning without choosing an engine."""
+        # Collect raw semantic signals from configurable vocabularies.
         operation_matches = cls._match_terms(query, _OPERATION_TERMS)
         output_matches = cls._match_terms(query, _OUTPUT_TERMS)
         operations = [
@@ -235,6 +236,8 @@ class RoutingClassificationSkill(Skill):
             add_operation("numeric_condition", "regex:numeric_condition")
         if _DATE_RANGE_PATTERN.search(query):
             add_operation("date_filter", "regex:date_range")
+
+        # Derive intents from signal combinations and resolve ambiguity before routing.
         if "anomaly" in operation_matches and "detect_action" in operation_matches:
             add_operation("anomaly_detect")
 
@@ -243,12 +246,21 @@ class RoutingClassificationSkill(Skill):
         )
         explains = "explain" in operations
         references_existing = "reference_marker" in output_matches
+        visualizes = "visualization_action" in output_matches
         chart_requested = False
-        if chart_mentioned and "chart_action" in output_matches:
+        if chart_mentioned and (
+            "chart_action" in output_matches or visualizes
+        ):
             chart_requested = not (references_existing and explains)
         if "chart_type" in output_matches and not references_existing and not explains:
             chart_requested = True
-        if "display_action" in output_matches and "trend" in operations:
+        if visualizes and not explains:
+            chart_requested = True
+        if (
+            "display_action" in output_matches
+            and "trend" in operations
+            and not explains
+        ):
             chart_requested = True
 
         formats: List[str] = []

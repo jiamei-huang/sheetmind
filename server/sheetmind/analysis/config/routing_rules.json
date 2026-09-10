@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "level_1": {
     "description": "Query structure: conversation mode, sequencing, parallelism, and dependencies.",
     "keyword_groups": {
@@ -107,10 +107,13 @@
         "这个", "该图", "上图", "上面", "上述", "已有", "当前"
       ],
       "chart_action": [
-        "画", "生成", "绘制", "制作", "创建", "出一个", "可视化", "visualize", "plot"
+        "画", "生成", "绘制", "制作", "创建", "出一个"
       ],
       "display_action": [
-        "查看", "展示", "显示", "看", "show", "view", "display"
+        "查看", "展示", "显示", "看一下", "show", "view", "display"
+      ],
+      "visualization_action": [
+        "可视化", "visualize", "plot"
       ],
       "table_reference": [
         "表格", "数据表", "明细", "列表", "table", "list"
