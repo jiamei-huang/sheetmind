@@ -39,10 +39,10 @@ class QueryPlanningSkill(Skill):
     """
     Turn a query into a small, dependency-ordered list of atomic operations.
 
-    Simple queries do not call a model. Structurally complex queries use the
-    planning model for decomposition, then route every atomic step through the
-    normal two-level routing module. Invalid model output falls back to a local
-    deterministic splitter.
+    High-confidence simple queries do not call a model. Complex or structurally
+    ambiguous queries use one semantic planning call that may confirm one step
+    or return a dependency-aware decomposition. Invalid output falls back to a
+    local deterministic splitter.
     """
 
     name = "query_planning"
@@ -64,7 +64,7 @@ class QueryPlanningSkill(Skill):
         **kwargs: Any,
     ) -> QueryPlan:
         routing = routing or await self.routing_skill.run(ctx, query)
-        if not (routing.structure.requires_planning or routing.is_compound):
+        if not routing.structure.needs_semantic_planning:
             return QueryPlan(
                 steps=[self._single_step(query, routing)],
                 is_multi_step=False,
@@ -76,7 +76,7 @@ class QueryPlanningSkill(Skill):
         raw_steps: List[Dict[str, Any]]
         source: Literal["llm", "rule_fallback"]
         confidence = 0.65
-        reasoning = "Level-1 structure signals required decomposition."
+        reasoning = "Structure detection requested semantic planning."
         try:
             raw_steps, confidence, reasoning = await self._llm_decompose(ctx, query)
             source = "llm"
@@ -85,15 +85,6 @@ class QueryPlanningSkill(Skill):
             raw_steps = self._rule_decompose(query)
             source = "rule_fallback"
             reasoning = f"Deterministic fallback after planner error: {exc}"
-
-        if len(raw_steps) < 2:
-            return QueryPlan(
-                steps=[self._single_step(query, routing)],
-                is_multi_step=False,
-                source="single",
-                confidence=routing.confidence,
-                reasoning=f"Decomposition collapsed to one step. {reasoning}",
-            )
 
         steps = await self._route_steps(ctx, raw_steps, routing.mode)
         return QueryPlan(
@@ -130,8 +121,9 @@ class QueryPlanningSkill(Skill):
     ) -> tuple[List[Dict[str, Any]], float, str]:
         provider = self.router.get_provider(ModelRole.QUERY_PLANNING)
         system = (
-            "你是数据分析执行规划器。把一个复合查询拆成最多6个原子步骤，并标出前置依赖。\n"
-            "只负责拆分和依赖，不选择执行引擎，不生成代码。\n"
+            "你是数据分析结构识别与执行规划器。先判断查询是一个问题还是多个问题。\n"
+            "单一问题原样返回1个步骤；多个问题拆成最多6个原子步骤，并标出前置依赖。\n"
+            "只负责结构、拆分和依赖，不选择执行引擎，不生成代码。\n"
             "每一步必须可单独执行；筛选、汇总、Top-N、比较、图表、解释应按用户语义排序。\n"
             "如果后一步基于前一步结果，depends_on 必须引用一个前序步骤ID；每步最多一个依赖。"
             "并行问题不添加依赖。\n"
@@ -154,7 +146,7 @@ class QueryPlanningSkill(Skill):
         )
         data = self._parse_json(response)
         raw = data.get("steps")
-        if not isinstance(raw, list) or not 2 <= len(raw) <= _MAX_PLAN_STEPS:
+        if not isinstance(raw, list) or not 1 <= len(raw) <= _MAX_PLAN_STEPS:
             raise ValueError(f"planner returned invalid step count: {len(raw) if isinstance(raw, list) else 0}")
 
         steps: List[Dict[str, Any]] = []

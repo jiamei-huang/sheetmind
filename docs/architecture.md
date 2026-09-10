@@ -7,7 +7,8 @@ Browser (React)
   -> FastAPI routes
     -> project, file, task, and conversation services
     -> SheetMindAgent
-      -> two-level routing and dependency-aware query planning
+      -> hybrid structure detection and dependency-aware query planning
+      -> intent-signal extraction and deterministic route decision
       -> sheet-selection and semantic field skills
       -> dataframe tools and guarded Python execution
       -> chart and insight skills
@@ -38,12 +39,13 @@ Model access is replaceable through `ModelRouter` and `ModelProvider`. Generated
 
 ## Analysis routing
 
-Intent handling has two rule levels configured in `server/sheetmind/analysis/config/routing_rules.json`:
+Intent handling is split into three decisions:
 
-- Level 1 identifies multi-turn mode and structural signals such as sequential steps, parallel questions, and dependencies.
-- Level 2 classifies an atomic operation by execution route and produces operation facets.
+1. **Structure Detection** uses high-precision rules for explicit sequencing, parallel questions, dependencies, and clearly simple queries. Complex or ambiguous shapes are sent to `QueryPlanningSkill`, whose model may confirm one atomic operation or return multiple dependency-ordered steps.
+2. **Intent Signal Extraction** maps each atomic query to configurable meanings such as `filter`, `sort`, `aggregate`, `top_n`, `trend`, `pivot`, `chart_create`, and `chart_explain`. The vocabulary in `server/sheetmind/analysis/config/routing_rules.json` contains no execution-route keyword groups.
+3. **Route Decision** applies deterministic signal combinations. Computation signals select `CODE_GEN`; filter/sort-only signals select `RULE_ENGINE`; explanation without new computation selects `INSIGHT_ONLY`. A low-confidence atomic query may ask the routing model for additional signals, but the model cannot directly select or override the route.
 
-Simple queries remain on the rule-first fast path. When Level 1 detects a multi-operation query, `QueryPlanningSkill` asks the planning model to decompose it into validated atomic steps. Each step is then classified independently by Level 2; low-confidence atomic routes can still use the routing model fallback.
+This keeps explicit simple queries on a zero-model fast path while using semantic understanding where a mistaken structural guess would be costly. Every planned atomic step crosses the same signal-extraction and route-decision interface.
 
 The available execution routes are:
 
@@ -53,7 +55,7 @@ The available execution routes are:
 | `CODE_GEN` / `code` | LLM generates pandas data-processing code for aggregation, pivoting, Top-N, growth rate, share calculation, or complex conditions. | Yes |
 | `INSIGHT_ONLY` / `insight` | LLM writes insight from existing results or lightweight dataframe context. It does not create a new table/chart computation. | No |
 
-The same skill also emits secondary routing facets for debugging and future Studio views:
+The same skill exposes the extracted `IntentSignals` for tracing, then derives secondary routing facets for downstream execution:
 
 - `operation_types`: product intent labels such as `filter`, `sort`, `aggregate`, `trend`, `compare`, `anomaly`, `explain`, and `chart`.
 - `needs_new_computation`: whether this turn should produce a new structured result.
@@ -61,7 +63,7 @@ The same skill also emits secondary routing facets for debugging and future Stud
 - `uses_previous_result`: whether the turn is a follow-up that refers to prior results.
 - `target_fields`: best-effort field mentions before semantic typing runs.
 
-`QueryPlanningSkill` returns ordered `ExecutionStep` records containing a route, dependency IDs, input source, operations, chart intent, fields, and confidence. Dependencies may only reference prior steps, and planning output is rejected if it drops currency qualifiers or numeric constraints. Invalid model output falls back to deterministic clause splitting.
+`QueryPlanningSkill` returns one or more ordered `ExecutionStep` records containing a route, dependency IDs, input source, operations, chart intent, fields, and confidence. Dependencies may only reference prior steps, and planning output is rejected if it drops currency qualifiers or numeric constraints. Invalid model output falls back to deterministic clause splitting.
 
 `SheetMindAgent` stores the resulting `ExecutionPlan` in runtime context and trace. Dependent steps consume the declared prior result; independent steps consume the original source and may produce multiple named result blocks. Semantic typing, profiling, field resolution, code-generation field contracts, and executor validation are applied to every computational step.
 

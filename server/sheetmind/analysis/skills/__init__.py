@@ -5,7 +5,7 @@ from .code_generation import CodeGenerationSkill
 from .data_profiling import DataProfilingSkill
 from .insight_writing import InsightWritingSkill
 from .query_planning import QueryPlan, QueryPlanningSkill
-from .routing_classification import RoutingClassificationSkill, RoutingResult
+from .routing_classification import IntentSignals, RoutingClassificationSkill, RoutingResult
 from .semantic_typing import SemanticFieldInfo, SemanticFieldMap, SemanticTypingSkill
 from .sheet_selection import SheetSelectionSkill
 
@@ -18,6 +18,7 @@ __all__ = [
     "InsightWritingSkill",
     "QueryPlan",
     "QueryPlanningSkill",
+    "IntentSignals",
     "RoutingClassificationSkill",
     "RoutingResult",
     "SemanticFieldInfo",

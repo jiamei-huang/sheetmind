@@ -46,6 +46,7 @@ from sheetmind.analysis.skills.chart_planning import ChartPlanningSkill
 from sheetmind.analysis.skills.data_profiling import DataProfilingSkill
 from sheetmind.analysis.skills.routing_classification import (
     IntentFacets,
+    IntentSignals,
     RoutingClassificationSkill,
     RoutingResult,
 )
@@ -174,14 +175,72 @@ class TestRoutingClassificationSkill:
         assert "chart" in result.facets.operation_types
         assert "销售额" in result.facets.target_fields
 
+    def test_filter_and_sort_signals_combine_into_rule_engine_route(self):
+        result = run(self.skill.run(self.ctx, "筛选2025年订单并按金额降序排序"))
+
+        assert result.hint == RoutingHint.RULE_ENGINE
+        assert isinstance(result.intent_signals, IntentSignals)
+        assert {"filter", "sort"} <= set(result.intent_signals.active)
+        assert "aggregate" not in result.intent_signals.active
+
+    def test_chart_explanation_is_not_chart_creation(self):
+        result = run(self.skill.run(self.ctx, "这个柱状图说明了什么"))
+
+        assert result.hint == RoutingHint.INSIGHT_ONLY
+        assert "chart_explain" in result.intent_signals.active
+        assert "chart_create" not in result.intent_signals.active
+        assert result.facets.wants_chart is False
+
+    def test_anomaly_detection_requires_computation(self):
+        result = run(self.skill.run(self.ctx, "找出退货率异常的地区"))
+
+        assert result.hint == RoutingHint.CODE_GEN
+        assert "anomaly_detect" in result.intent_signals.active
+        assert result.facets.needs_new_computation is True
+
+    def test_vague_pass_through_is_a_simple_structure(self):
+        result = run(self.skill.run(self.ctx, "看看数据"))
+
+        assert result.hint == RoutingHint.RULE_ENGINE
+        assert result.structure.classification == "simple"
+        assert result.structure.needs_semantic_planning is False
+
+    def test_llm_can_add_signals_but_cannot_override_route_decision(self):
+        router = MockRouter(
+            '{"routing":"rule","signals":["aggregate"],"confidence":0.92}'
+        )
+        skill = RoutingClassificationSkill(router)
+
+        result = run(skill.run(make_ctx(), "处理重点记录", atomic=True))
+
+        assert result.intent_signals.source == "hybrid"
+        assert "aggregate" in result.intent_signals.active
+        assert result.hint == RoutingHint.CODE_GEN
+
+    def test_ambiguous_long_query_requests_semantic_structure_planning(self):
+        query = "请帮我看看不同地区销售表现到底如何，重点关注明显偏离整体水平的地区并解释可能原因"
+        result = run(self.skill.run(self.ctx, query))
+
+        assert result.structure.classification == "uncertain"
+        assert result.structure.needs_semantic_planning is True
+        assert result.structure.requires_planning is False
+
+    def test_mixed_computation_and_explanation_requests_semantic_planning(self):
+        result = run(self.skill.run(self.ctx, "计算各地区销售额并解释差异原因"))
+
+        assert result.structure.classification == "uncertain"
+        assert result.structure.needs_semantic_planning is True
+        assert "mixed_compute_explain" in result.structure.signals
+
     def test_routing_rules_are_loaded_from_config_file(self):
         assert routing_rules_module._ROUTING_RULES_PATH.name == "routing_rules.json"
         assert routing_rules_module._ROUTING_RULES_PATH.exists()
         assert "level_1" in routing_rules_module._ROUTING_RULES
         assert "level_2" in routing_rules_module._ROUTING_RULES
-        assert "汇总" in routing_rules_module._CODE_GEN_KWS
-        assert "筛选" in routing_rules_module._RULE_ONLY_KWS
-        assert "说明什么" in routing_rules_module._INSIGHT_ONLY_KWS
+        assert "route_keywords" not in routing_rules_module._ROUTING_RULES["level_2"]
+        assert "汇总" in routing_rules_module._SIGNAL_TERMS["aggregate"]
+        assert "筛选" in routing_rules_module._SIGNAL_TERMS["filter"]
+        assert "说明什么" in routing_rules_module._SIGNAL_TERMS["explain"]
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +292,50 @@ class TestQueryPlanningSkill:
         assert plan.source == "single"
         assert len(plan.steps) == 1
         assert router._mock.calls == 0
+
+    def test_semantic_structure_detection_can_confirm_one_atomic_step(self):
+        query = "请帮我看看不同地区销售表现到底如何，重点关注明显偏离整体水平的地区并解释可能原因"
+        response = f'''{{
+          "steps": [{{"query": "{query}", "depends_on": []}}],
+          "reasoning": "这是一个围绕地区异常的单一分析问题",
+          "confidence": 0.91
+        }}'''
+        router = MockRouter(response)
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx()
+
+        routing = run(routing_skill.run(ctx, query))
+        plan = run(planning_skill.run(ctx, query, routing=routing))
+
+        assert plan.source == "llm"
+        assert plan.is_multi_step is False
+        assert len(plan.steps) == 1
+        assert plan.steps[0].query == query
+        assert router._mock.calls == 1
+
+    def test_semantic_structure_detection_finds_implicit_dependency(self):
+        query = "找出销售表现异常的地区，判断这些地区的退货率是否也明显偏高并解释可能原因"
+        response = """{
+          "steps": [
+            {"query": "找出销售表现异常的地区", "depends_on": []},
+            {"query": "判断异常地区的退货率是否明显偏高并解释原因", "depends_on": ["s1"]}
+          ],
+          "reasoning": "第二问需要第一问先确定地区范围",
+          "confidence": 0.94
+        }"""
+        router = MockRouter(response)
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx()
+
+        routing = run(routing_skill.run(ctx, query))
+        plan = run(planning_skill.run(ctx, query, routing=routing))
+
+        assert routing.structure.classification == "uncertain"
+        assert plan.source == "llm"
+        assert plan.is_multi_step is True
+        assert plan.steps[1].depends_on == ["s1"]
 
     def test_invalid_llm_plan_falls_back_to_sequential_rules(self):
         router = MockRouter('{"unexpected": true}')

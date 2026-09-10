@@ -1,24 +1,4 @@
-"""
-SheetMind — Routing Classification Skill
-============================================
-Returns RoutingHint (rule / code / text) + MultiTurnMode (new / follow_up / reset).
-
-Design:
-- Level 1 classifies query structure: multi-turn mode and whether the query
-  needs dependency-aware planning.
-- Level 2 classifies each atomic operation into an execution route and facets.
-- Both rule levels live in analysis/config/routing_rules.json so routing
-  language can be tuned without editing this module.
-- LLM fallback only when confidence < 0.55 (rare ambiguous cases).
-- Multi-turn mode is determined first — it takes priority and can influence routing.
-- Secondary intent facets are returned beside the 3-way execution route.
-
-Routing rules:
-- CODE_GEN signals override ordinary RULE_ENGINE signals.
-- INSIGHT_ONLY wins for chart-reference explanation queries such as
-  "这个图表说明什么".
-- Low-confidence matches fall back to the routing LLM.
-"""
+"""Classify query structure, intent signals, and execution route."""
 from __future__ import annotations
 
 import json
@@ -32,71 +12,72 @@ from ..models.configs import ModelRole
 from .base import Skill
 
 
-# ---------------------------------------------------------------------------
-# Routing rule config
-# ---------------------------------------------------------------------------
-
 _ROUTING_RULES_PATH = Path(__file__).resolve().parents[1] / "config" / "routing_rules.json"
 
 
 def _load_routing_rules() -> Dict[str, Any]:
     with _ROUTING_RULES_PATH.open("r", encoding="utf-8") as fp:
         data = json.load(fp)
-
     if not isinstance(data.get("level_1"), dict) or not isinstance(data.get("level_2"), dict):
         raise ValueError(f"routing rules must contain level_1 and level_2: {_ROUTING_RULES_PATH}")
     return data
-
-
-_ROUTING_RULES = _load_routing_rules()
-_LEVEL_1_GROUPS: Dict[str, Any] = _ROUTING_RULES["level_1"].get("keyword_groups", {})
-_ROUTE_GROUPS: Dict[str, Any] = _ROUTING_RULES["level_2"].get("route_keywords", {})
-_FACET_GROUPS: Dict[str, Any] = _ROUTING_RULES["level_2"].get("facet_keywords", {})
-_LEVEL_1_THRESHOLDS: Dict[str, Any] = _ROUTING_RULES["level_1"].get("thresholds", {})
 
 
 def _keywords(groups: Dict[str, Any], group_name: str) -> List[str]:
     values = groups.get(group_name, [])
     if not isinstance(values, list):
         raise ValueError(f"routing keyword group must be a list: {group_name}")
-    return [str(value) for value in values]
+    return [str(value).lower() for value in values]
 
+
+_ROUTING_RULES = _load_routing_rules()
+_LEVEL_1_GROUPS: Dict[str, Any] = _ROUTING_RULES["level_1"].get("keyword_groups", {})
+_LEVEL_1_THRESHOLDS: Dict[str, Any] = _ROUTING_RULES["level_1"].get("thresholds", {})
+_SIGNAL_TERMS: Dict[str, List[str]] = {
+    name: _keywords(_ROUTING_RULES["level_2"].get("signal_terms", {}), name)
+    for name in _ROUTING_RULES["level_2"].get("signal_terms", {})
+}
+_DECISION_CONFIDENCE: Dict[str, Any] = _ROUTING_RULES["level_2"].get(
+    "decision_confidence", {}
+)
 
 _RESET_KWS = _keywords(_LEVEL_1_GROUPS, "reset")
 _FOLLOW_UP_KWS = _keywords(_LEVEL_1_GROUPS, "follow_up")
 _SEQUENCE_KWS = _keywords(_LEVEL_1_GROUPS, "sequence")
 _PARALLEL_KWS = _keywords(_LEVEL_1_GROUPS, "parallel")
 _DEPENDENCY_KWS = _keywords(_LEVEL_1_GROUPS, "dependency")
-_CODE_GEN_KWS = _keywords(_ROUTE_GROUPS, "code_gen")
-_RULE_ONLY_KWS = _keywords(_ROUTE_GROUPS, "rule_only")
-_INSIGHT_ONLY_KWS = _keywords(_ROUTE_GROUPS, "insight_only")
-_VAGUE_KWS = _keywords(_ROUTE_GROUPS, "vague")
-_DETERMINISTIC_EXTREME_KWS = _keywords(_ROUTE_GROUPS, "deterministic_extreme")
-_DETERMINISTIC_EXTREME_SUBJECT_KWS = _keywords(_ROUTE_GROUPS, "deterministic_extreme_subject")
-_COMPLEX_OVERRIDE_KWS = _keywords(_ROUTE_GROUPS, "complex_override")
-_FILTER_TRIGGER_KWS = _keywords(_FACET_GROUPS, "filter_trigger")
-_SORT_TRIGGER_KWS = _keywords(_FACET_GROUPS, "sort_trigger")
-_AGGREGATE_KWS = _keywords(_FACET_GROUPS, "aggregate")
-_TREND_KWS = _keywords(_FACET_GROUPS, "trend")
-_COMPARE_KWS = _keywords(_FACET_GROUPS, "compare")
-_ANOMALY_KWS = _keywords(_FACET_GROUPS, "anomaly")
-_CHART_KWS = _keywords(_FACET_GROUPS, "chart")
-_CHART_REF_ONLY_KWS = frozenset(_keywords(_ROUTE_GROUPS, "chart_reference_only"))
 _TARGET_FIELD_CANDIDATES = [
     str(value) for value in _ROUTING_RULES.get("target_field_candidates", [])
 ]
-_CODE_GEN_OPS = re.compile(
-    str(_ROUTING_RULES.get("operators", {}).get("code_gen_regex", r"[><≥≤]"))
+_TOP_N_PATTERN = re.compile(
+    str(_ROUTING_RULES["level_2"].get("patterns", {}).get("top_n_regex", r"(?:前|top\s*)\d+")),
+    re.IGNORECASE,
+)
+_NUMERIC_CONDITION_PATTERN = re.compile(
+    str(
+        _ROUTING_RULES["level_2"].get("patterns", {}).get(
+            "numeric_condition_regex", r"[><≥≤]"
+        )
+    )
 )
 
 
-# ---------------------------------------------------------------------------
-# Result dataclass
-# ---------------------------------------------------------------------------
+@dataclass
+class IntentSignals:
+    """Meaning extracted from an atomic query before route selection."""
+
+    active: List[str] = field(default_factory=list)
+    matched_terms: Dict[str, List[str]] = field(default_factory=dict)
+    source: str = "rules"
+    confidence: float = 1.0
+
+    def has(self, *names: str) -> bool:
+        return any(name in self.active for name in names)
+
 
 @dataclass
 class IntentFacets:
-    """Secondary product intent labels that sit beside the execution route."""
+    """Product-facing intent labels derived from IntentSignals."""
 
     operation_types: List[str] = field(default_factory=list)
     needs_new_computation: bool = True
@@ -107,9 +88,12 @@ class IntentFacets:
 
 @dataclass
 class QueryStructure:
-    """Level-1 result describing query shape before atomic route selection."""
+    """Structure decision made before dependency-aware planning."""
 
     requires_planning: bool = False
+    needs_semantic_planning: bool = False
+    classification: str = "simple"
+    confidence: float = 1.0
     score: int = 0
     signals: List[str] = field(default_factory=list)
 
@@ -120,30 +104,21 @@ class RoutingResult:
     mode: MultiTurnMode
     confidence: float
     reasoning: str
-    is_compound: bool = False   # Compatibility alias for structure.requires_planning
+    is_compound: bool = False
+    intent_signals: IntentSignals = field(default_factory=IntentSignals)
     facets: IntentFacets = field(default_factory=IntentFacets)
     structure: QueryStructure = field(default_factory=QueryStructure)
 
 
-# ---------------------------------------------------------------------------
-# Skill implementation
-# ---------------------------------------------------------------------------
-
 class RoutingClassificationSkill(Skill):
     """
-    Classify a query into a RoutingHint and MultiTurnMode.
-    Uses rule-based detection first; LLM fallback for low-confidence cases.
+    Expose one stable routing interface while keeping three decisions separate:
+    structure detection, intent-signal extraction, and route decision.
     """
 
     name = "routing_classification"
-    description = "Classify query into RoutingHint (rule/code/insight) + MultiTurnMode (new/follow_up/reset)"
-
-    # Confidence threshold below which an atomic query calls the routing LLM.
+    description = "Detect query structure and route atomic intent signals"
     LLM_THRESHOLD = float(_LEVEL_1_THRESHOLDS.get("llm_routing_confidence", 0.55))
-
-    # ---------------------------------------------------------------------------
-    # Public
-    # ---------------------------------------------------------------------------
 
     async def run(
         self,
@@ -153,70 +128,105 @@ class RoutingClassificationSkill(Skill):
         **kwargs: Any,
     ) -> RoutingResult:
         q = query.strip()
-
-        # Level 1: determine conversation mode and query structure.
         mode = self._detect_multiturn_mode(q, ctx)
-        structure = QueryStructure() if atomic else self._classify_structure(q)
+        intent_signals = self._extract_intent_signals(q)
+        structure = (
+            QueryStructure(classification="atomic", confidence=1.0)
+            if atomic
+            else self._classify_structure(q, intent_signals)
+        )
+        hint, confidence, reasoning = self._decide_route(intent_signals)
 
-        # Level 2: classify the execution route for this query. For a planned
-        # query this is only a coarse top-level hint; every atomic step is
-        # classified again by QueryPlanningSkill.
-        hint, confidence, reasoning = self._rule_classify(q)
-
-        if confidence < self.LLM_THRESHOLD and not structure.requires_planning:
+        # Top-level ambiguous structure is handled by QueryPlanningSkill in a
+        # single semantic call. Atomic or clearly-simple queries may use the
+        # lightweight signal extractor when local signals are insufficient.
+        should_enrich_signals = confidence < self.LLM_THRESHOLD and (
+            atomic or not structure.needs_semantic_planning
+        )
+        if should_enrich_signals:
             try:
-                hint, reasoning = await self._llm_classify(q, ctx, hint)
-                confidence = 0.80
+                intent_signals = await self._llm_extract_signals(q, ctx, intent_signals)
+                hint, confidence, reasoning = self._decide_route(intent_signals)
             except Exception as exc:
-                # Don't fail the whole request on routing LLM error — fall back to rule result
-                reasoning += f" (LLM fallback failed: {exc})"
+                reasoning += f" (LLM signal fallback failed: {exc})"
 
-        facets = self._build_facets(q, hint, mode)
-
+        facets = self._build_facets(q, hint, mode, intent_signals)
         return RoutingResult(
             hint=hint,
             mode=mode,
             confidence=confidence,
             reasoning=reasoning,
             is_compound=structure.requires_planning,
+            intent_signals=intent_signals,
             facets=facets,
             structure=structure,
         )
-
-    # ---------------------------------------------------------------------------
-    # Multi-turn mode detection
-    # ---------------------------------------------------------------------------
 
     def _detect_multiturn_mode(
         self, query: str, ctx: AnalysisContext
     ) -> MultiTurnMode:
         q_lower = query.lower()
-
-        # RESET: explicit restart — only meaningful when there is an active result to reset
         if ctx.active_result is not None and any(kw in q_lower for kw in _RESET_KWS):
             return MultiTurnMode.RESET
-
-        # FOLLOW_UP: explicit reference-to-previous signal AND there is an active result.
-        # NOTE: We intentionally do NOT use query length as a signal — Chinese queries
-        # are naturally short, so a 15-char query like "按地区汇总销售额" is a new question,
-        # not a follow-up just because it's brief.  Only explicit keywords count.
-        if ctx.active_result is not None:
-            if any(kw in q_lower for kw in _FOLLOW_UP_KWS):
-                return MultiTurnMode.FOLLOW_UP
-
+        if ctx.active_result is not None and any(kw in q_lower for kw in _FOLLOW_UP_KWS):
+            return MultiTurnMode.FOLLOW_UP
         return MultiTurnMode.NEW_QUERY
 
-    # ---------------------------------------------------------------------------
-    # Compound query detection
-    # ---------------------------------------------------------------------------
+    @staticmethod
+    def _extract_intent_signals(query: str) -> IntentSignals:
+        """Level 2A: extract meanings only; no signal names an engine."""
+        q_lower = query.lower()
+        matched: Dict[str, List[str]] = {}
+        for name, terms in _SIGNAL_TERMS.items():
+            hits = [term for term in terms if term in q_lower]
+            if hits:
+                matched[name] = hits
+
+        active = list(matched)
+
+        def add(name: str, evidence: Optional[str] = None) -> None:
+            if name not in active:
+                active.append(name)
+            if evidence:
+                matched.setdefault(name, []).append(evidence)
+
+        if _TOP_N_PATTERN.search(query):
+            add("top_n", "regex:top_n")
+        if _NUMERIC_CONDITION_PATTERN.search(query):
+            add("numeric_condition", "regex:numeric_condition")
+
+        # Chart nouns are references. Creation requires an action; explanation
+        # requires explanatory language. This prevents "这个图说明什么" from
+        # being treated as a request to generate a new chart.
+        chart_mentioned = bool({"chart_reference", "chart_type"}.intersection(active))
+        if chart_mentioned and "chart_action" in active:
+            add("chart_create")
+        if (
+            "chart_type" in active
+            and "reference_marker" not in active
+            and "explain" not in active
+            and "anomaly" not in active
+        ):
+            add("chart_create")
+        if chart_mentioned and (
+            "explain" in active or "anomaly" in active
+        ):
+            add("chart_explain")
+        if "anomaly" in active and "detect_action" in active:
+            add("anomaly_detect")
+
+        return IntentSignals(active=active, matched_terms=matched)
 
     @staticmethod
-    def _classify_structure(query: str) -> QueryStructure:
+    def _classify_structure(
+        query: str,
+        intent_signals: Optional[IntentSignals] = None,
+    ) -> QueryStructure:
         """
-        Score level-1 structural evidence. A single weak conjunction is not
-        enough; explicit sequencing/dependency or multiple analytical clauses
-        activates QueryPlanningSkill.
+        Level 1: rules decide only high-confidence simple/complex cases.
+        Ambiguous shape is marked for semantic planning instead of guessed.
         """
+        intent_signals = intent_signals or RoutingClassificationSkill._extract_intent_signals(query)
         q_lower = query.lower()
         boundary_pattern = str(
             _ROUTING_RULES["level_1"].get("patterns", {}).get(
@@ -233,252 +243,274 @@ class RoutingClassificationSkill(Skill):
         )
         parts = re.split(split_pattern, query)
         meaningful = [
-            p.strip()
-            for p in parts
-            if len(p.strip()) >= 6 and RoutingClassificationSkill._looks_independent_question(p)
+            part.strip()
+            for part in parts
+            if len(part.strip()) >= 6
+            and RoutingClassificationSkill._looks_independent_question(part)
         ]
-        signals: List[str] = []
-        score = 0
 
+        structural_signals: List[str] = []
+        score = 0
         sequence_hits = [kw for kw in _SEQUENCE_KWS if kw in q_lower]
         dependency_hits = [kw for kw in _DEPENDENCY_KWS if kw in q_lower]
         parallel_hits = [kw for kw in _PARALLEL_KWS if kw in q_lower]
 
         if sequence_hits:
             score += 2
-            signals.append(f"sequence:{sequence_hits[0]}")
+            structural_signals.append(f"sequence:{sequence_hits[0]}")
         if dependency_hits:
             score += 2
-            signals.append(f"dependency:{dependency_hits[0]}")
+            structural_signals.append(f"dependency:{dependency_hits[0]}")
         if len(meaningful) >= 2:
             score += 2
-            signals.append(f"analytical_clauses:{len(meaningful)}")
+            structural_signals.append(f"analytical_clauses:{len(meaningful)}")
         elif parallel_hits:
             score += 1
-            signals.append(f"parallel:{parallel_hits[0]}")
+            structural_signals.append(f"parallel:{parallel_hits[0]}")
 
-        threshold = int(_LEVEL_1_THRESHOLDS.get("planning_score", 2))
+        planning_threshold = int(_LEVEL_1_THRESHOLDS.get("planning_score", 2))
+        if score >= planning_threshold:
+            return QueryStructure(
+                requires_planning=True,
+                needs_semantic_planning=True,
+                classification="complex",
+                confidence=0.95,
+                score=score,
+                signals=structural_signals,
+            )
+
+        semantic_min_chars = int(
+            _LEVEL_1_THRESHOLDS.get("semantic_planning_min_chars", 32)
+        )
+        semantic_signals = {
+            "filter", "sort", "aggregate", "top_n", "trend", "pivot",
+            "compare", "anomaly", "chart_create", "chart_explain", "explain",
+            "anomaly_detect", "complex_transform", "advanced_analysis",
+            "numeric_condition", "which", "extreme", "vague",
+        }
+        active_semantics = semantic_signals.intersection(intent_signals.active)
+        computation_semantics = {
+            "aggregate", "top_n", "trend", "pivot", "compare", "chart_create",
+            "anomaly_detect", "complex_transform", "advanced_analysis", "numeric_condition",
+        }
+        mixed_compute_explain = bool(
+            active_semantics.intersection(computation_semantics)
+            and active_semantics.intersection({"explain", "chart_explain"})
+        )
+        ambiguous = (
+            not active_semantics
+            or bool(parallel_hits)
+            or mixed_compute_explain
+            or (
+                len(query) >= semantic_min_chars
+                and len(active_semantics) >= 2
+            )
+        )
+        if ambiguous:
+            reasons = list(structural_signals)
+            if not active_semantics:
+                reasons.append("no_clear_intent")
+            if len(query) >= semantic_min_chars:
+                reasons.append("long_query")
+            if mixed_compute_explain:
+                reasons.append("mixed_compute_explain")
+            return QueryStructure(
+                requires_planning=False,
+                needs_semantic_planning=True,
+                classification="uncertain",
+                confidence=0.50,
+                score=score,
+                signals=reasons,
+            )
+
         return QueryStructure(
-            requires_planning=score >= threshold,
+            requires_planning=False,
+            needs_semantic_planning=False,
+            classification="simple",
+            confidence=0.95,
             score=score,
-            signals=signals,
+            signals=structural_signals,
         )
 
     @staticmethod
     def _detect_compound(query: str) -> bool:
-        """Compatibility wrapper for callers that only need a boolean."""
         return RoutingClassificationSkill._classify_structure(query).requires_planning
 
     @staticmethod
     def _looks_independent_question(part: str) -> bool:
-        """Filter out follow-up modifiers such as "更直观看尾程花费"."""
         p = part.strip().lower()
         if not p:
             return False
-
         modifier_prefixes = [
-            "更直观", "直观", "方便", "便于", "用于", "用来", "看看",
-            "看一下", "展示一下",
+            "更直观", "直观", "方便", "便于", "用于", "用来", "看看", "看一下", "展示一下",
         ]
         if any(p.startswith(prefix) for prefix in modifier_prefixes):
             return False
-
-        action_kws = (
-            _CODE_GEN_KWS
-            + _RULE_ONLY_KWS
-            + _INSIGHT_ONLY_KWS
-            + _DETERMINISTIC_EXTREME_SUBJECT_KWS
+        signals = RoutingClassificationSkill._extract_intent_signals(p)
+        return bool(
+            set(signals.active)
+            - {
+                "vague", "date_filter", "chart_reference", "chart_type",
+                "chart_action", "reference_marker", "detect_action",
+            }
         )
-        return any(kw in p for kw in action_kws)
 
-    # ---------------------------------------------------------------------------
-    # Rule-based classification
-    # ---------------------------------------------------------------------------
+    @staticmethod
+    def _decide_route(intent_signals: IntentSignals) -> tuple[RoutingHint, float, str]:
+        """Level 2B: apply stable combinations to extracted meanings."""
+        active = set(intent_signals.active)
 
-    def _rule_classify(self, query: str) -> tuple:
-        """Returns (RoutingHint, confidence, reasoning)."""
-        q_lower = query.lower()
+        def confidence(name: str, default: float) -> float:
+            return float(_DECISION_CONFIDENCE.get(name, default))
 
-        # Check INSIGHT_ONLY signals BEFORE CODE_GEN when all CODE_GEN hits are
-        # chart-reference words only (no aggregation / calculation signals).
-        # This prevents "这个图表说明什么" from being misclassified as CODE_GEN.
-        insight_hits = [kw for kw in _INSIGHT_ONLY_KWS if kw in q_lower]
-        if insight_hits:
-            code_candidates = [kw for kw in _CODE_GEN_KWS if kw in q_lower]
-            non_chart_code = [kw for kw in code_candidates if kw not in _CHART_REF_ONLY_KWS]
-            if not non_chart_code:
-                # INSIGHT_ONLY wins: no real computation signals, just chart-ref words
-                return (
-                    RoutingHint.INSIGHT_ONLY,
-                    0.85,
-                    f"INSIGHT_ONLY signals: {insight_hits[:3]} (no agg/calc CODE_GEN signals)",
-                )
+        computational = {
+            "aggregate", "top_n", "trend", "pivot", "chart_create", "compare",
+            "anomaly_detect", "complex_transform", "advanced_analysis", "numeric_condition",
+        }
+        extreme_complexity = {"top_n", "trend", "pivot", "chart_create", "numeric_condition"}
+        hard_computation = computational - {"compare"}
 
-        # Deterministic "which category costs/sells the most?" questions are
-        # safer in the rule engine than in free-form pandas code generation.
-        if (
-            any(kw in q_lower for kw in _DETERMINISTIC_EXTREME_SUBJECT_KWS)
-            and any(kw in q_lower for kw in _DETERMINISTIC_EXTREME_KWS)
-            and not any(kw in q_lower for kw in _COMPLEX_OVERRIDE_KWS)
-        ):
-            return (
-                RoutingHint.RULE_ENGINE,
-                0.86,
-                "RULE_ENGINE deterministic aggregate-extreme question",
-            )
-
-        # Check CODE_GEN signals (they take priority over RULE_ENGINE)
-        code_hits = [kw for kw in _CODE_GEN_KWS if kw in q_lower]
-        has_op = bool(_CODE_GEN_OPS.search(query))
-        if code_hits or has_op:
-            matched = code_hits[:3]  # keep first 3 for reasoning
-            conf = 0.90 if len(code_hits) >= 2 else 0.82
-            return (
-                RoutingHint.CODE_GEN,
-                conf,
-                f"CODE_GEN signals: {matched}" + (" + numeric operator" if has_op else ""),
-            )
-
-        # Check INSIGHT_ONLY signals (open-ended, no data op) — second pass for pure insight queries
-        insight_hits = [kw for kw in _INSIGHT_ONLY_KWS if kw in q_lower]
-        rule_hits = [kw for kw in _RULE_ONLY_KWS if kw in q_lower]
-        if insight_hits and not rule_hits:
+        if "chart_explain" in active and not active.intersection(computational):
             return (
                 RoutingHint.INSIGHT_ONLY,
-                0.85,
-                f"INSIGHT_ONLY signals: {insight_hits[:3]}",
+                confidence("insight_only", 0.86),
+                "Route decision: chart_explain without new computation",
             )
 
-        # Check RULE_ENGINE signals
-        if rule_hits:
+        if "explain" in active and not active.intersection(hard_computation):
+            return (
+                RoutingHint.INSIGHT_ONLY,
+                confidence("insight_only", 0.86),
+                "Route decision: explanation without new computation",
+            )
+
+        if {"which", "extreme"} <= active and not active.intersection(extreme_complexity):
             return (
                 RoutingHint.RULE_ENGINE,
-                0.88,
-                f"RULE_ENGINE signals: {rule_hits[:3]}",
+                confidence("rule_engine", 0.88),
+                "Route decision: deterministic which + extreme",
             )
 
-        # Vague / pass-through queries (e.g. "看看数据") → rule engine pass-through
-        vague_hits = [kw for kw in _VAGUE_KWS if kw in q_lower]
-        if vague_hits and len(query) < 15:
+        computation_hits = sorted(active.intersection(computational))
+        if computation_hits:
+            return (
+                RoutingHint.CODE_GEN,
+                confidence("code_gen", 0.86),
+                f"Route decision: computation signals {computation_hits}",
+            )
+
+        if active.intersection({"filter", "date_filter", "sort"}):
+            hits = sorted(active.intersection({"filter", "date_filter", "sort"}))
             return (
                 RoutingHint.RULE_ENGINE,
-                0.70,
-                f"Vague query (pass-through): {vague_hits}",
+                confidence("rule_engine", 0.88),
+                f"Route decision: deterministic signals {hits}",
             )
 
-        # Low-confidence fallback — default to CODE_GEN (more flexible)
+        if active.intersection({"explain", "anomaly"}):
+            hits = sorted(active.intersection({"explain", "anomaly"}))
+            return (
+                RoutingHint.INSIGHT_ONLY,
+                confidence("insight_only", 0.86),
+                f"Route decision: insight signals {hits} without new computation",
+            )
+
+        if "vague" in active:
+            return (
+                RoutingHint.RULE_ENGINE,
+                confidence("vague", 0.70),
+                "Route decision: vague pass-through query",
+            )
+
         return (
             RoutingHint.CODE_GEN,
-            0.45,
-            "No clear signal; defaulting to CODE_GEN",
+            confidence("unknown", 0.45),
+            "Route decision: no clear signal; provisional CODE_GEN",
         )
 
-    # ---------------------------------------------------------------------------
-    # LLM fallback
-    # ---------------------------------------------------------------------------
-
-    async def _llm_classify(
+    async def _llm_extract_signals(
         self,
         query: str,
         ctx: AnalysisContext,
-        rule_hint: RoutingHint,
-    ) -> tuple:
-        """Call the LLM for ambiguous routing.  Returns (RoutingHint, reasoning)."""
+        rule_signals: IntentSignals,
+    ) -> IntentSignals:
+        """Use the model to add semantic signals; route selection stays local."""
         provider = self.router.get_provider(ModelRole.ROUTING)
-
-        conv_text = ctx.conversation_text(max_turns=4)
+        allowed = sorted(
+            set(_SIGNAL_TERMS)
+            | {"anomaly_detect", "chart_create", "chart_explain", "numeric_condition", "top_n"}
+        )
         system = (
-            "你是 RoutingClassifier，专门判断数据分析查询的执行路径。\n\n"
-            "只输出 JSON，格式：{\"routing\": \"rule\"|\"code\"|\"insight\", \"reasoning\": \"一句话说明\"}\n\n"
-            "routing 含义：\n"
-            "  rule  — 简单筛选/排序，无需计算，规则引擎可直接执行\n"
-            "  code  — 需要聚合/计算/图表/复杂条件，LLM生成pandas代码执行\n"
-            "  insight — 不产生新的结构化计算结果，基于已有结果或数据概况写洞察\n\n"
-            "注意：判断执行路径，不判断输出格式。"
+            "你是数据分析意图信号抽取器，不选择执行引擎。"
+            "从允许的信号中选出用户明确需要的信号，只输出JSON："
+            '{"signals":["..."],"confidence":0.0,"reasoning":"一句话"}。'
+            f"允许的信号：{allowed}。"
+            "chart_reference只是提到已有图；chart_create是创建新图；chart_explain是解释已有图。"
         )
-
-        user_content = (
-            f"用户查询：{query}\n"
-            f"规则引擎预测：{rule_hint.value}\n"
-        )
+        user_content = f"用户查询：{query}\n规则已发现：{rule_signals.active}"
+        conv_text = ctx.conversation_text(max_turns=4)
         if conv_text:
-            user_content += f"\n对话历史（最近几轮）：\n{conv_text}"
+            user_content += f"\n最近对话：\n{conv_text}"
 
         response = await provider.complete(
             messages=[{"role": "user", "content": user_content}],
             system=system,
-            max_tokens=128,
+            max_tokens=256,
             temperature=0.0,
             json_mode=True,
         )
-
-        try:
-            data = json.loads(response)
-            hint_str = data.get("routing", rule_hint.value)
-            reasoning = data.get("reasoning", "LLM routing")
-            if hint_str == "text":
-                hint_str = RoutingHint.INSIGHT_ONLY.value
-            return RoutingHint(hint_str), reasoning
-        except Exception:
-            return rule_hint, f"LLM parse failed; kept rule result: {response[:80]}"
-
-    # ---------------------------------------------------------------------------
-    # Secondary intent facets
-    # ---------------------------------------------------------------------------
+        data = json.loads(response)
+        raw_signals = data.get("signals", [])
+        if not isinstance(raw_signals, list):
+            raise ValueError("signal extractor returned a non-list signals field")
+        valid = [str(name) for name in raw_signals if str(name) in allowed]
+        active = list(rule_signals.active)
+        for name in valid:
+            if name not in active:
+                active.append(name)
+        return IntentSignals(
+            active=active,
+            matched_terms=dict(rule_signals.matched_terms),
+            source="hybrid",
+            confidence=min(max(float(data.get("confidence", 0.75)), 0.0), 1.0),
+        )
 
     def _build_facets(
         self,
         query: str,
         hint: RoutingHint,
         mode: MultiTurnMode,
+        intent_signals: IntentSignals,
     ) -> IntentFacets:
-        q_lower = query.lower()
+        active = set(intent_signals.active)
         operation_types: List[str] = []
-
-        def add(name: str) -> None:
-            if name not in operation_types:
-                operation_types.append(name)
-
-        if any(kw in q_lower for kw in _FILTER_TRIGGER_KWS):
-            add("filter")
-        if any(kw in q_lower for kw in _SORT_TRIGGER_KWS):
-            add("sort")
-        if (
-            any(kw in q_lower for kw in _AGGREGATE_KWS)
-            or (
-                any(kw in q_lower for kw in _DETERMINISTIC_EXTREME_SUBJECT_KWS)
-                and any(kw in q_lower for kw in _DETERMINISTIC_EXTREME_KWS)
-            )
-        ):
-            add("aggregate")
-        if any(kw in q_lower for kw in _TREND_KWS):
-            add("trend")
-        if any(kw in q_lower for kw in _COMPARE_KWS):
-            add("compare")
-        if any(kw in q_lower for kw in _ANOMALY_KWS):
-            add("anomaly")
-        if any(kw in q_lower for kw in _INSIGHT_ONLY_KWS):
-            add("explain")
-
-        wants_chart = any(kw in q_lower for kw in _CHART_KWS)
-        if wants_chart:
-            add("chart")
-
-        uses_previous = mode == MultiTurnMode.FOLLOW_UP
-        needs_new_computation = hint in (RoutingHint.RULE_ENGINE, RoutingHint.CODE_GEN)
-
+        operation_map = [
+            ("filter", {"filter", "date_filter", "numeric_condition"}),
+            ("sort", {"sort"}),
+            ("aggregate", {"aggregate", "top_n", "extreme"}),
+            ("trend", {"trend"}),
+            ("pivot", {"pivot"}),
+            ("compare", {"compare"}),
+            ("anomaly", {"anomaly", "anomaly_detect"}),
+            ("explain", {"explain", "chart_explain"}),
+            ("transform", {"complex_transform"}),
+            ("advanced_analysis", {"advanced_analysis"}),
+            ("chart", {"chart_create"}),
+        ]
+        for operation, source_signals in operation_map:
+            if active.intersection(source_signals):
+                operation_types.append(operation)
         if not operation_types:
-            add("general")
+            operation_types.append("general")
 
         return IntentFacets(
             operation_types=operation_types,
-            needs_new_computation=needs_new_computation,
-            wants_chart=wants_chart,
-            uses_previous_result=uses_previous,
+            needs_new_computation=hint in (RoutingHint.RULE_ENGINE, RoutingHint.CODE_GEN),
+            wants_chart="chart_create" in active,
+            uses_previous_result=mode == MultiTurnMode.FOLLOW_UP,
             target_fields=self._extract_target_fields(query),
         )
 
     @staticmethod
     def _extract_target_fields(query: str) -> List[str]:
-        """Best-effort field mentions for trace/debug use before semantic typing."""
         return [field for field in _TARGET_FIELD_CANDIDATES if field.lower() in query.lower()]

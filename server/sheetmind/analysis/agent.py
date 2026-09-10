@@ -195,6 +195,7 @@ class SheetMindAgent:
         previous_result_df = self._previous_result_dataframe(ctx)
         if (
             mode == MultiTurnMode.FOLLOW_UP
+            and not routing.structure.needs_semantic_planning
             and wants_chart
             and self._query_targets_previous_result(query)
             and previous_result_df is not None
@@ -216,8 +217,8 @@ class SheetMindAgent:
                 emitter=emitter,
             )
 
-        if (routing.structure.requires_planning or routing.is_compound) and emitter:
-            await emitter.emit_progress("正在拆解多步骤任务...", step_id="query_planning")
+        if routing.structure.needs_semantic_planning and emitter:
+            await emitter.emit_progress("正在识别问题结构...", step_id="query_planning")
         query_plan = await self.planning_skill.run(ctx, query, routing=routing)
         execution_plan = self._build_execution_plan(query_plan, routing, wants_chart)
         ctx.execution_plan = execution_plan
