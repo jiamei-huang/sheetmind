@@ -12,16 +12,17 @@ Handles:
   5. Sort:           "按销售额降序" → sort_values
   6. Pass-through:   "看看数据" → return df as-is
 
-Returns a pd.DataFrame (result_df).
-If the rule engine cannot handle the query confidently, raises ToolError with
-retryable=True so the caller can fall back to CODE_GEN.
+Returns a DataFrame by default or a structured RuleResult report. When no
+deterministic operation matches, the report identifies pass-through; the caller
+uses RuleResultValidator to decide whether pass-through satisfies the request.
 """
 from __future__ import annotations
 
 import logging
 import re
+import warnings
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -63,7 +64,7 @@ _SORT_ASC_KWS = ["升序", "从低到高", "从小到大", "asc", "ascending", "
 _SORT_TRIGGER_KWS = ["排序", "sort", "order", "排", "按"]
 
 # Filter trigger keywords
-_FILTER_TRIGGER_KWS = ["筛选", "过滤", "filter", "where", "只看", "只要", "显示", "展示"]
+_FILTER_TRIGGER_KWS = ["筛选", "过滤", "filter", "where", "只看", "只要"]
 
 _EXTREME_MAX_KWS = ["最多", "最高", "最大", "最贵", "花费最多", "费用最高", "金额最高"]
 _EXTREME_SUBJECT_KWS = ["哪个", "哪家", "哪一个", "哪类", "哪种", "who", "which"]
@@ -112,26 +113,24 @@ class RuleEngineTool(Tool):
             return self._result(aggregate_result.reset_index(drop=True), ["aggregate_extreme"], return_report)
 
         # 1. Apply date filters
-        before_date = len(result)
+        before_date_result = result
         result = self._apply_date_filters(query, result)
+        date_filter_applied = result is not before_date_result
 
         # 2. Apply keyword filters (if filter trigger present)
-        before_keyword = len(result)
+        before_keyword_result = result
         result = self._apply_keyword_filters(query, result, df)
+        keyword_filter_applied = result is not before_keyword_result
 
         # 3. Apply sort
         sorted_result = self._apply_sort(query, result, field_map)
+        sort_applied = sorted_result is not result
         applied_rules = []
-        if (
-            before_date != len(df)
-            or _DATE_RANGE.search(query)
-            or _DATE_YEAR_MONTH.search(query)
-            or _DATE_YEAR_ONLY.search(query)
-        ):
+        if date_filter_applied:
             applied_rules.append("date_filter")
-        if before_keyword != len(result):
+        if keyword_filter_applied:
             applied_rules.append("keyword_filter")
-        if not sorted_result.equals(result):
+        if sort_applied:
             applied_rules.append("sort")
         result = sorted_result
 
@@ -149,7 +148,7 @@ class RuleEngineTool(Tool):
         result_df: pd.DataFrame,
         matched_rules: List[str],
         return_report: bool,
-    ) -> pd.DataFrame | RuleResult:
+    ) -> Union[pd.DataFrame, RuleResult]:
         report = RuleResult(
             result_df=result_df,
             matched_rules=matched_rules,
@@ -315,7 +314,9 @@ class RuleEngineTool(Tool):
             if df[col].dtype == object:
                 sample = df[col].dropna().head(5)
                 try:
-                    pd.to_datetime(sample, errors="raise")
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        pd.to_datetime(sample, errors="raise")
                     return col
                 except Exception:
                     pass

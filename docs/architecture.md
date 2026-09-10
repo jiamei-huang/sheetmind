@@ -83,7 +83,9 @@ The routing result exposes both intent objects and execution metadata for downst
 
 ## Execution and presentation safeguards
 
-`DataframeLoaderTool` can emit a load report with sources, detected headers, cleanup counts, and warnings. `RuleEngineTool` can emit a structured rule report while preserving its DataFrame API for callers.
+`DataframeLoaderTool` can emit a load report with sources, detected headers, cleanup counts, and warnings. `RuleEngineTool` emits a structured rule report to the agent. `RuleResultValidator` checks operation coverage, required qualified columns, pass-through equivalence, row-count constraints, sort order, and requested date periods before the result is accepted. A rejected rule result changes the step and top-level execution route to `CODE_GEN`, then enters `RepairLoop`.
+
+`RepairLoop` wraps `CodeGenerationSkill` and `PythonExecutorTool`. It permits the initial attempt plus at most two repairs, with a 120-second repair budget. It stops early when generated code repeats, generation/execution/field-contract errors repeat, or executor safety policy rejects the code.
 
 `ChartPlanningSkill` uses semantic metadata to choose axes, supports period labels as time axes, limits crowded categorical charts with `Other`, and records a confidence and reason. `ResultValidator` enforces frontend table/chart caps and drops an invalid chart while retaining valid table and summary blocks.
 

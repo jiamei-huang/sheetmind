@@ -564,10 +564,38 @@ class TestRuleEngineTool:
         result = self.tool.run(self.ctx, query="2024年的数据", df=df_with_2023)
         assert len(result) == 2  # 2023-12-01 excluded
 
+    def test_date_report_does_not_claim_success_without_a_date_column(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+
+        df = pd.DataFrame({"SKU": ["A", "B"], "金额": [10, 20]})
+        result = self.tool.run(
+            self.ctx,
+            query="筛选2025年数据",
+            df=df,
+            return_report=True,
+        )
+
+        assert isinstance(result, RuleResult)
+        assert result.matched_rules == ["pass_through"]
+
     def test_sort_descending(self):
         result = self.tool.run(self.ctx, query="按金额降序排序", df=self.df)
         vals = list(result["金额"])
         assert vals == sorted(vals, reverse=True)
+
+    def test_sort_report_records_a_rule_even_when_data_was_already_sorted(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+
+        df = pd.DataFrame({"金额": [30, 20, 10]})
+        result = self.tool.run(
+            self.ctx,
+            query="按金额降序排序",
+            df=df,
+            return_report=True,
+        )
+
+        assert isinstance(result, RuleResult)
+        assert result.matched_rules == ["sort"]
 
     def test_sort_ascending(self):
         result = self.tool.run(self.ctx, query="按金额升序排序", df=self.df)
@@ -610,6 +638,20 @@ class TestRuleEngineTool:
 
         assert len(result) == 2
 
+    def test_filter_report_records_a_rule_when_every_row_matches(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+
+        df = pd.DataFrame({"地区": ["华东", "华东"], "金额": [10, 20]})
+        result = self.tool.run(
+            self.ctx,
+            query="筛选华东",
+            df=df,
+            return_report=True,
+        )
+
+        assert isinstance(result, RuleResult)
+        assert result.matched_rules == ["keyword_filter"]
+
     def test_normalized_relative_month_range_is_executed(self):
         normalized = run(QueryNormalizationSkill(MockRouter()).run(
             self.ctx,
@@ -624,6 +666,264 @@ class TestRuleEngineTool:
         result = self.tool.run(self.ctx, query=normalized.normalized_text, df=df)
 
         assert result["金额"].tolist() == [2, 3]
+
+
+# ---------------------------------------------------------------------------
+# RuleResultValidator
+# ---------------------------------------------------------------------------
+
+class TestRuleResultValidator:
+    def test_filter_request_rejects_a_pass_through_rule_result(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({"地区": ["华东", "华南"], "金额": [10, 20]})
+        step = ExecutionStep(
+            step_id="s1",
+            query="筛选华东地区",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["filter"],
+        )
+        rule_result = RuleResult(
+            result_df=source.copy(),
+            matched_rules=["pass_through"],
+            selected_columns=["地区", "金额"],
+            confidence=0.6,
+            fallback_reason="No deterministic rule matched.",
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is False
+        assert decision.fallback_to_codegen is True
+        assert "filter" in decision.reasons[0]
+
+    def test_rejects_result_that_drops_a_required_qualified_column(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({"金额": [10], "金额（USD）": [5]})
+        step = ExecutionStep(
+            step_id="s1",
+            query="按金额（USD）降序排序",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["sort"],
+            required_source_columns=["金额（USD）"],
+        )
+        rule_result = RuleResult(
+            result_df=pd.DataFrame({"金额": [10]}),
+            matched_rules=["sort"],
+            selected_columns=["金额"],
+            confidence=0.95,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is False
+        assert "金额（USD）" in decision.reasons[0]
+
+    def test_rejects_a_reported_sort_when_rows_are_not_sorted(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({"金额": [10, 30, 20]})
+        step = ExecutionStep(
+            step_id="s1",
+            query="按金额降序排序",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["sort"],
+            required_source_columns=["金额"],
+        )
+        rule_result = RuleResult(
+            result_df=source.copy(),
+            matched_rules=["sort"],
+            selected_columns=["金额"],
+            confidence=0.95,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is False
+        assert "descending" in decision.reasons[0]
+
+    def test_rejects_rows_outside_the_requested_date_range(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({
+            "日期": ["2026-08-01", "2026-09-01"],
+            "金额": [10, 20],
+        })
+        step = ExecutionStep(
+            step_id="s1",
+            query="查看2026-08-01至2026-09-01的数据",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["date_filter"],
+        )
+        rule_result = RuleResult(
+            result_df=source.copy(),
+            matched_rules=["date_filter"],
+            selected_columns=["日期", "金额"],
+            confidence=0.95,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is False
+        assert "date range" in decision.reasons[0]
+
+    def test_rejects_row_growth_for_a_non_aggregating_rule(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({"地区": ["华东", "华南"]})
+        step = ExecutionStep(
+            step_id="s1",
+            query="筛选华东",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["filter"],
+        )
+        rule_result = RuleResult(
+            result_df=pd.DataFrame({"地区": ["华东", "华东", "华东"]}),
+            matched_rules=["keyword_filter"],
+            selected_columns=["地区"],
+            confidence=0.95,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is False
+        assert "row count" in decision.reasons[0]
+
+    def test_accepts_an_explicit_pass_through_result(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({"SKU": ["A", "B"]})
+        step = ExecutionStep(
+            step_id="s1",
+            query="生成 Excel",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["pass_through"],
+            output_intents=["export_excel"],
+        )
+        rule_result = RuleResult(
+            result_df=source.copy(),
+            matched_rules=["pass_through"],
+            selected_columns=["SKU"],
+            confidence=0.6,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is True
+        assert decision.fallback_to_codegen is False
+
+    def test_rejects_a_pass_through_result_that_changes_rows(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({"SKU": ["A", "B"]})
+        step = ExecutionStep(
+            step_id="s1",
+            query="生成 Excel",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["pass_through"],
+            output_intents=["export_excel"],
+        )
+        rule_result = RuleResult(
+            result_df=source.iloc[[0]].copy(),
+            matched_rules=["pass_through"],
+            selected_columns=["SKU"],
+            confidence=0.6,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is False
+        assert "pass-through" in decision.reasons[0]
+
+    def test_rejects_rows_outside_a_requested_year_and_month(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({"日期": ["2024-10-01", "2024-11-01"]})
+        step = ExecutionStep(
+            step_id="s1",
+            query="筛选2024年10月数据",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["filter", "date_filter"],
+        )
+        rule_result = RuleResult(
+            result_df=source.copy(),
+            matched_rules=["date_filter"],
+            selected_columns=["日期"],
+            confidence=0.95,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is False
+        assert "2024-10" in decision.reasons[0]
+
+    def test_sort_with_extreme_word_does_not_require_extreme_aggregation(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({"金额": [30, 20, 10]})
+        step = ExecutionStep(
+            step_id="s1",
+            query="按金额最高排序",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["sort", "extreme"],
+            target_fields=["金额"],
+        )
+        rule_result = RuleResult(
+            result_df=source.copy(),
+            matched_rules=["sort"],
+            selected_columns=["金额"],
+            confidence=0.95,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is True
 
 
 # ---------------------------------------------------------------------------
@@ -925,8 +1225,16 @@ class TestRepairLoop:
         assert self.mock_code_gen.run.call_count == 2
 
     def test_all_attempts_fail_returns_none(self):
-        self.mock_code_gen.run = AsyncMock(return_value="bad_code = df")
-        self.mock_executor.run = MagicMock(return_value=(None, "error"))
+        self.mock_code_gen.run = AsyncMock(side_effect=[
+            "bad_code_1 = df",
+            "bad_code_2 = df",
+            "bad_code_3 = df",
+        ])
+        self.mock_executor.run = MagicMock(side_effect=[
+            (None, "error 1"),
+            (None, "error 2"),
+            (None, "error 3"),
+        ])
 
         result_df, code, repairs = run(
             self.loop.run(self.ctx, "test query", self.df)
@@ -935,6 +1243,72 @@ class TestRepairLoop:
         # Should have tried 1 + MAX_REPAIRS times
         from sheetmind.analysis.harness.repair_loop import MAX_REPAIRS
         assert self.mock_code_gen.run.call_count == 1 + MAX_REPAIRS
+
+    def test_stops_before_executing_identical_repaired_code(self):
+        self.mock_code_gen.run = AsyncMock(return_value="bad_code = df")
+        self.mock_executor.run = MagicMock(return_value=(None, "NameError: bad_code"))
+
+        result_df, code, repairs = run(
+            self.loop.run(self.ctx, "test query", self.df)
+        )
+
+        assert result_df is None
+        assert code == "bad_code = df"
+        assert repairs == 1
+        assert self.mock_code_gen.run.call_count == 2
+        assert self.mock_executor.run.call_count == 1
+
+    def test_stops_after_the_same_execution_error_repeats(self):
+        self.mock_code_gen.run = AsyncMock(side_effect=[
+            "bad_code_1 = df",
+            "bad_code_2 = df",
+            "bad_code_3 = df",
+        ])
+        self.mock_executor.run = MagicMock(return_value=(None, "KeyError: missing"))
+
+        result_df, code, repairs = run(
+            self.loop.run(self.ctx, "test query", self.df)
+        )
+
+        assert result_df is None
+        assert code == "bad_code_2 = df"
+        assert repairs == 2
+        assert self.mock_code_gen.run.call_count == 2
+        assert self.mock_executor.run.call_count == 2
+
+    def test_stops_before_a_repair_when_time_budget_is_exhausted(self):
+        from sheetmind.analysis.harness.repair_loop import RepairLoop
+
+        clock = MagicMock(side_effect=[0.0, 2.0])
+        loop = RepairLoop(
+            self.mock_code_gen,
+            self.mock_executor,
+            time_budget_seconds=1.0,
+            clock=clock,
+        )
+        self.mock_code_gen.run = AsyncMock(return_value="bad_code = df")
+        self.mock_executor.run = MagicMock(return_value=(None, "NameError: bad_code"))
+
+        result_df, code, repairs = run(loop.run(self.ctx, "test query", self.df))
+
+        assert result_df is None
+        assert code == "bad_code = df"
+        assert repairs == 1
+        assert self.mock_code_gen.run.call_count == 1
+        assert self.mock_executor.run.call_count == 1
+
+    def test_stops_when_code_generation_repeats_the_same_error(self):
+        self.mock_code_gen.run = AsyncMock(side_effect=RuntimeError("model unavailable"))
+
+        result_df, code, repairs = run(
+            self.loop.run(self.ctx, "test query", self.df)
+        )
+
+        assert result_df is None
+        assert code == ""
+        assert repairs == 1
+        assert self.mock_code_gen.run.call_count == 2
+        assert self.mock_executor.run.call_count == 0
 
     def test_required_columns_are_validated_before_execution(self):
         self.df = pd.DataFrame({"金额": [10], "金额（USD）": [5]})
@@ -1008,6 +1382,31 @@ class TestBuildTableBlock:
 # ---------------------------------------------------------------------------
 
 class TestSheetMindAgentPipeline:
+    def test_invalid_rule_result_falls_back_to_codegen_repair_loop(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({"地区": ["华东", "华南"], "金额": [100, 200]})
+        generated_result = source_df.iloc[[0]].copy()
+        agent.sheet_skill.run = AsyncMock(return_value=[
+            {"fileName": "sales.xlsx", "sheets": ["Sheet1"]},
+        ])
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.semantic_skill.run = AsyncMock(return_value={})
+        agent.profiling_skill.run = AsyncMock(return_value="profile")
+        agent.repair_loop.run = AsyncMock(
+            return_value=(generated_result, "result_df = df.iloc[[0]]", 0)
+        )
+        agent.insight_skill.run = AsyncMock(return_value="已筛选东部地区。")
+
+        result = run(agent.run(ctx, "筛选东部地区"))
+
+        assert agent.repair_loop.run.call_count == 1
+        assert ctx.execution_plan.route == RoutingHint.CODE_GEN
+        assert ctx.execution_plan.steps[0].route == RoutingHint.CODE_GEN
+        assert result.first_table().rows == [{"地区": "华东", "金额": 100}]
+
     def test_execution_plan_preserves_default_and_explicit_step_outputs(self):
         from sheetmind.analysis.agent import SheetMindAgent
 

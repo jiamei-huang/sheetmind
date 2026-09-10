@@ -16,12 +16,13 @@ Flow:
     → success: return result_df
     → fail: return ToolError (caller wraps in error ResultBlock)
 
-  Max 2 repair attempts (attempt 1 + attempt 2 = 3 total executions).
-  This matches the spec §12 "max 2 retries before returning error".
+  At most 2 repair attempts follow the initial execution (3 total executions).
+  Retries stop early for repeated code/errors, safety rejection, or time budget.
 """
 from __future__ import annotations
 
 import logging
+from time import monotonic
 from typing import Any, Callable, List, Optional, Tuple
 
 import pandas as pd
@@ -40,6 +41,7 @@ from ..tracing.trace import (
 logger = logging.getLogger(__name__)
 
 MAX_REPAIRS = 2  # total retries after first failure = 2 (spec §12)
+DEFAULT_REPAIR_TIME_BUDGET_SECONDS = 120.0
 
 
 class RepairLoop:
@@ -57,9 +59,14 @@ class RepairLoop:
         self,
         code_gen: CodeGenerationSkill,
         executor: PythonExecutorTool,
+        time_budget_seconds: float = DEFAULT_REPAIR_TIME_BUDGET_SECONDS,
+        clock: Callable[[], float] = monotonic,
     ) -> None:
+        """Configure collaborators and the elapsed budget for repair retries."""
         self.code_gen = code_gen
         self.executor = executor
+        self.time_budget_seconds = max(0.0, float(time_budget_seconds))
+        self.clock = clock
 
     async def run(
         self,
@@ -77,6 +84,10 @@ class RepairLoop:
         """
         Run code gen + executor with up to MAX_REPAIRS repair attempts.
 
+        The initial attempt always runs. Repair attempts stop when generated
+        code or errors repeat, safety policy rejects code, or the elapsed
+        repair time budget has been exhausted.
+
         Returns:
             (result_df, final_code, repairs_used)
             result_df is None only if ALL attempts failed — caller should handle error.
@@ -84,9 +95,21 @@ class RepairLoop:
         error_feedback: Optional[str] = None
         last_code: str = ""
         repairs_used: int = 0
+        seen_code: set[str] = set()
+        seen_errors: set[str] = set()
+        started_at = self.clock()
 
         for attempt in range(1 + MAX_REPAIRS):
             is_repair = attempt > 0
+
+            if is_repair and self.clock() - started_at >= self.time_budget_seconds:
+                logger.warning("[RepairLoop] repair time budget exhausted; stopping retries")
+                if trace:
+                    trace.add_event(
+                        EVT_REPAIR,
+                        output_summary="stopped: repair time budget exhausted",
+                    )
+                return None, last_code, repairs_used
 
             if is_repair and emit_progress:
                 await emit_progress(f"修复执行错误（第 {attempt} 次）...")
@@ -106,11 +129,32 @@ class RepairLoop:
                 )
             except Exception as exc:
                 logger.warning("[RepairLoop] code gen failed attempt=%d: %s", attempt + 1, exc)
+                error_key = f"code_generation:{type(exc).__name__}:{exc}"
+                if error_key in seen_errors:
+                    repairs_used = attempt
+                    logger.warning("[RepairLoop] repeated code generation error; stopping retries")
+                    if trace:
+                        trace.add_event(
+                            EVT_REPAIR,
+                            output_summary="stopped: repeated code generation error",
+                        )
+                    return None, last_code, repairs_used
+                seen_errors.add(error_key)
                 if attempt < MAX_REPAIRS:
                     error_feedback = f"代码生成失败: {exc}"
                     continue
                 return None, last_code, repairs_used
 
+            code_key = code.strip()
+            if is_repair and code_key in seen_code:
+                logger.warning("[RepairLoop] repeated generated code; stopping retries")
+                if trace:
+                    trace.add_event(
+                        EVT_REPAIR,
+                        output_summary="stopped: repeated generated code",
+                    )
+                return None, code, repairs_used
+            seen_code.add(code_key)
             last_code = code
 
             if trace:
@@ -137,8 +181,18 @@ class RepairLoop:
                         output_summary=f"attempt={attempt+1} FIELD_CONTRACT_FAILED",
                         error=field_error,
                     )
-                error_feedback = f"代码：\n{code}\n\n执行错误：\n{field_error}"
                 repairs_used = attempt + 1
+                error_key = field_error.strip()
+                if error_key in seen_errors:
+                    logger.warning("[RepairLoop] repeated field contract error; stopping retries")
+                    if trace:
+                        trace.add_event(
+                            EVT_REPAIR,
+                            output_summary="stopped: repeated field contract error",
+                        )
+                    return None, last_code, repairs_used
+                seen_errors.add(error_key)
+                error_feedback = f"代码：\n{code}\n\n执行错误：\n{field_error}"
                 continue
 
             result_df, error = self.executor.run(
@@ -171,6 +225,18 @@ class RepairLoop:
                 logger.warning("[RepairLoop] safety violation; stopping without retry")
                 return None, last_code, repairs_used
 
+            repairs_used = attempt + 1
+            error_key = (error or "未知错误").strip()
+            if error_key in seen_errors:
+                logger.warning("[RepairLoop] repeated execution error; stopping retries")
+                if trace:
+                    trace.add_event(
+                        EVT_REPAIR,
+                        output_summary="stopped: repeated execution error",
+                    )
+                return None, last_code, repairs_used
+            seen_errors.add(error_key)
+
             # Failure — build error feedback for next attempt
             logger.warning(
                 "[RepairLoop] attempt %d failed: %s",
@@ -181,8 +247,6 @@ class RepairLoop:
                 f"代码：\n{code}\n\n"
                 f"执行错误：\n{error or '未知错误'}"
             )
-            repairs_used = attempt + 1
-
             if trace:
                 trace.add_event(EVT_REPAIR, output_summary=f"attempt {attempt+1} failed, retrying")
 

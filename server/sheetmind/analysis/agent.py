@@ -49,8 +49,15 @@ from .tools.dataframe_loader import DataframeLoaderTool
 from .tools.python_executor import PythonExecutorTool
 from .tools.rule_engine import RuleEngineTool
 from .tracing.storage import get_trace_store
-from .tracing.trace import EVT_ERROR, EVT_RESULT_ASSEMBLED, EVT_ROUTING, Trace
+from .tracing.trace import (
+    EVT_ERROR,
+    EVT_RESULT_ASSEMBLED,
+    EVT_ROUTING,
+    EVT_TOOL_END,
+    Trace,
+)
 from .validators.result_validator import validate_result
+from .validators.rule_result_validator import RuleResultValidator
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +98,7 @@ class SheetMindAgent:
         self.df_loader = DataframeLoaderTool()
         self.rule_engine = RuleEngineTool()
         self.executor = PythonExecutorTool()
+        self.rule_result_validator = RuleResultValidator()
 
         self.repair_loop = RepairLoop(self.code_gen_skill, self.executor)
 
@@ -307,6 +315,7 @@ class SheetMindAgent:
             trace=trace,
             emitter=emitter,
         )
+        hint = execution_plan.route
         if execution_failed:
             error_msg = (
                 "数据查询执行失败，请尝试换一种方式描述您的问题，"
@@ -506,12 +515,34 @@ class SheetMindAgent:
             result: Optional[pd.DataFrame] = None
             if step.route == RoutingHint.RULE_ENGINE:
                 try:
-                    result = self.rule_engine.run(
+                    rule_result = self.rule_engine.run(
                         ctx,
                         query=step_query,
                         df=input_df,
                         field_map=field_map,
+                        return_report=True,
                     )
+                    validation = self.rule_result_validator.validate(
+                        step=step,
+                        source_df=input_df,
+                        rule_result=rule_result,
+                    )
+                    if validation.valid:
+                        result = rule_result.result_df
+                    elif validation.fallback_to_codegen:
+                        logger.warning(
+                            "[Pipeline] rule result rejected for step=%s: %s",
+                            step.step_id,
+                            "; ".join(validation.reasons),
+                        )
+                        step.route = RoutingHint.CODE_GEN
+                        execution_plan.route = RoutingHint.CODE_GEN
+                        trace.add_event(
+                            EVT_TOOL_END,
+                            tool_name=self.rule_engine.name,
+                            output_summary=f"step={step.step_id} rejected; fallback=code",
+                            metadata={"reasons": validation.reasons},
+                        )
                 except Exception as exc:
                     logger.warning(
                         "[Pipeline] rule step %s fell back to CODE_GEN: %s",
@@ -519,6 +550,7 @@ class SheetMindAgent:
                         exc,
                     )
                     step.route = RoutingHint.CODE_GEN
+                    execution_plan.route = RoutingHint.CODE_GEN
 
             if step.route == RoutingHint.CODE_GEN and result is None:
                 if emitter:
