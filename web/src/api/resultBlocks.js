@@ -14,8 +14,27 @@ export const toAnalysisViewModel = (payload, prompt) => {
     .filter((block) => block.kind === "summary" && block.content)
     .map((block) => block.content);
   const metrics = payload.blocks.filter((block) => block.kind === "metric");
+  const outputIntents = Array.isArray(payload.output_intents) && payload.output_intents.length
+    ? payload.output_intents
+    : ["auto"];
 
   const type = table && chart ? "both" : table ? "data" : chart ? "chart" : "insight_only";
+  const mode = chart && table
+    ? "both"
+    : chart || outputIntents.includes("chart")
+      ? "visualization"
+      : table || outputIntents.some((intent) => intent === "table" || intent === "export_excel")
+        ? "processing"
+        : "insight";
+  const classification = outputIntents.includes("export_excel")
+    ? "Excel Export"
+    : mode === "visualization"
+      ? "Visualization"
+      : mode === "processing"
+        ? "Data Processing"
+        : mode === "both"
+          ? "Data + Visualization"
+          : "Insight";
   const totalRows = table?.total_rows ?? table?.rows?.length ?? 0;
   const previews = tables.map((tableBlock, index) => ({
     title: tableBlock.title || `结果 ${index + 1}`,
@@ -38,6 +57,9 @@ export const toAnalysisViewModel = (payload, prompt) => {
 
   return {
     type,
+    outputIntents,
+    mode,
+    classification,
     prompt,
     processedAt: new Date().toISOString(),
     suggestion: summaries.join("\n\n"),

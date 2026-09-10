@@ -61,12 +61,14 @@ class ExecutionStep(BaseModel):
 
     step_id: str
     query: str
+    normalized_query: str = ""
     route: RoutingHint
     depends_on: List[str] = Field(default_factory=list)
     input_source: Literal["source", "previous_result", "step"] = "source"
-    operation_types: List[str] = Field(default_factory=list)
+    operation_intents: List[str] = Field(default_factory=list)
+    output_intents: List[str] = Field(default_factory=lambda: ["auto"])
+    output_explicit: bool = False
     needs_new_computation: bool = True
-    wants_chart: bool = False
     target_fields: List[str] = Field(default_factory=list)
     required_source_columns: List[str] = Field(default_factory=list)
     confidence: float = 0.0
@@ -77,9 +79,12 @@ class ExecutionPlan(BaseModel):
 
     route: RoutingHint
     mode: MultiTurnMode
-    operation_types: List[str] = Field(default_factory=list)
+    original_query: str = ""
+    normalized_query: str = ""
+    operation_intents: List[str] = Field(default_factory=list)
+    output_intents: List[str] = Field(default_factory=lambda: ["auto"])
+    output_explicit: bool = False
     needs_new_computation: bool = True
-    wants_chart: bool = False
     uses_previous_result: bool = False
     target_fields: List[str] = Field(default_factory=list)
     target_sheets: List[str] = Field(default_factory=list)
@@ -171,6 +176,7 @@ class ResultBlocks(BaseModel):
     """Stable result protocol produced by the analysis runtime."""
 
     type: Literal["result_blocks"] = "result_blocks"
+    output_intents: List[str] = Field(default_factory=lambda: ["auto"])
     blocks: List[Union[SummaryBlock, MetricBlock, TableBlock, ChartBlock]] = Field(
         default_factory=list
     )

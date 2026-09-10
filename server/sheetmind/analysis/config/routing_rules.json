@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "level_1": {
     "description": "Query structure: conversation mode, sequencing, parallelism, and dependencies.",
     "keyword_groups": {
@@ -33,13 +33,13 @@
     }
   },
   "level_2": {
-    "description": "Atomic-query intent signals. Terms describe meaning and never name an execution route.",
-    "signal_terms": {
+    "description": "Atomic query operation and output vocabularies. Neither vocabulary names an execution route.",
+    "operation_terms": {
       "filter": [
-        "筛选", "过滤", "filter", "where", "只看", "只要", "显示", "展示"
+        "筛选", "过滤", "filter", "where", "只看", "只要", "满足条件"
       ],
       "date_filter": [
-        "年", "月", "日期", "date", "year", "month"
+        "年", "月", "日期", "date", "year", "month", "时间范围"
       ],
       "sort": [
         "排序", "sort", "order", "降序", "升序", "从高到低", "从低到高", "排列",
@@ -67,24 +67,14 @@
       "detect_action": [
         "找出", "识别", "检测", "定位", "查找", "发现", "detect", "identify", "find"
       ],
-      "chart_reference": [
-        "图", "图表", "折线图", "柱状图", "饼图", "bar", "line", "pie", "chart",
-        "plot", "visualization", "图形", "趋势图"
-      ],
-      "chart_type": [
-        "折线图", "柱状图", "饼图", "bar chart", "line chart", "pie chart", "趋势图"
-      ],
-      "reference_marker": [
-        "这个", "该图", "上图", "上面", "上述", "已有", "当前"
-      ],
-      "chart_action": [
-        "画", "生成", "绘制", "制作", "创建", "出一个", "可视化", "visualize", "plot"
-      ],
       "explain": [
-        "分析一下", "有什么问题", "说明什么", "说明了什么", "洞察", "建议", "为什么",
-        "什么原因", "原因", "怎么看", "什么特点", "趋势如何", "有没有异常", "有什么异常",
-        "解读", "解释", "什么规律", "如何改进", "什么问题", "什么意义", "什么意思",
-        "什么情况", "能说明", "反映了什么", "体现了什么"
+        "有什么问题", "说明什么", "说明了什么", "洞察", "建议", "为什么", "什么原因",
+        "原因", "怎么看", "什么特点", "趋势如何", "有没有异常", "有什么异常", "解读",
+        "解释", "什么规律", "如何改进", "什么意义", "什么意思", "什么情况", "能说明",
+        "反映了什么", "体现了什么"
+      ],
+      "analysis_request": [
+        "分析", "分析一下", "评估", "研究", "诊断", "analyze", "analyse", "assess"
       ],
       "which": [
         "哪个", "哪家", "哪一个", "哪类", "哪种", "who", "which"
@@ -105,6 +95,36 @@
         "看看", "看一下", "数据", "全部", "所有", "一览"
       ]
     },
+    "output_terms": {
+      "chart_reference": [
+        "图", "图表", "折线图", "柱状图", "饼图", "bar", "line", "pie", "chart",
+        "plot", "visualization", "图形", "趋势图"
+      ],
+      "chart_type": [
+        "折线图", "柱状图", "饼图", "bar chart", "line chart", "pie chart", "趋势图"
+      ],
+      "reference_marker": [
+        "这个", "该图", "上图", "上面", "上述", "已有", "当前"
+      ],
+      "chart_action": [
+        "画", "生成", "绘制", "制作", "创建", "出一个", "可视化", "visualize", "plot"
+      ],
+      "display_action": [
+        "查看", "展示", "显示", "看", "show", "view", "display"
+      ],
+      "table_reference": [
+        "表格", "数据表", "明细", "列表", "table", "list"
+      ],
+      "export_excel": [
+        "excel", "xlsx", "xls", "电子表格", "工作簿"
+      ],
+      "export_action": [
+        "导出", "生成", "下载", "保存", "export", "download", "save"
+      ],
+      "insight_output": [
+        "洞察", "解释", "解读", "原因", "建议", "分析报告", "insight", "explain"
+      ]
+    },
     "patterns": {
       "top_n_regex": "(?:前|top\\s*)\\d+|(?:最高|最低|最大|最小)的?\\d+(?:个|名|条)?",
       "numeric_condition_regex": "[><≥≤]"
@@ -113,6 +133,7 @@
       "rule_engine": 0.88,
       "code_gen": 0.86,
       "insight_only": 0.86,
+      "analysis_request": 0.50,
       "vague": 0.70,
       "unknown": 0.45
     }

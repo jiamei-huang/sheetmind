@@ -46,6 +46,10 @@ class RuleResult:
 # Patterns
 # ---------------------------------------------------------------------------
 
+# Date range emitted by QueryNormalizationSkill. The end is exclusive.
+_DATE_RANGE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})\s*至\s*(\d{4}-\d{2}-\d{2})"
+)
 # Date patterns: "2024年10月", "2025年3月", "2024-10", "2024/10"
 _DATE_YEAR_MONTH = re.compile(
     r"(\d{4})[年\-/](\d{1,2})[月]?"
@@ -118,7 +122,12 @@ class RuleEngineTool(Tool):
         # 3. Apply sort
         sorted_result = self._apply_sort(query, result, field_map)
         applied_rules = []
-        if before_date != len(df) or _DATE_YEAR_MONTH.search(query) or _DATE_YEAR_ONLY.search(query):
+        if (
+            before_date != len(df)
+            or _DATE_RANGE.search(query)
+            or _DATE_YEAR_MONTH.search(query)
+            or _DATE_YEAR_ONLY.search(query)
+        ):
             applied_rules.append("date_filter")
         if before_keyword != len(result):
             applied_rules.append("keyword_filter")
@@ -255,6 +264,16 @@ class RuleEngineTool(Tool):
     # ------------------------------------------------------------------
 
     def _apply_date_filters(self, query: str, df: pd.DataFrame) -> pd.DataFrame:
+        range_match = _DATE_RANGE.search(query)
+        if range_match:
+            date_col = self._find_date_column(df)
+            if date_col:
+                start = pd.Timestamp(range_match.group(1))
+                end = pd.Timestamp(range_match.group(2))
+                dt = self._coerce_datetime(df[date_col])
+                return df[(dt >= start) & (dt < end)]
+            return df
+
         # Detect year+month
         ym_match = _DATE_YEAR_MONTH.search(query)
         if ym_match:

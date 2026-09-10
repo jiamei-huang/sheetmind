@@ -12,13 +12,6 @@ export const CHART_TYPE_LABELS = {
   pie: "Pie Chart",
 };
 
-/** 分析模式标签 */
-export const MODE_LABELS = {
-  processing: "Data Processing",
-  visualization: "Visualization",
-  both: "Both (Comprehensive)",
-};
-
 /** 可视化模式（含 data 视图） */
 export const VISUALIZATION_MODES = ["line", "bar", "pie", "data"];
 

@@ -100,6 +100,11 @@ class QueryPlanningSkill(Skill):
         return ExecutionStep(
             step_id="s1",
             query=query,
+            normalized_query=(
+                routing.normalized_query.normalized_text
+                if routing.normalized_query is not None
+                else query
+            ),
             route=routing.hint,
             depends_on=[],
             input_source=(
@@ -107,10 +112,13 @@ class QueryPlanningSkill(Skill):
                 if routing.mode == MultiTurnMode.FOLLOW_UP
                 else "source"
             ),
-            operation_types=routing.facets.operation_types,
-            needs_new_computation=routing.facets.needs_new_computation,
-            wants_chart=routing.facets.wants_chart,
-            target_fields=routing.facets.target_fields,
+            operation_intents=routing.operation_intent.types,
+            output_intents=routing.output_intent.formats,
+            output_explicit=routing.output_intent.explicit,
+            needs_new_computation=routing.hint in (
+                RoutingHint.RULE_ENGINE, RoutingHint.CODE_GEN
+            ),
+            target_fields=routing.target_fields,
             confidence=routing.confidence,
         )
 
@@ -249,18 +257,25 @@ class QueryPlanningSkill(Skill):
             step_routing = await self.routing_skill.run(ctx, raw["query"], atomic=True)
             dependencies = list(raw.get("depends_on", []))
             route = step_routing.hint
-            needs_computation = step_routing.facets.needs_new_computation
-            operations = set(step_routing.facets.operation_types)
+            needs_computation = step_routing.hint in (
+                RoutingHint.RULE_ENGINE, RoutingHint.CODE_GEN
+            )
+            operations = set(step_routing.operation_intent.types)
 
             # A chart-only dependent step consumes an existing result; it does
             # not need generated pandas code of its own.
-            if dependencies and operations and operations <= {"chart", "general"}:
+            if dependencies and operations and operations <= {"chart_data_prep", "general"}:
                 route = RoutingHint.INSIGHT_ONLY
                 needs_computation = False
 
             steps.append(ExecutionStep(
                 step_id=f"s{index}",
                 query=raw["query"],
+                normalized_query=(
+                    step_routing.normalized_query.normalized_text
+                    if step_routing.normalized_query is not None
+                    else raw["query"]
+                ),
                 route=route,
                 depends_on=dependencies,
                 input_source=(
@@ -270,10 +285,11 @@ class QueryPlanningSkill(Skill):
                     if index == 1 and mode == MultiTurnMode.FOLLOW_UP
                     else "source"
                 ),
-                operation_types=step_routing.facets.operation_types,
+                operation_intents=step_routing.operation_intent.types,
+                output_intents=step_routing.output_intent.formats,
+                output_explicit=step_routing.output_intent.explicit,
                 needs_new_computation=needs_computation,
-                wants_chart=step_routing.facets.wants_chart,
-                target_fields=step_routing.facets.target_fields,
+                target_fields=step_routing.target_fields,
                 confidence=step_routing.confidence,
             ))
         return steps

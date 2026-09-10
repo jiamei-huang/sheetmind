@@ -35,7 +35,9 @@ from .skills.code_generation import CodeGenerationSkill
 from .skills.data_profiling import DataProfilingSkill
 from .skills.field_resolution import FieldResolver, query_qualifiers
 from .skills.insight_writing import InsightWritingSkill
+from .skills.output_planning import OutputPlanningSkill
 from .skills.query_planning import QueryPlan, QueryPlanningSkill
+from .skills.query_normalization import QueryNormalizationSkill
 from .skills.routing_classification import (
     RoutingClassificationSkill,
     RoutingResult,
@@ -73,8 +75,12 @@ class SheetMindAgent:
         self.trace_store = get_trace_store()
 
         # Instantiate all skills and tools once (reusable, stateless)
-        self.routing_skill = RoutingClassificationSkill(self.router)
+        self.normalization_skill = QueryNormalizationSkill(self.router)
+        self.routing_skill = RoutingClassificationSkill(
+            self.router, self.normalization_skill
+        )
         self.planning_skill = QueryPlanningSkill(self.router, self.routing_skill)
+        self.output_planning_skill = OutputPlanningSkill(self.router)
         self.sheet_skill = SheetSelectionSkill(self.router)
         self.semantic_skill = SemanticTypingSkill(self.router)
         self.profiling_skill = DataProfilingSkill(self.router)
@@ -187,10 +193,16 @@ class SheetMindAgent:
         if emitter:
             await emitter.emit_progress("正在理解您的问题...", step_id="routing")
 
-        routing = await self.routing_skill.run(ctx, query)
+        normalized_query = await self.normalization_skill.run(ctx, query)
+        routing = await self.routing_skill.run(
+            ctx, query, normalized_query=normalized_query
+        )
         hint: RoutingHint = routing.hint
         mode: MultiTurnMode = routing.mode
-        wants_chart = hint != RoutingHint.INSIGHT_ONLY and routing.facets.wants_chart
+        wants_chart = (
+            hint != RoutingHint.INSIGHT_ONLY
+            and routing.output_intent.wants_chart
+        )
 
         previous_result_df = self._previous_result_dataframe(ctx)
         if (
@@ -206,7 +218,7 @@ class SheetMindAgent:
                 confidence=routing.confidence,
                 reasoning="Direct presentation from the previous result.",
             )
-            ctx.execution_plan = self._build_execution_plan(shortcut_plan, routing, wants_chart)
+            ctx.execution_plan = self._build_execution_plan(shortcut_plan, routing)
             self._trace_execution_plan(trace, ctx.execution_plan, routing)
             return await self._run_previous_result_chart(
                 ctx=ctx,
@@ -220,10 +232,9 @@ class SheetMindAgent:
         if routing.structure.needs_semantic_planning and emitter:
             await emitter.emit_progress("正在识别问题结构...", step_id="query_planning")
         query_plan = await self.planning_skill.run(ctx, query, routing=routing)
-        execution_plan = self._build_execution_plan(query_plan, routing, wants_chart)
+        execution_plan = self._build_execution_plan(query_plan, routing)
         ctx.execution_plan = execution_plan
         hint = execution_plan.route
-        wants_chart = execution_plan.wants_chart
         self._trace_execution_plan(trace, execution_plan, routing)
         logger.debug(
             "[Pipeline] routing=%s mode=%s steps=%d planner=%s",
@@ -250,7 +261,9 @@ class SheetMindAgent:
                 await emitter.emit_progress("正在选择数据文件...", step_id="sheet_selection")
 
             try:
-                selected_files = await self.sheet_skill.run(ctx, query)
+                selected_files = await self.sheet_skill.run(
+                    ctx, normalized_query.normalized_text
+                )
                 execution_plan.target_sheets = list(ctx.selected_sheets)
             except Exception as exc:
                 logger.warning("[Pipeline] sheet selection failed: %s", exc)
@@ -300,14 +313,29 @@ class SheetMindAgent:
                 "或检查列名是否正确。"
             )
             logger.warning("[Pipeline] planned execution failed for task=%s", ctx.task_id)
-            return ResultBlocks(blocks=[SummaryBlock(content=error_msg)]), hint, mode
+            return ResultBlocks(
+                output_intents=execution_plan.output_intents,
+                blocks=[SummaryBlock(content=error_msg)],
+            ), hint, mode
+
+        output_plan = await self.output_planning_skill.run(
+            ctx,
+            query,
+            output_intents=execution_plan.output_intents,
+            route=hint,
+            has_computation=execution_plan.needs_new_computation,
+        )
 
         # ----------------------------------------------------------------
         # 5. Chart planning for the result requested by each chart step
         # ----------------------------------------------------------------
         chart_blocks: List[ChartBlock] = []
-        chart_requests = [step for step in query_plan.steps if step.wants_chart]
-        if wants_chart and not chart_requests and query_plan.steps:
+        chart_requests = (
+            [step for step in query_plan.steps if "chart" in step.output_intents]
+            if output_plan.include_chart
+            else []
+        )
+        if output_plan.include_chart and not chart_requests and query_plan.steps:
             chart_requests = [query_plan.steps[-1]]
 
         for step in chart_requests[:3]:
@@ -318,10 +346,11 @@ class SheetMindAgent:
                 continue
             if emitter:
                 await emitter.emit_progress("正在生成图表...", step_id="chart_planning")
-            result_field_map = await self.semantic_skill.run(ctx, step.query, df=chart_df)
+            step_query = step.normalized_query or step.query
+            result_field_map = await self.semantic_skill.run(ctx, step_query, df=chart_df)
             chart = await self.chart_skill.run(
                 ctx,
-                step.query,
+                step_query,
                 result_df=chart_df,
                 field_map=result_field_map,
             )
@@ -349,6 +378,15 @@ class SheetMindAgent:
 
         table_blocks: List[TableBlock] = []
         for step, step_df in visible_results:
+            step_output_plan = await self.output_planning_skill.run(
+                ctx,
+                step.query,
+                output_intents=step.output_intents,
+                route=step.route,
+                has_computation=step.needs_new_computation,
+            )
+            if not step_output_plan.include_table:
+                continue
             table = self._build_table_block(step_df)
             if table is not None:
                 if len(visible_results) > 1:
@@ -380,7 +418,7 @@ class SheetMindAgent:
         blocks: List[Any] = []
 
         # Summary always first
-        if summary_text:
+        if summary_text and output_plan.include_summary:
             blocks.append(SummaryBlock(content=summary_text))
 
         # Tables from independent terminal branches, or the final sequential step.
@@ -388,7 +426,10 @@ class SheetMindAgent:
 
         blocks.extend(chart_blocks)
 
-        result = ResultBlocks(blocks=blocks)
+        result = ResultBlocks(
+            output_intents=execution_plan.output_intents,
+            blocks=blocks,
+        )
 
         if emitter:
             await emitter.emit_progress("正在校验结果...", step_id="validation")
@@ -417,6 +458,7 @@ class SheetMindAgent:
         required_columns: List[str] = []
 
         for index, step in enumerate(plan.steps, start=1):
+            step_query = step.normalized_query or step.query
             input_df = self._step_input_dataframe(
                 step,
                 outputs=outputs,
@@ -446,8 +488,8 @@ class SheetMindAgent:
 
             if emitter:
                 await emitter.emit_progress("正在识别字段类型...", step_id="semantic_typing")
-            field_map = await self.semantic_skill.run(ctx, step.query, df=input_df)
-            step.required_source_columns = self._required_source_columns(step.query, field_map)
+            field_map = await self.semantic_skill.run(ctx, step_query, df=input_df)
+            step.required_source_columns = self._required_source_columns(step_query, field_map)
             for column in step.required_source_columns:
                 if column not in required_columns:
                     required_columns.append(column)
@@ -456,7 +498,7 @@ class SheetMindAgent:
                 await emitter.emit_progress("正在生成数据画像...", step_id="data_profiling")
             data_summary = await self.profiling_skill.run(
                 ctx,
-                step.query,
+                step_query,
                 df=input_df,
                 field_map=field_map,
             )
@@ -466,7 +508,7 @@ class SheetMindAgent:
                 try:
                     result = self.rule_engine.run(
                         ctx,
-                        query=step.query,
+                        query=step_query,
                         df=input_df,
                         field_map=field_map,
                     )
@@ -486,11 +528,11 @@ class SheetMindAgent:
                     emit_fn = None
                 result, _code, _repairs = await self.repair_loop.run(
                     ctx=ctx,
-                    query=step.query,
+                    query=step_query,
                     df=input_df,
                     data_summary=data_summary,
                     field_map=field_map,
-                    wants_chart=step.wants_chart,
+                    wants_chart="chart" in step.output_intents,
                     is_compound=False,
                     required_columns=step.required_source_columns,
                     trace=trace,
@@ -534,7 +576,6 @@ class SheetMindAgent:
     def _build_execution_plan(
         plan: QueryPlan,
         routing: RoutingResult,
-        wants_chart: bool,
     ) -> ExecutionPlan:
         def unique(values: List[str]) -> List[str]:
             return list(dict.fromkeys(values))
@@ -547,31 +588,52 @@ class SheetMindAgent:
         else:
             primary_route = RoutingHint.INSIGHT_ONLY
 
-        operation_types = unique([
+        operation_intents = unique([
             operation
             for step in plan.steps
-            for operation in step.operation_types
-        ]) or list(routing.facets.operation_types)
+            for operation in step.operation_intents
+        ]) or list(routing.operation_intent.types)
+        output_intents = unique([
+            output
+            for step in plan.steps
+            for output in step.output_intents
+        ])
+        if not output_intents:
+            output_intents = list(routing.output_intent.formats)
         target_fields = unique([
             target
             for step in plan.steps
             for target in step.target_fields
-        ]) or list(routing.facets.target_fields)
+        ]) or list(routing.target_fields)
 
         return ExecutionPlan(
             route=primary_route,
             mode=routing.mode,
-            operation_types=operation_types,
+            original_query=(
+                routing.normalized_query.original_text
+                if routing.normalized_query is not None
+                else ""
+            ),
+            normalized_query=(
+                routing.normalized_query.normalized_text
+                if routing.normalized_query is not None
+                else ""
+            ),
+            operation_intents=operation_intents,
+            output_intents=output_intents,
+            output_explicit=(
+                routing.output_intent.explicit
+                or any(step.output_explicit for step in plan.steps)
+            ),
             needs_new_computation=any(step.needs_new_computation for step in plan.steps),
-            wants_chart=wants_chart or any(step.wants_chart for step in plan.steps),
             uses_previous_result=(
-                routing.facets.uses_previous_result
+                routing.mode == MultiTurnMode.FOLLOW_UP
                 or any(step.input_source == "previous_result" for step in plan.steps)
             ),
             target_fields=target_fields,
             confidence=plan.confidence,
             steps=plan.steps,
-            planner_used=plan.is_multi_step,
+            planner_used=plan.source != "single",
             planner_source=plan.source,
             reasoning=plan.reasoning,
         )
@@ -592,9 +654,18 @@ class SheetMindAgent:
                 "reasoning": routing.reasoning,
                 "structure": {
                     "requires_planning": routing.structure.requires_planning,
+                    "needs_semantic_planning": routing.structure.needs_semantic_planning,
+                    "classification": routing.structure.classification,
                     "score": routing.structure.score,
                     "signals": routing.structure.signals,
                 },
+                "operation_intent": routing.operation_intent.types,
+                "output_intent": routing.output_intent.formats,
+                "normalized_query": (
+                    routing.normalized_query.model_dump()
+                    if routing.normalized_query is not None
+                    else None
+                ),
                 "execution_plan": execution_plan.model_dump(mode="json"),
             },
         )
@@ -666,7 +737,7 @@ class SheetMindAgent:
             field_map=field_map,
         )
         if chart_block is None:
-            result = ResultBlocks(blocks=[
+            result = ResultBlocks(output_intents=["chart"], blocks=[
                 SummaryBlock(content="上一次结果无法直接生成图表，请换一种图表描述。")
             ])
             return result, hint, mode
@@ -688,7 +759,7 @@ class SheetMindAgent:
             blocks.append(SummaryBlock(content=summary_text))
         blocks.append(chart_block)
 
-        result = ResultBlocks(blocks=blocks)
+        result = ResultBlocks(output_intents=["chart"], blocks=blocks)
         return validate_result(result, degrade_invalid_charts=True), hint, mode
 
     @staticmethod

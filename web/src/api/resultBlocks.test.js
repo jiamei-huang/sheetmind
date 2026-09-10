@@ -8,6 +8,7 @@ test("converts native result blocks into the analysis view model", () => {
   const result = toAnalysisViewModel(
     {
       type: "result_blocks",
+      output_intents: ["table", "chart"],
       blocks: [
         { kind: "metric", label: "Revenue", value: 1200, unit: "CNY" },
         {
@@ -31,6 +32,9 @@ test("converts native result blocks into the analysis view model", () => {
   );
 
   assert.equal(result.type, "both");
+  assert.deepEqual(result.outputIntents, ["table", "chart"]);
+  assert.equal(result.mode, "both");
+  assert.equal(result.classification, "Data + Visualization");
   assert.equal(result.metrics[0].value, 1200);
   assert.equal(result.preview.totalRowCount, 20);
   assert.equal(result.chartData.defaultType, "bar");
@@ -38,6 +42,23 @@ test("converts native result blocks into the analysis view model", () => {
   assert.match(result.chartData.reason, /numeric metric/);
   assert.equal(result.suggestion, "East leads sales.");
   assert.match(result.runtimeNote, /1.*20/);
+});
+
+
+test("uses backend output intent for Excel export classification", () => {
+  const result = toAnalysisViewModel(
+    {
+      type: "result_blocks",
+      output_intents: ["export_excel"],
+      blocks: [
+        { kind: "table", columns: ["sku"], rows: [{ sku: "A" }] },
+      ],
+    },
+    "生成 Excel"
+  );
+
+  assert.equal(result.mode, "processing");
+  assert.equal(result.classification, "Excel Export");
 });
 
 

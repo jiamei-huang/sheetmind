@@ -70,10 +70,12 @@ class MockModelProvider:
         json_mode: bool = False,
         **kwargs: Any,
     ) -> str:
-        # For routing LLM fallback: return the rule engine's guess unchanged
-        # The routing skill will fall back to the rule result if JSON parse fails
+        # Keep low-confidence intent enrichment neutral during deterministic evals.
         if json_mode:
-            return '{"routing": "code", "reasoning": "mock"}'
+            return (
+                '{"operation_intents": [], "output_intents": ["auto"], '
+                '"confidence": 0.5, "reasoning": "mock"}'
+            )
         return "分析完成。"
 
 

@@ -4,12 +4,13 @@ SheetMind is an Excel analysis application for persistent projects, multi-turn q
 
 ## Analysis runtime
 
-The backend first classifies query structure, then builds a dependency-aware
-execution plan. High-confidence single questions stay on the rule fast path;
-complex or ambiguous questions use semantic planning to confirm one operation or
-decompose multiple operations and their dependencies. Each atomic step extracts
-intent signals before deterministic route-decision rules select guarded rules,
-generated pandas code, or insight writing.
+The backend first normalizes query syntax, classifies query structure, then builds
+a dependency-aware execution plan. High-confidence single questions stay on the
+rule fast path; complex or ambiguous questions use semantic planning to confirm
+one operation or decompose multiple operations and their dependencies. Each
+atomic step independently extracts operation and output intents. Deterministic
+operation rules select guarded rules, generated pandas code, or insight writing;
+output planning separately selects table, chart, insight, or export-ready results.
 It recognizes period labels and identifier columns, prefers qualified metrics
 such as RMB amounts, and returns validated table, chart, metric, and summary
 blocks. Independent branches can return multiple named tables or charts, which

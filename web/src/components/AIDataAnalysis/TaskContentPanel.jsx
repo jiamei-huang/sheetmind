@@ -14,7 +14,7 @@ import {
   ImageDown,
 } from "lucide-react";
 import Loader from "../Loader";
-import { CHART_TYPES, MODE_LABELS, VISUALIZATION_MODES, VISUALIZATION_LABELS } from "../../constants/chart";
+import { CHART_TYPES, VISUALIZATION_MODES, VISUALIZATION_LABELS } from "../../constants/chart";
 
 const RechartsVisualization = lazy(() => import("./RechartsVisualization"));
 

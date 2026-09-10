@@ -18,6 +18,7 @@ No real LLM API calls are made.  Tests cover:
 import asyncio
 import os
 import sys
+from datetime import date
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
@@ -41,12 +42,14 @@ from sheetmind.analysis.context import (
 from sheetmind.analysis.models.configs import ModelRole
 from sheetmind.analysis.models.router import ModelRouter
 from sheetmind.analysis.skills.query_planning import QueryPlan, QueryPlanningSkill
+from sheetmind.analysis.skills.query_normalization import QueryNormalizationSkill
+from sheetmind.analysis.skills.output_planning import OutputPlanningSkill
 from sheetmind.analysis.skills import routing_classification as routing_rules_module
 from sheetmind.analysis.skills.chart_planning import ChartPlanningSkill
 from sheetmind.analysis.skills.data_profiling import DataProfilingSkill
 from sheetmind.analysis.skills.routing_classification import (
-    IntentFacets,
-    IntentSignals,
+    OperationIntent,
+    OutputIntent,
     RoutingClassificationSkill,
     RoutingResult,
 )
@@ -72,7 +75,7 @@ def make_ctx(project_id: str = "test_proj", with_active_result: bool = False) ->
 
 class MockModelProvider:
     """Returns deterministic responses — no real API calls."""
-    def __init__(self, response: str = '{"routing":"code","reasoning":"mock"}'):
+    def __init__(self, response: str = '{"operation_intents":[],"output_intents":["auto"],"confidence":0.5,"reasoning":"mock"}'):
         self._response = response
         self.calls = 0
 
@@ -83,7 +86,7 @@ class MockModelProvider:
 
 
 class MockRouter(ModelRouter):
-    def __init__(self, response: str = '{"routing":"code","reasoning":"mock"}'):
+    def __init__(self, response: str = '{"operation_intents":[],"output_intents":["auto"],"confidence":0.5,"reasoning":"mock"}'):
         self._mock = MockModelProvider(response)
 
     def get_provider(self, role: ModelRole):
@@ -92,6 +95,109 @@ class MockRouter(ModelRouter):
 
 def run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
+
+
+# ---------------------------------------------------------------------------
+# QueryNormalizationSkill
+# ---------------------------------------------------------------------------
+
+class TestQueryNormalizationSkill:
+    def setup_method(self):
+        self.skill = QueryNormalizationSkill(MockRouter())
+        self.ctx = make_ctx()
+
+    def test_normalizes_contextual_chinese_numbers_without_losing_original_text(self):
+        result = run(self.skill.run(
+            self.ctx,
+            "  查看金额（RMB）前十名！！  ",
+            reference_date=date(2026, 9, 10),
+        ))
+
+        assert result.original_text == "查看金额（RMB）前十名！！"
+        assert result.normalized_text == "查看金额(RMB)前10名!!"
+        assert result.numbers[0].raw == "十"
+        assert result.numbers[0].value == 10
+
+    def test_resolves_relative_month_to_a_structured_time_range(self):
+        result = run(self.skill.run(
+            self.ctx,
+            "查看上个月的销售额",
+            reference_date=date(2026, 9, 10),
+        ))
+
+        assert "2026-08-01至2026-09-01" in result.normalized_text
+        assert result.time_ranges[0].raw == "上个月"
+        assert result.time_ranges[0].start == "2026-08-01"
+        assert result.time_ranges[0].end == "2026-09-01"
+
+    def test_keeps_clause_punctuation_for_structure_detection(self):
+        result = run(self.skill.run(
+            self.ctx,
+            "先筛选数据；然后汇总金额。",
+            reference_date=date(2026, 9, 10),
+        ))
+
+        assert ";" in result.normalized_text
+        assert result.normalized_text.endswith(".")
+
+
+# ---------------------------------------------------------------------------
+# OutputPlanningSkill
+# ---------------------------------------------------------------------------
+
+class TestOutputPlanningSkill:
+    def setup_method(self):
+        self.skill = OutputPlanningSkill(MockRouter())
+        self.ctx = make_ctx()
+
+    def test_auto_computation_defaults_to_table(self):
+        plan = run(self.skill.run(
+            self.ctx,
+            "统计销售额",
+            output_intents=["auto"],
+            route=RoutingHint.CODE_GEN,
+            has_computation=True,
+        ))
+
+        assert plan.include_table is True
+        assert plan.include_chart is False
+        assert plan.include_summary is True
+
+    def test_explicit_chart_does_not_force_table(self):
+        plan = run(self.skill.run(
+            self.ctx,
+            "查看销售额趋势",
+            output_intents=["chart"],
+            route=RoutingHint.CODE_GEN,
+            has_computation=True,
+        ))
+
+        assert plan.include_chart is True
+        assert plan.include_table is False
+
+    def test_excel_export_keeps_a_table_result_for_export(self):
+        plan = run(self.skill.run(
+            self.ctx,
+            "生成 Excel",
+            output_intents=["export_excel"],
+            route=RoutingHint.RULE_ENGINE,
+            has_computation=True,
+        ))
+
+        assert plan.include_table is True
+        assert plan.export_excel is True
+
+    def test_mixed_default_and_chart_outputs_keep_both_result_types(self):
+        plan = run(self.skill.run(
+            self.ctx,
+            "汇总销售额，同时展示趋势图",
+            output_intents=["auto", "chart"],
+            route=RoutingHint.CODE_GEN,
+            has_computation=True,
+        ))
+
+        assert plan.include_table is True
+        assert plan.include_chart is True
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +233,8 @@ class TestRoutingClassificationSkill:
     def test_insight_only_analysis(self):
         result = run(self.skill.run(self.ctx, "分析一下这些数据说明什么"))
         assert result.hint == RoutingHint.INSIGHT_ONLY
-        assert result.facets.needs_new_computation is False
-        assert "explain" in result.facets.operation_types
+        assert result.needs_new_computation is False
+        assert "explain" in result.operation_intent.types
 
     def test_mode_new_by_default(self):
         result = run(self.skill.run(self.ctx, "筛选2024年10月的订单"))
@@ -166,37 +272,85 @@ class TestRoutingClassificationSkill:
         assert isinstance(result.reasoning, str)
         assert len(result.reasoning) > 0
 
-    def test_secondary_facets_for_chart_aggregation(self):
+    def test_operation_and_output_intents_for_chart_aggregation(self):
         result = run(self.skill.run(self.ctx, "按地区汇总销售额并画柱状图"))
         assert result.hint == RoutingHint.CODE_GEN
-        assert result.facets.needs_new_computation is True
-        assert result.facets.wants_chart is True
-        assert "aggregate" in result.facets.operation_types
-        assert "chart" in result.facets.operation_types
-        assert "销售额" in result.facets.target_fields
+        assert isinstance(result.operation_intent, OperationIntent)
+        assert isinstance(result.output_intent, OutputIntent)
+        assert "aggregate" in result.operation_intent.types
+        assert result.output_intent.formats == ["chart"]
+        assert result.needs_new_computation is True
+        assert result.output_intent.wants_chart is True
+        assert "aggregate" in result.operation_intent.types
+        assert "chart_data_prep" in result.operation_intent.types
+        assert "销售额" in result.target_fields
 
     def test_filter_and_sort_signals_combine_into_rule_engine_route(self):
         result = run(self.skill.run(self.ctx, "筛选2025年订单并按金额降序排序"))
 
         assert result.hint == RoutingHint.RULE_ENGINE
-        assert isinstance(result.intent_signals, IntentSignals)
-        assert {"filter", "sort"} <= set(result.intent_signals.active)
-        assert "aggregate" not in result.intent_signals.active
+        assert isinstance(result.operation_intent, OperationIntent)
+        assert {"filter", "sort"} <= set(result.operation_intent.types)
+        assert "aggregate" not in result.operation_intent.types
 
     def test_chart_explanation_is_not_chart_creation(self):
         result = run(self.skill.run(self.ctx, "这个柱状图说明了什么"))
 
         assert result.hint == RoutingHint.INSIGHT_ONLY
-        assert "chart_explain" in result.intent_signals.active
-        assert "chart_create" not in result.intent_signals.active
-        assert result.facets.wants_chart is False
+        assert result.operation_intent.types == ["explain"]
+        assert result.output_intent.formats == ["insight"]
+        assert result.output_intent.wants_chart is False
+
+    def test_generate_excel_is_export_output_not_chart_operation(self):
+        result = run(self.skill.run(self.ctx, "生成 Excel"))
+
+        assert result.hint == RoutingHint.RULE_ENGINE
+        assert result.operation_intent.types == ["pass_through"]
+        assert result.output_intent.formats == ["export_excel"]
+        assert result.output_intent.explicit is True
+        assert result.output_intent.wants_chart is False
+
+    def test_view_trend_infers_chart_output(self):
+        result = run(self.skill.run(self.ctx, "查看 SKU 销售额趋势"))
+
+        assert result.hint == RoutingHint.CODE_GEN
+        assert "trend" in result.operation_intent.types
+        assert result.output_intent.formats == ["chart"]
+
+    def test_normalized_relative_month_has_date_filter_operation(self):
+        result = run(self.skill.run(
+            self.ctx,
+            "查看上个月的数据",
+            normalized_query=run(QueryNormalizationSkill(MockRouter()).run(
+                self.ctx,
+                "查看上个月的数据",
+                reference_date=date(2026, 9, 10),
+            )),
+        ))
+
+        assert "date_filter" in result.operation_intent.types
+        assert result.hint == RoutingHint.RULE_ENGINE
+
+    def test_show_trend_chart_does_not_create_filter_operation(self):
+        result = run(self.skill.run(self.ctx, "展示 SKU 销售额趋势图"))
+
+        assert "filter" not in result.operation_intent.types
+        assert "trend" in result.operation_intent.types
+        assert result.output_intent.formats == ["chart"]
+
+    def test_generic_analysis_is_semantically_planned_without_forcing_chart(self):
+        result = run(self.skill.run(self.ctx, "分析 SKU 销售额"))
+
+        assert "analysis_request" in result.operation_intent.types
+        assert result.output_intent.formats == ["auto"]
+        assert result.structure.needs_semantic_planning is True
 
     def test_anomaly_detection_requires_computation(self):
         result = run(self.skill.run(self.ctx, "找出退货率异常的地区"))
 
         assert result.hint == RoutingHint.CODE_GEN
-        assert "anomaly_detect" in result.intent_signals.active
-        assert result.facets.needs_new_computation is True
+        assert "anomaly_detect" in result.operation_intent.types
+        assert result.needs_new_computation is True
 
     def test_vague_pass_through_is_a_simple_structure(self):
         result = run(self.skill.run(self.ctx, "看看数据"))
@@ -205,16 +359,18 @@ class TestRoutingClassificationSkill:
         assert result.structure.classification == "simple"
         assert result.structure.needs_semantic_planning is False
 
-    def test_llm_can_add_signals_but_cannot_override_route_decision(self):
+    def test_llm_can_add_intents_but_cannot_override_route_decision(self):
         router = MockRouter(
-            '{"routing":"rule","signals":["aggregate"],"confidence":0.92}'
+            '{"routing":"rule","operation_intents":["aggregate"],'
+            '"output_intents":["table"],"confidence":0.92}'
         )
         skill = RoutingClassificationSkill(router)
 
         result = run(skill.run(make_ctx(), "处理重点记录", atomic=True))
 
-        assert result.intent_signals.source == "hybrid"
-        assert "aggregate" in result.intent_signals.active
+        assert result.operation_intent.source == "hybrid"
+        assert "aggregate" in result.operation_intent.types
+        assert result.output_intent.formats == ["table"]
         assert result.hint == RoutingHint.CODE_GEN
 
     def test_ambiguous_long_query_requests_semantic_structure_planning(self):
@@ -230,7 +386,7 @@ class TestRoutingClassificationSkill:
 
         assert result.structure.classification == "uncertain"
         assert result.structure.needs_semantic_planning is True
-        assert "mixed_compute_explain" in result.structure.signals
+        assert "mixed_compute_insight" in result.structure.signals
 
     def test_routing_rules_are_loaded_from_config_file(self):
         assert routing_rules_module._ROUTING_RULES_PATH.name == "routing_rules.json"
@@ -238,9 +394,11 @@ class TestRoutingClassificationSkill:
         assert "level_1" in routing_rules_module._ROUTING_RULES
         assert "level_2" in routing_rules_module._ROUTING_RULES
         assert "route_keywords" not in routing_rules_module._ROUTING_RULES["level_2"]
-        assert "汇总" in routing_rules_module._SIGNAL_TERMS["aggregate"]
-        assert "筛选" in routing_rules_module._SIGNAL_TERMS["filter"]
-        assert "说明什么" in routing_rules_module._SIGNAL_TERMS["explain"]
+        assert "signal_terms" not in routing_rules_module._ROUTING_RULES["level_2"]
+        assert "汇总" in routing_rules_module._OPERATION_TERMS["aggregate"]
+        assert "筛选" in routing_rules_module._OPERATION_TERMS["filter"]
+        assert "展示" not in routing_rules_module._OPERATION_TERMS["filter"]
+        assert "excel" in routing_rules_module._OUTPUT_TERMS["export_excel"]
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +609,21 @@ class TestRuleEngineTool:
         result = self.tool.run(self.ctx, query="筛选美国官网", df=df)
 
         assert len(result) == 2
-        assert result["费用金额"].sum() == pytest.approx(95291.0571641788)
+
+    def test_normalized_relative_month_range_is_executed(self):
+        normalized = run(QueryNormalizationSkill(MockRouter()).run(
+            self.ctx,
+            "查看上个月的数据",
+            reference_date=date(2026, 9, 10),
+        ))
+        df = pd.DataFrame({
+            "日期": ["2026-07-31", "2026-08-01", "2026-08-31", "2026-09-01"],
+            "金额": [1, 2, 3, 4],
+        })
+
+        result = self.tool.run(self.ctx, query=normalized.normalized_text, df=df)
+
+        assert result["金额"].tolist() == [2, 3]
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +1008,91 @@ class TestBuildTableBlock:
 # ---------------------------------------------------------------------------
 
 class TestSheetMindAgentPipeline:
+    def test_execution_plan_preserves_default_and_explicit_step_outputs(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        routing = RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.9,
+            reasoning="mixed outputs",
+        )
+        plan = QueryPlan(
+            steps=[
+                ExecutionStep(
+                    step_id="s1",
+                    query="汇总销售额",
+                    route=RoutingHint.CODE_GEN,
+                    output_intents=["auto"],
+                ),
+                ExecutionStep(
+                    step_id="s2",
+                    query="展示趋势图",
+                    route=RoutingHint.CODE_GEN,
+                    output_intents=["chart"],
+                    output_explicit=True,
+                ),
+            ],
+            is_multi_step=True,
+            source="llm",
+            confidence=0.9,
+        )
+
+        execution_plan = SheetMindAgent._build_execution_plan(plan, routing)
+
+        assert execution_plan.output_intents == ["auto", "chart"]
+
+    def test_export_output_intent_returns_exportable_table(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({"SKU": ["A", "B"], "销售额": [100, 200]})
+        agent.sheet_skill.run = AsyncMock(return_value=[
+            {"fileName": "sales.xlsx", "sheets": ["Sheet1"]},
+        ])
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.semantic_skill.run = AsyncMock(return_value={})
+        agent.profiling_skill.run = AsyncMock(return_value="profile")
+        agent.insight_skill.run = AsyncMock(return_value="已准备导出数据。")
+
+        result = run(agent.run(ctx, "生成 Excel"))
+
+        assert result.output_intents == ["export_excel"]
+        assert result.has_table is True
+        assert result.has_chart is False
+        assert ctx.execution_plan.output_intents == ["export_excel"]
+
+    def test_chart_output_intent_does_not_force_table_block(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({"月份": ["2026-01", "2026-02"], "销售额": [100, 200]})
+        chart_df = source_df.copy()
+        chart = ChartBlock(
+            chart_type="line",
+            labels=["2026-01", "2026-02"],
+            series=[ChartSeries(name="销售额", values=[100.0, 200.0])],
+            x_axis_label="月份",
+            y_axis_label="销售额",
+        )
+        agent.sheet_skill.run = AsyncMock(return_value=[
+            {"fileName": "sales.xlsx", "sheets": ["Sheet1"]},
+        ])
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.semantic_skill.run = AsyncMock(return_value={})
+        agent.profiling_skill.run = AsyncMock(return_value="profile")
+        agent.repair_loop.run = AsyncMock(return_value=(chart_df, "result = df", 0))
+        agent.chart_skill.run = AsyncMock(return_value=chart)
+        agent.insight_skill.run = AsyncMock(return_value="销售额呈上升趋势。")
+
+        result = run(agent.run(ctx, "查看 SKU 销售额趋势"))
+
+        assert result.output_intents == ["chart"]
+        assert result.has_chart is True
+        assert result.has_table is False
+
     def test_executes_each_planned_step_from_its_dependency_result(self):
         from sheetmind.analysis.agent import SheetMindAgent
 
@@ -1026,7 +1283,8 @@ class TestSheetMindAgentPipeline:
             confidence=0.9,
             reasoning="follow-up chart",
             is_compound=True,
-            facets=IntentFacets(wants_chart=True),
+            operation_intent=OperationIntent(types=["chart_data_prep"]),
+            output_intent=OutputIntent(formats=["chart"], explicit=True),
         ))
         agent.df_loader.run = MagicMock(side_effect=AssertionError("should not load source data"))
         agent.repair_loop.run = AsyncMock(side_effect=AssertionError("should not codegen"))

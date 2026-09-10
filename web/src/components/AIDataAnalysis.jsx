@@ -6,7 +6,6 @@ import { toAnalysisViewModel } from "../api/resultBlocks";
 import { isValidBackendProjectId } from "../utils/validation";
 import { createTask, PAGE_SIZE_OPTIONS } from "../constants/task";
 import { CHART_TYPES, CHART_TYPE_LABELS } from "../constants/chart";
-import { classifyPrompt } from "../utils/prompt";
 
 const maxChars = 500;
 
@@ -323,8 +322,6 @@ function AIDataAnalysis({
       return;
     }
 
-    const classification = classifyPrompt(trimmedPrompt);
-
     effectiveSetTasks((prev) =>
       prev.map((item) =>
         item.id === taskId
@@ -332,8 +329,8 @@ function AIDataAnalysis({
               ...item,
               prompt: trimmedPrompt,
               status: "running",
-              classification: classification.label,
-              mode: classification.mode,
+              classification: "AI Analysis",
+              mode: "auto",
               analysisError: null,
             }
           : item
@@ -472,6 +469,8 @@ function AIDataAnalysis({
               ...item,
               status: "draft", // 保持draft状态以便继续对话
               results: [...(item.results || []), newResult],
+              classification: newResult.classification,
+              mode: newResult.mode,
               prompt: "", // 清空prompt以便继续输入
               analysisError: null,
               isOpen: true,
