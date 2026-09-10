@@ -94,6 +94,7 @@ class RuleEngineTool(Tool):
         query: str = "",
         df: Optional[pd.DataFrame] = None,
         field_map: Optional[SemanticFieldMap] = None,
+        required_columns: Optional[List[str]] = None,
         return_report: bool = False,
         **kwargs: Any,
     ) -> pd.DataFrame:
@@ -108,22 +109,43 @@ class RuleEngineTool(Tool):
         # 0. Deterministic aggregate extrema:
         #    "哪个店铺的尾程花费最多" should be answered by real groupby+sum,
         #    not by LLM-generated code that can confuse column names and values.
-        aggregate_result = self._apply_aggregate_extreme(query, result, field_map)
+        aggregate_result = self._apply_aggregate_extreme(
+            query,
+            result,
+            field_map,
+            required_columns,
+        )
         if aggregate_result is not None:
             return self._result(aggregate_result.reset_index(drop=True), ["aggregate_extreme"], return_report)
 
         # 1. Apply date filters
         before_date_result = result
-        result = self._apply_date_filters(query, result, field_map)
+        result = self._apply_date_filters(
+            query,
+            result,
+            field_map,
+            required_columns,
+        )
         date_filter_applied = result is not before_date_result
 
         # 2. Apply keyword filters (if filter trigger present)
         before_keyword_result = result
-        result = self._apply_keyword_filters(query, result, df)
+        result = self._apply_keyword_filters(
+            query,
+            result,
+            df,
+            required_columns,
+            field_map,
+        )
         keyword_filter_applied = result is not before_keyword_result
 
         # 3. Apply sort
-        sorted_result = self._apply_sort(query, result, field_map)
+        sorted_result = self._apply_sort(
+            query,
+            result,
+            field_map,
+            required_columns,
+        )
         sort_applied = sorted_result is not result
         applied_rules = []
         if date_filter_applied:
@@ -167,6 +189,7 @@ class RuleEngineTool(Tool):
         query: str,
         df: pd.DataFrame,
         field_map: Optional[SemanticFieldMap] = None,
+        required_columns: Optional[List[str]] = None,
     ) -> Optional[pd.DataFrame]:
         q_lower = query.lower()
         if not (
@@ -175,8 +198,18 @@ class RuleEngineTool(Tool):
         ):
             return None
 
-        group_col = self._find_group_column(query, df, field_map)
-        value_col = self._find_value_column(query, df, field_map)
+        group_col = self._find_group_column(
+            query,
+            df,
+            field_map,
+            required_columns,
+        )
+        value_col = self._find_value_column(
+            query,
+            df,
+            field_map,
+            required_columns,
+        )
         if group_col is None or value_col is None:
             return None
 
@@ -200,7 +233,17 @@ class RuleEngineTool(Tool):
         query: str,
         df: pd.DataFrame,
         field_map: Optional[SemanticFieldMap] = None,
+        required_columns: Optional[List[str]] = None,
     ) -> Optional[str]:
+        for column in required_columns or []:
+            if column not in df.columns:
+                continue
+            info = field_map.get(column) if field_map else None
+            if info and info.type in {"categorical", "datetime", "datetime-like"}:
+                return column
+            if info is None and not pd.api.types.is_numeric_dtype(df[column]):
+                return column
+
         if field_map:
             match = FieldResolver().resolve(
                 query,
@@ -231,8 +274,18 @@ class RuleEngineTool(Tool):
         query: str,
         df: pd.DataFrame,
         field_map: Optional[SemanticFieldMap] = None,
+        required_columns: Optional[List[str]] = None,
     ) -> Optional[str]:
         q_lower = query.lower()
+
+        for column in required_columns or []:
+            if column not in df.columns:
+                continue
+            info = field_map.get(column) if field_map else None
+            if info and info.should_aggregate:
+                return column
+            if info is None and pd.api.types.is_numeric_dtype(df[column]):
+                return column
 
         if field_map:
             match = FieldResolver().resolve(query, field_map, aggregate_only=True)
@@ -267,10 +320,13 @@ class RuleEngineTool(Tool):
         query: str,
         df: pd.DataFrame,
         field_map: Optional[SemanticFieldMap] = None,
+        required_columns: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         range_match = _DATE_RANGE.search(query)
         if range_match:
-            date_col = self._find_date_column(query, df, field_map)
+            date_col = self._find_date_column(
+                query, df, field_map, required_columns
+            )
             if date_col:
                 start = pd.Timestamp(range_match.group(1))
                 end = pd.Timestamp(range_match.group(2))
@@ -283,7 +339,9 @@ class RuleEngineTool(Tool):
         if ym_match:
             year = int(ym_match.group(1))
             month = int(ym_match.group(2))
-            date_col = self._find_date_column(query, df, field_map)
+            date_col = self._find_date_column(
+                query, df, field_map, required_columns
+            )
             if date_col:
                 return self._filter_year_month(df, date_col, year, month)
             # No date column found — skip silently
@@ -293,7 +351,9 @@ class RuleEngineTool(Tool):
         year_match = _DATE_YEAR_ONLY.search(query)
         if year_match:
             year = int(year_match.group(1))
-            date_col = self._find_date_column(query, df, field_map)
+            date_col = self._find_date_column(
+                query, df, field_map, required_columns
+            )
             if date_col:
                 return self._filter_year(df, date_col, year)
 
@@ -304,8 +364,24 @@ class RuleEngineTool(Tool):
         query: str,
         df: pd.DataFrame,
         field_map: Optional[SemanticFieldMap] = None,
+        required_columns: Optional[List[str]] = None,
     ) -> Optional[str]:
         """Find the most likely date column in df."""
+        for column in required_columns or []:
+            if column not in df.columns:
+                continue
+            info = field_map.get(column) if field_map else None
+            if info and info.type in {"datetime", "datetime-like"}:
+                return column
+            if info is None and (
+                pd.api.types.is_datetime64_any_dtype(df[column])
+                or any(
+                    term in str(column).lower()
+                    for term in ("日期", "时间", "年月", "date", "time")
+                )
+            ):
+                return column
+
         if field_map:
             match = FieldResolver().resolve(
                 query,
@@ -366,7 +442,12 @@ class RuleEngineTool(Tool):
     # ------------------------------------------------------------------
 
     def _apply_keyword_filters(
-        self, query: str, df: pd.DataFrame, original_df: pd.DataFrame
+        self,
+        query: str,
+        df: pd.DataFrame,
+        original_df: pd.DataFrame,
+        required_columns: Optional[List[str]] = None,
+        field_map: Optional[SemanticFieldMap] = None,
     ) -> pd.DataFrame:
         """
         Try to extract column + value from the query and filter accordingly.
@@ -377,7 +458,24 @@ class RuleEngineTool(Tool):
             return df
 
         # Try to identify column and value from query tokens
-        for col in df.columns:
+        contract_columns = [
+            column
+            for column in required_columns or []
+            if column in df.columns
+            and (
+                (
+                    field_map is not None
+                    and field_map.get(column) is not None
+                    and field_map[column].type in {"categorical", "identifier"}
+                )
+                or (
+                    (field_map is None or field_map.get(column) is None)
+                    and not pd.api.types.is_numeric_dtype(df[column])
+                )
+            )
+        ]
+        candidate_columns = contract_columns or list(df.columns)
+        for col in candidate_columns:
             col_clean = re.sub(r"[（(）)【】\[\]]", "", col)
             # Check if column name appears in query
             if col not in query and col_clean not in query:
@@ -398,18 +496,26 @@ class RuleEngineTool(Tool):
         # categorical value that appears verbatim in the query. This handles
         # product-manager-style filters while still keeping the operation
         # deterministic.
-        value_filter = self._filter_by_mentioned_value(query, df)
+        value_filter = self._filter_by_mentioned_value(
+            query,
+            df,
+            candidate_columns=contract_columns or None,
+        )
         if value_filter is not None:
             return value_filter
 
         return df
 
     @staticmethod
-    def _filter_by_mentioned_value(query: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    def _filter_by_mentioned_value(
+        query: str,
+        df: pd.DataFrame,
+        candidate_columns: Optional[List[str]] = None,
+    ) -> Optional[pd.DataFrame]:
         best_match = None
         best_len = 0
 
-        for col in df.columns:
+        for col in candidate_columns or list(df.columns):
             if pd.api.types.is_numeric_dtype(df[col]):
                 continue
             values = df[col].dropna().astype(str).unique()
@@ -462,6 +568,7 @@ class RuleEngineTool(Tool):
         query: str,
         df: pd.DataFrame,
         field_map: Optional[SemanticFieldMap] = None,
+        required_columns: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         q_lower = query.lower()
         has_sort_trigger = any(kw in q_lower for kw in _SORT_TRIGGER_KWS)
@@ -478,7 +585,12 @@ class RuleEngineTool(Tool):
             ascending = False  # default desc for "排序" without direction
 
         # Find the sort column: look for numeric column mentioned in query
-        sort_col = self._find_sort_column(query, df, field_map)
+        sort_col = self._find_sort_column(
+            query,
+            df,
+            field_map,
+            required_columns,
+        )
         if sort_col is None:
             return df
 
@@ -493,8 +605,18 @@ class RuleEngineTool(Tool):
         query: str,
         df: pd.DataFrame,
         field_map: Optional[SemanticFieldMap] = None,
+        required_columns: Optional[List[str]] = None,
     ) -> Optional[str]:
         """Find which column the user wants to sort by."""
+        for column in required_columns or []:
+            if column not in df.columns:
+                continue
+            info = field_map.get(column) if field_map else None
+            if info and info.should_aggregate:
+                return column
+            if info is None and pd.api.types.is_numeric_dtype(df[column]):
+                return column
+
         if field_map:
             match = FieldResolver().resolve(query, field_map, aggregate_only=True)
             if match and match.column in df.columns:

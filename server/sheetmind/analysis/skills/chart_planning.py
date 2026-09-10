@@ -38,14 +38,28 @@ class ChartPlanningSkill(Skill):
         query: str,
         result_df: Optional[pd.DataFrame] = None,
         field_map: Optional[SemanticFieldMap] = None,
+        required_columns: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Optional[ChartBlock]:
         if result_df is None or result_df.empty:
             return None
 
         negated = self._extract_negated_cols(query, result_df)
-        x_col = self._select_x_col(query, result_df, negated, field_map)
-        y_cols = self._select_y_cols(query, result_df, x_col, negated, field_map)
+        x_col = self._select_x_col(
+            query,
+            result_df,
+            negated,
+            field_map,
+            required_columns,
+        )
+        y_cols = self._select_y_cols(
+            query,
+            result_df,
+            x_col,
+            negated,
+            field_map,
+            required_columns,
+        )
         if not x_col or not y_cols:
             return None
 
@@ -84,7 +98,59 @@ class ChartPlanningSkill(Skill):
         df: pd.DataFrame,
         negated: set[str],
         field_map: Optional[SemanticFieldMap],
+        required_columns: Optional[List[str]],
     ) -> Optional[str]:
+        required_axis_candidates: List[str] = []
+        for column in required_columns or []:
+            if column not in df.columns or column in negated:
+                continue
+            info = field_map.get(column) if field_map else None
+            if info and info.type in {
+                "categorical", "identifier", "datetime", "datetime-like"
+            }:
+                required_axis_candidates.append(column)
+            elif info is None and not pd.api.types.is_numeric_dtype(df[column]):
+                required_axis_candidates.append(column)
+        if field_map:
+            required_axis_map = {
+                column: field_map[column]
+                for column in required_axis_candidates
+                if column in field_map
+                and field_map[column].type in {
+                    "categorical", "identifier", "datetime", "datetime-like"
+                }
+            }
+            resolution = FieldResolver().resolve(
+                query,
+                required_axis_map,
+                allowed_types={
+                    "categorical", "identifier", "datetime", "datetime-like"
+                },
+            )
+            if resolution:
+                return resolution.column
+        if len(required_axis_candidates) == 1:
+            return required_axis_candidates[0]
+        if required_axis_candidates:
+            wants_line = any(keyword in query.lower() for keyword in _LINE_KWS)
+            if wants_line:
+                date_column = next(
+                    (
+                        column
+                        for column in required_axis_candidates
+                        if pd.api.types.is_datetime64_any_dtype(df[column])
+                        or (
+                            field_map
+                            and field_map.get(column)
+                            and field_map[column].type in {"datetime", "datetime-like"}
+                        )
+                    ),
+                    None,
+                )
+                if date_column:
+                    return date_column
+            return required_axis_candidates[0]
+
         if field_map:
             resolution = FieldResolver().resolve(
                 query,
@@ -113,6 +179,7 @@ class ChartPlanningSkill(Skill):
         x_col: Optional[str],
         negated: set[str],
         field_map: Optional[SemanticFieldMap],
+        required_columns: Optional[List[str]],
     ) -> List[str]:
         candidates = [
             col for col in df.columns
@@ -122,6 +189,14 @@ class ChartPlanningSkill(Skill):
         ]
         if not candidates:
             return []
+
+        required_metrics = [
+            column
+            for column in required_columns or []
+            if column in candidates
+        ]
+        if required_metrics:
+            candidates = required_metrics
 
         if field_map:
             resolution = FieldResolver().resolve(

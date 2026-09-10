@@ -675,6 +675,24 @@ class TestRuleEngineTool:
 
         assert len(result) == 2
 
+    def test_implicit_filter_value_still_works_with_a_required_metric(self):
+        df = pd.DataFrame({
+            "平台": ["速卖通", "美国官网", "美国官网", "乐天"],
+            "金额（RMB）": [10.0, 20.0, 30.0, 40.0],
+        })
+        query = "筛选美国官网，查看人民币金额"
+        field_map = run(SemanticTypingSkill(MockRouter()).run(self.ctx, query, df=df))
+
+        result = self.tool.run(
+            self.ctx,
+            query=query,
+            df=df,
+            field_map=field_map,
+            required_columns=["金额（RMB）"],
+        )
+
+        assert result["金额（RMB）"].tolist() == [20.0, 30.0]
+
     def test_filter_report_records_a_rule_when_every_row_matches(self):
         from sheetmind.analysis.tools.rule_engine import RuleResult
 
@@ -714,6 +732,43 @@ class TestRuleEngineTool:
         field_map = run(SemanticTypingSkill(MockRouter()).run(self.ctx, query, df=df))
 
         result = self.tool.run(self.ctx, query=query, df=df, field_map=field_map)
+
+        assert result["金额"].tolist() == [20]
+
+    def test_sort_uses_the_required_qualified_metric(self):
+        df = pd.DataFrame({
+            "金额": [30, 10, 20],
+            "金额（USD）": [1, 3, 2],
+        })
+        query = "按金额降序排序"
+        field_map = run(SemanticTypingSkill(MockRouter()).run(self.ctx, query, df=df))
+
+        result = self.tool.run(
+            self.ctx,
+            query=query,
+            df=df,
+            field_map=field_map,
+            required_columns=["金额（USD）"],
+        )
+
+        assert result["金额（USD）"].tolist() == [3, 2, 1]
+
+    def test_date_filter_uses_the_required_date_column(self):
+        df = pd.DataFrame({
+            "创建日期": ["2025-01-01", "2024-01-01"],
+            "付款日期": ["2024-02-01", "2025-02-01"],
+            "金额": [10, 20],
+        })
+        query = "筛选2025年的数据"
+        field_map = run(SemanticTypingSkill(MockRouter()).run(self.ctx, query, df=df))
+
+        result = self.tool.run(
+            self.ctx,
+            query=query,
+            df=df,
+            field_map=field_map,
+            required_columns=["付款日期"],
+        )
 
         assert result["金额"].tolist() == [20]
 
@@ -1073,6 +1128,31 @@ class TestChartPlanningSkill:
         assert result is not None
         y_names = [s.name for s in result.series]
         assert "数量" not in y_names
+
+    def test_required_columns_constrain_chart_axes(self):
+        df = self._make_df(
+            日期=pd.to_datetime(["2025-01-01", "2025-02-01"]),
+            店铺=["A", "B"],
+            金额=[100, 200],
+            **{"金额（RMB）": [700, 1400]},
+        )
+        field_map = run(SemanticTypingSkill(MockRouter()).run(
+            self.ctx,
+            "画图",
+            df=df,
+        ))
+
+        result = run(self.skill.run(
+            self.ctx,
+            "画图",
+            result_df=df,
+            field_map=field_map,
+            required_columns=["店铺", "金额（RMB）"],
+        ))
+
+        assert result is not None
+        assert result.x_axis_label == "店铺"
+        assert [series.name for series in result.series] == ["金额（RMB）"]
 
 
 # ---------------------------------------------------------------------------

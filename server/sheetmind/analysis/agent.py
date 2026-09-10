@@ -377,6 +377,7 @@ class SheetMindAgent:
                 step_query,
                 result_df=chart_df,
                 field_map=result_field_map,
+                required_columns=step.required_source_columns,
             )
             if chart is not None:
                 chart.title = step.query
@@ -569,6 +570,7 @@ class SheetMindAgent:
                         query=step_query,
                         df=input_df,
                         field_map=field_map,
+                        required_columns=step.required_source_columns,
                         return_report=True,
                     )
                     validation = self.rule_result_validator.validate(
@@ -859,11 +861,46 @@ class SheetMindAgent:
             await emitter.emit_progress("正在基于上一次结果生成图表...", step_id="chart_planning")
 
         field_map = await self.semantic_skill.run(ctx, query, df=previous_result_df)
+        step = (
+            ctx.execution_plan.steps[0]
+            if ctx.execution_plan and ctx.execution_plan.steps
+            else None
+        )
+        decisions = FieldResolver().decide_all(
+            query,
+            field_map,
+            mentions=step.target_fields if step else None,
+        )
+        records = [self._field_resolution_record(item) for item in decisions]
+        required_columns = [
+            record.selected_column
+            for record in records
+            if record.selected_column is not None
+            and record.status in {"confirmed", "assumed"}
+        ]
+        if step is not None:
+            step.field_resolutions = records
+            step.required_source_columns = required_columns
+        if ctx.execution_plan is not None:
+            ctx.execution_plan.field_resolutions = records
+            ctx.execution_plan.required_source_columns = required_columns
+        clarification_blocks = self._field_resolution_blocks(
+            records,
+            status="needs_clarification",
+        )
+        if clarification_blocks:
+            result = ResultBlocks(
+                output_intents=["chart"],
+                blocks=clarification_blocks,
+            )
+            return validate_result(result), hint, mode
+
         chart_block = await self.chart_skill.run(
             ctx,
             query,
             result_df=previous_result_df,
             field_map=field_map,
+            required_columns=required_columns,
         )
         if chart_block is None:
             result = ResultBlocks(output_intents=["chart"], blocks=[
@@ -883,7 +920,10 @@ class SheetMindAgent:
             table_block=None,
         )
 
-        blocks: List[Any] = []
+        blocks: List[Any] = self._field_resolution_blocks(
+            records,
+            status="assumed",
+        )
         if summary_text:
             blocks.append(SummaryBlock(content=summary_text))
         blocks.append(chart_block)
