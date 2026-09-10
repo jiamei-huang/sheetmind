@@ -100,8 +100,6 @@ class SemanticTypingSkill(Skill):
         # Names win for identifiers: numeric-looking IDs must never become metrics.
         if any(keyword in name for keyword in _IDENTIFIER_KWS):
             return "identifier", 0.98
-        if cls._looks_like_identifier_values(values):
-            return "identifier", 0.75
 
         if pd.api.types.is_datetime64_any_dtype(series):
             return "datetime", 0.99
@@ -111,6 +109,8 @@ class SemanticTypingSkill(Skill):
             if cls._looks_like_date(values):
                 return "datetime", 0.92
             return "datetime-like", 0.65
+        if cls._looks_like_identifier_values(values):
+            return "identifier", 0.75
 
         if pd.api.types.is_numeric_dtype(series):
             return "numeric", 0.97

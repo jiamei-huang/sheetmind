@@ -112,13 +112,25 @@ The routing result exposes both intent objects and execution metadata for downst
 - Identifier columns such as SKU, order number, and customer ID are never treated as summable metrics.
 - Qualified aliases prioritize fields such as `金额（RMB）` when a query mentions `人民币金额`.
 
+`FieldResolver` converts field matches into an explicit decision for each field concept mentioned by the user:
+
+| Status | Runtime behavior |
+|---|---|
+| `confirmed` | A unique or strongly qualified field is used without interrupting the analysis. |
+| `assumed` | A single partial match is used, and the result includes the selected column and reason. |
+| `needs_clarification` | Execution stops before calculation and returns the nearest column candidates for the user to choose. |
+
+Candidates are compared only within the same canonical field concept and semantic role. For example, `金额`, `金额（RMB）`, and `金额（USD）` compete with one another, while `店铺` and `金额` are resolved independently. Every confirmed or assumed field is stored in the step and top-level execution plan as a required source column. A follow-up containing an exact candidate column resolves the ambiguity and resumes the original analysis.
+
 `DataProfilingSkill` returns a structured profile and a compact prompt view. Profiles include null and cardinality ratios, samples, numeric statistics, date ranges, candidate metrics/dimensions/dates, and recommended aggregations.
+
+`DataTypeNormalizationTool` runs after semantic typing and before profiling or execution. It works on a dataframe copy and deterministically converts recognized calendar text, `YYYYMM`, `YYYYMMDD`, four-digit years, Excel serial dates, and Unix second/millisecond timestamps. A conversion is accepted only when at least 80% of non-null values parse successfully. Identifier fields are excluded, so numeric SKU and order IDs are not converted into dates.
 
 ## Execution and presentation safeguards
 
 `DataframeLoaderTool` can emit a load report with sources, detected headers, cleanup counts, and warnings. `RuleEngineTool` emits a structured rule report to the agent. `RuleResultValidator` checks operation coverage, required qualified columns, pass-through equivalence, row-count constraints, sort order, and requested date periods before the result is accepted. A rejected rule result changes the step and top-level execution route to `CODE_GEN`, then enters `RepairLoop`.
 
-`RepairLoop` wraps `CodeGenerationSkill` and `PythonExecutorTool`. It permits the initial attempt plus at most two repairs, with a 120-second repair budget. It stops early when generated code repeats, generation/execution/field-contract errors repeat, or executor safety policy rejects the code.
+`RepairLoop` wraps `CodeGenerationSkill` and `PythonExecutorTool`. It permits the initial attempt plus at most two repairs, with a 120-second repair budget. It stops early when generated code repeats, generation/execution/field-contract errors repeat, or executor safety policy rejects the code. Before execution, the field contract traces dataframe dependencies backward from `result_df`; a required column must participate in the result data flow through selection, filtering, grouping, sorting, or computation. A column name appearing only in an unused variable or output label does not satisfy the contract.
 
 `ChartPlanningSkill` uses semantic metadata to choose axes, supports period labels as time axes, limits crowded categorical charts with `Other`, and records a confidence and reason. `ResultValidator` enforces frontend table/chart caps and drops an invalid chart while retaining valid table and summary blocks.
 

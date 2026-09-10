@@ -22,6 +22,9 @@ from .context import (
     ColumnMeta,
     ExecutionPlan,
     ExecutionStep,
+    FieldCandidate,
+    FieldResolutionBlock,
+    FieldResolutionRecord,
     MultiTurnMode,
     ResultBlocks,
     RoutingHint,
@@ -33,7 +36,7 @@ from .models.router import ModelRouter
 from .skills.chart_planning import ChartPlanningSkill
 from .skills.code_generation import CodeGenerationSkill
 from .skills.data_profiling import DataProfilingSkill
-from .skills.field_resolution import FieldResolver, query_qualifiers
+from .skills.field_resolution import FieldResolver
 from .skills.insight_writing import InsightWritingSkill
 from .skills.output_planning import OutputPlanningSkill
 from .skills.query_planning import QueryPlan, QueryPlanningSkill
@@ -46,6 +49,7 @@ from .skills.semantic_typing import SemanticFieldMap, SemanticTypingSkill
 from .skills.sheet_selection import SheetSelectionSkill
 from .streaming.emitter import StreamEmitter
 from .tools.dataframe_loader import DataframeLoaderTool
+from .tools.data_type_normalizer import DataTypeNormalizationTool
 from .tools.python_executor import PythonExecutorTool
 from .tools.rule_engine import RuleEngineTool
 from .tracing.storage import get_trace_store
@@ -96,6 +100,7 @@ class SheetMindAgent:
         self.insight_skill = InsightWritingSkill(self.router)
 
         self.df_loader = DataframeLoaderTool()
+        self.type_normalizer = DataTypeNormalizationTool()
         self.rule_engine = RuleEngineTool()
         self.executor = PythonExecutorTool()
         self.rule_result_validator = RuleResultValidator()
@@ -317,6 +322,16 @@ class SheetMindAgent:
         )
         hint = execution_plan.route
         if execution_failed:
+            clarification_blocks = self._field_resolution_blocks(
+                execution_plan.field_resolutions,
+                status="needs_clarification",
+            )
+            if clarification_blocks:
+                clarification_result = ResultBlocks(
+                    output_intents=execution_plan.output_intents,
+                    blocks=clarification_blocks,
+                )
+                return validate_result(clarification_result), hint, mode
             error_msg = (
                 "数据查询执行失败，请尝试换一种方式描述您的问题，"
                 "或检查列名是否正确。"
@@ -426,7 +441,12 @@ class SheetMindAgent:
         # ----------------------------------------------------------------
         blocks: List[Any] = []
 
-        # Summary always first
+        blocks.extend(self._field_resolution_blocks(
+            execution_plan.field_resolutions,
+            status="assumed",
+        ))
+
+        # Summary follows any field-assumption notice.
         if summary_text and output_plan.include_summary:
             blocks.append(SummaryBlock(content=summary_text))
 
@@ -498,10 +518,39 @@ class SheetMindAgent:
             if emitter:
                 await emitter.emit_progress("正在识别字段类型...", step_id="semantic_typing")
             field_map = await self.semantic_skill.run(ctx, step_query, df=input_df)
-            step.required_source_columns = self._required_source_columns(step_query, field_map)
+            decisions = FieldResolver().decide_all(
+                step_query,
+                field_map,
+                mentions=step.target_fields,
+            )
+            step.field_resolutions = [self._field_resolution_record(item) for item in decisions]
+            execution_plan.field_resolutions.extend(step.field_resolutions)
+            step.required_source_columns = [
+                record.selected_column
+                for record in step.field_resolutions
+                if record.selected_column is not None
+                and record.status in {"confirmed", "assumed"}
+            ]
             for column in step.required_source_columns:
                 if column not in required_columns:
                     required_columns.append(column)
+            execution_plan.required_source_columns = list(required_columns)
+
+            if any(record.status == "needs_clarification" for record in step.field_resolutions):
+                return None, [], outputs, True
+
+            normalized_types = self.type_normalizer.run(
+                ctx,
+                df=input_df,
+                field_map=field_map,
+            )
+            input_df = normalized_types.df
+            if normalized_types.warnings:
+                logger.warning(
+                    "[Pipeline] type normalization warnings for step=%s: %s",
+                    step.step_id,
+                    "; ".join(normalized_types.warnings),
+                )
 
             if emitter:
                 await emitter.emit_progress("正在生成数据画像...", step_id="data_profiling")
@@ -707,12 +756,60 @@ class SheetMindAgent:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _required_source_columns(query: str, field_map: Optional[SemanticFieldMap]) -> List[str]:
-        if not field_map or not query_qualifiers(query):
-            return []
+    def _field_resolution_record(decision: Any) -> FieldResolutionRecord:
+        selected = decision.selected
+        confidence = (
+            0.50
+            if decision.status == "needs_clarification"
+            else selected.confidence if selected is not None else 0.0
+        )
+        return FieldResolutionRecord(
+            reference=decision.reference,
+            status=decision.status,
+            selected_column=selected.column if selected is not None else None,
+            confidence=confidence,
+            reason=decision.reason,
+            candidates=[
+                FieldCandidate(
+                    column=candidate.column,
+                    confidence=candidate.confidence,
+                    reason=candidate.reason,
+                )
+                for candidate in decision.candidates
+            ],
+        )
 
-        match = FieldResolver().resolve(query, field_map, aggregate_only=True)
-        return [match.column] if match else []
+    @staticmethod
+    def _field_resolution_blocks(
+        records: List[FieldResolutionRecord],
+        *,
+        status: str,
+    ) -> List[FieldResolutionBlock]:
+        blocks: List[FieldResolutionBlock] = []
+        seen: set[tuple[str, str]] = set()
+        for record in records:
+            if record.status != status:
+                continue
+            key = (record.reference, record.status)
+            if key in seen:
+                continue
+            seen.add(key)
+            if status == "needs_clarification":
+                message = f"“{record.reference}”可能对应多个字段，请选择后继续。"
+            else:
+                message = (
+                    f"本次推测使用列“{record.selected_column}”（{record.reason}）。"
+                )
+            blocks.append(FieldResolutionBlock(
+                reference=record.reference,
+                status=record.status,
+                selected_column=record.selected_column,
+                confidence=record.confidence,
+                reason=record.reason,
+                candidates=record.candidates,
+                message=message,
+            ))
+        return blocks
 
     # ------------------------------------------------------------------
     # Helpers

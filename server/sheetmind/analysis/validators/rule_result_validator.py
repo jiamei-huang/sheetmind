@@ -128,7 +128,7 @@ class RuleResultValidator:
             and "date_filter" in matched
         ):
             date_reason = self._validate_date_period(
-                step.normalized_query or step.query,
+                step,
                 rule_result.result_df,
             )
             if date_reason:
@@ -155,7 +155,16 @@ class RuleResultValidator:
         return None
 
     @staticmethod
-    def _resolve_date_column(result_df: pd.DataFrame) -> Optional[str]:
+    def _resolve_date_column(
+        step: ExecutionStep,
+        result_df: pd.DataFrame,
+    ) -> Optional[str]:
+        for column in step.required_source_columns:
+            if column in result_df.columns and (
+                pd.api.types.is_datetime64_any_dtype(result_df[column])
+                or any(term in column.lower() for term in ("日期", "时间", "年月", "date", "time"))
+            ):
+                return column
         for column in result_df.columns:
             if pd.api.types.is_datetime64_any_dtype(result_df[column]):
                 return str(column)
@@ -168,10 +177,11 @@ class RuleResultValidator:
     @classmethod
     def _validate_date_period(
         cls,
-        query: str,
+        step: ExecutionStep,
         result_df: pd.DataFrame,
     ) -> Optional[str]:
-        date_column = cls._resolve_date_column(result_df)
+        query = step.normalized_query or step.query
+        date_column = cls._resolve_date_column(step, result_df)
         if date_column is None:
             return "rule result has no column for date validation"
         if result_df.empty:

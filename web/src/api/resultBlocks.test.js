@@ -115,3 +115,30 @@ test("keeps every chart block as a named visualization", () => {
   assert.equal(result.chartDatas[1].title, "月度趋势");
   assert.deepEqual(result.chartData, result.chartDatas[0]);
 });
+
+test("keeps field clarification choices in the analysis view model", () => {
+  const result = toAnalysisViewModel(
+    {
+      type: "result_blocks",
+      blocks: [
+        {
+          kind: "field_resolution",
+          status: "needs_clarification",
+          reference: "金额",
+          message: "“金额”可能对应多个字段，请选择。",
+          candidates: [
+            { column: "金额", confidence: 0.5, reason: "名称匹配" },
+            { column: "金额（RMB）", confidence: 0.5, reason: "名称匹配" },
+          ],
+        },
+      ],
+    },
+    "汇总金额"
+  );
+
+  assert.equal(result.type, "clarification");
+  assert.equal(result.mode, "clarification");
+  assert.equal(result.classification, "Field Confirmation");
+  assert.equal(result.fieldResolutions[0].reference, "金额");
+  assert.equal(result.fieldResolutions[0].candidates[1].column, "金额（RMB）");
+});

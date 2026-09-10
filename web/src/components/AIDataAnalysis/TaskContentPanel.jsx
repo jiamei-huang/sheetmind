@@ -11,6 +11,7 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronDown,
+  Columns3,
   ImageDown,
 } from "lucide-react";
 import Loader from "../Loader";
@@ -47,6 +48,7 @@ const RESULT_TYPE_LABELS = {
   both: "数据表 + 图表",
   insight_only: "洞察",
   "insights-only": "洞察",
+  clarification: "字段确认",
 };
 
 const inferProgressStage = (message = "") => {
@@ -301,7 +303,7 @@ const TaskContentPanel = ({
 
   const renderSingleResult = (result, resultIndex) => {
     const {
-      type, // "data" | "chart" | "both" | "insights-only"
+      type, // "data" | "chart" | "both" | "insight_only" | "clarification"
       preview: primaryPreview,
       previews = [],
       suggestion,
@@ -310,6 +312,7 @@ const TaskContentPanel = ({
       chartDatas = [],
       runtimeNote,
       metrics = [],
+      fieldResolutions = [],
     } = result;
 
     // 根据 type 决定显示什么内容
@@ -794,6 +797,45 @@ const TaskContentPanel = ({
                     />
                   </div>
                 )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {fieldResolutions.length > 0 && (
+          <div className="border border-amber-200 bg-amber-50 p-4">
+            <div className="flex items-start gap-3">
+              <Columns3 className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+              <div className="min-w-0 flex-1 space-y-3">
+                <h6 className="text-sm font-semibold text-amber-950">
+                  {fieldResolutions.some((item) => item.status === "needs_clarification")
+                    ? "请选择分析字段"
+                    : "字段使用说明"}
+                </h6>
+                {fieldResolutions.map((resolution) => (
+                  <div key={`${resolution.reference}-${resolution.status}`} className="space-y-2">
+                    <p className="text-sm text-amber-900">{resolution.message}</p>
+                    {resolution.status === "needs_clarification" && (
+                      <div className="flex flex-wrap gap-2">
+                        {(resolution.candidates || []).map((candidate) => (
+                          <button
+                            key={candidate.column}
+                            type="button"
+                            title={candidate.reason || `使用字段 ${candidate.column}`}
+                            onClick={() => onTaskPromptChange(
+                              task.id,
+                              `使用列“${candidate.column}”继续：${result.prompt || resolution.reference}`
+                            )}
+                            className="inline-flex items-center gap-1.5 border border-amber-300 bg-white px-3 py-1.5 text-sm font-medium text-amber-950 hover:border-amber-500 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                          >
+                            <Columns3 className="w-3.5 h-3.5" />
+                            <span className="break-all">{candidate.column}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
               </div>
             </div>
           </div>

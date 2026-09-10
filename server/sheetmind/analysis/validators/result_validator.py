@@ -71,6 +71,8 @@ def validate_result(
                 _validate_chart(block, index=i)
             elif kind == "summary":
                 _validate_summary(block, index=i)
+            elif kind == "field_resolution":
+                _validate_field_resolution(block, index=i)
             # metric blocks and unknown kinds are passed through without validation
         except ResultValidationError as exc:
             if kind == "chart" and degrade_invalid_charts:
@@ -232,6 +234,20 @@ def _validate_summary(block: Any, index: int) -> None:
     if not content or not str(content).strip():
         # Non-fatal: empty summary is weird but not a crash
         logger.warning("[ResultValidator] SummaryBlock[%d]: content is empty", index)
+
+
+def _validate_field_resolution(block: Any, index: int) -> None:
+    status = block.get("status") if isinstance(block, dict) else getattr(block, "status", "")
+    candidates = block.get("candidates", []) if isinstance(block, dict) else getattr(block, "candidates", [])
+    selected = block.get("selected_column") if isinstance(block, dict) else getattr(block, "selected_column", None)
+    if status == "needs_clarification" and len(candidates) < 2:
+        raise ResultValidationError(
+            f"FieldResolutionBlock[{index}]: clarification requires at least two candidates"
+        )
+    if status == "assumed" and not selected:
+        raise ResultValidationError(
+            f"FieldResolutionBlock[{index}]: assumed field requires selected_column"
+        )
 
 
 # ---------------------------------------------------------------------------

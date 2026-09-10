@@ -14,19 +14,29 @@ export const toAnalysisViewModel = (payload, prompt) => {
     .filter((block) => block.kind === "summary" && block.content)
     .map((block) => block.content);
   const metrics = payload.blocks.filter((block) => block.kind === "metric");
+  const fieldResolutions = payload.blocks.filter((block) => block.kind === "field_resolution");
+  const needsFieldClarification = fieldResolutions.some(
+    (block) => block.status === "needs_clarification"
+  );
   const outputIntents = Array.isArray(payload.output_intents) && payload.output_intents.length
     ? payload.output_intents
     : ["auto"];
 
-  const type = table && chart ? "both" : table ? "data" : chart ? "chart" : "insight_only";
-  const mode = chart && table
+  const type = needsFieldClarification
+    ? "clarification"
+    : table && chart ? "both" : table ? "data" : chart ? "chart" : "insight_only";
+  const mode = needsFieldClarification
+    ? "clarification"
+    : chart && table
     ? "both"
     : chart || outputIntents.includes("chart")
       ? "visualization"
       : table || outputIntents.some((intent) => intent === "table" || intent === "export_excel")
         ? "processing"
         : "insight";
-  const classification = outputIntents.includes("export_excel")
+  const classification = needsFieldClarification
+    ? "Field Confirmation"
+    : outputIntents.includes("export_excel")
     ? "Excel Export"
     : mode === "visualization"
       ? "Visualization"
@@ -64,6 +74,7 @@ export const toAnalysisViewModel = (payload, prompt) => {
     processedAt: new Date().toISOString(),
     suggestion: summaries.join("\n\n"),
     metrics,
+    fieldResolutions,
     runtimeNote:
       table && table.rows.length < totalRows
         ? `前端仅展示 ${table.rows.length.toLocaleString()} 行预览，后端已处理 ${totalRows.toLocaleString()} 行。`

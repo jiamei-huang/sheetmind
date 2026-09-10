@@ -46,7 +46,9 @@ from sheetmind.analysis.skills.query_normalization import QueryNormalizationSkil
 from sheetmind.analysis.skills.output_planning import OutputPlanningSkill
 from sheetmind.analysis.skills import routing_classification as routing_rules_module
 from sheetmind.analysis.skills.chart_planning import ChartPlanningSkill
+from sheetmind.analysis.skills.code_generation import CodeGenerationSkill
 from sheetmind.analysis.skills.data_profiling import DataProfilingSkill
+from sheetmind.analysis.skills.field_resolution import FieldResolver
 from sheetmind.analysis.skills.routing_classification import (
     OperationIntent,
     OutputIntent,
@@ -55,6 +57,7 @@ from sheetmind.analysis.skills.routing_classification import (
 )
 from sheetmind.analysis.skills.semantic_typing import SemanticTypingSkill
 from sheetmind.analysis.tools.python_executor import PythonExecutorTool
+from sheetmind.analysis.tools.data_type_normalizer import DataTypeNormalizationTool
 from sheetmind.analysis.tools.rule_engine import RuleEngineTool
 from sheetmind.analysis.validators.result_validator import (
     ResultValidationError,
@@ -701,12 +704,56 @@ class TestRuleEngineTool:
 
         assert result["金额"].tolist() == [2, 3]
 
+    def test_date_filter_uses_the_query_selected_date_column(self):
+        df = pd.DataFrame({
+            "创建日期": ["2025-01-01", "2024-01-01"],
+            "付款日期": ["2024-02-01", "2025-02-01"],
+            "金额": [10, 20],
+        })
+        query = "筛选付款日期在2025年的数据"
+        field_map = run(SemanticTypingSkill(MockRouter()).run(self.ctx, query, df=df))
+
+        result = self.tool.run(self.ctx, query=query, df=df, field_map=field_map)
+
+        assert result["金额"].tolist() == [20]
+
 
 # ---------------------------------------------------------------------------
 # RuleResultValidator
 # ---------------------------------------------------------------------------
 
 class TestRuleResultValidator:
+    def test_date_validation_uses_the_resolved_required_date_column(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({
+            "创建日期": pd.to_datetime(["2025-01-01", "2024-01-01"]),
+            "付款日期": pd.to_datetime(["2024-02-01", "2025-02-01"]),
+            "金额": [10, 20],
+        })
+        step = ExecutionStep(
+            step_id="s1",
+            query="筛选付款日期在2025年的数据",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["filter", "date_filter"],
+            required_source_columns=["付款日期"],
+        )
+        rule_result = RuleResult(
+            result_df=source.iloc[[1]].copy(),
+            matched_rules=["date_filter", "keyword_filter"],
+            selected_columns=list(source.columns),
+            confidence=0.95,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is True
+
     def test_filter_request_rejects_a_pass_through_rule_result(self):
         from sheetmind.analysis.tools.rule_engine import RuleResult
         from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
@@ -1366,6 +1413,54 @@ class TestRepairLoop:
         assert "金额（USD）" in code
         assert self.mock_executor.run.call_count == 1
 
+    def test_required_column_in_dead_assignment_does_not_satisfy_contract(self):
+        code = """unused = df['金额（USD）']
+result_df = pd.DataFrame({'total': [df['金额'].sum()]})"""
+
+        error = CodeGenerationSkill.validate_required_columns(
+            code,
+            ["金额（USD）"],
+            available_columns=["金额", "金额（USD）"],
+        )
+
+        assert error is not None
+        assert "金额（USD）" in error
+
+    def test_required_column_output_label_does_not_satisfy_contract(self):
+        code = "result_df = pd.DataFrame({'金额（USD）': [df['金额'].sum()]})"
+
+        error = CodeGenerationSkill.validate_required_columns(
+            code,
+            ["金额（USD）"],
+            available_columns=["金额", "金额（USD）"],
+        )
+
+        assert error is not None
+
+    def test_required_column_flowing_through_intermediate_satisfies_contract(self):
+        code = """work = df[['店铺', '金额（USD）']].copy()
+grouped = work.groupby('店铺', as_index=False)['金额（USD）'].sum()
+result_df = grouped.sort_values('金额（USD）', ascending=False)"""
+
+        error = CodeGenerationSkill.validate_required_columns(
+            code,
+            ["店铺", "金额（USD）"],
+            available_columns=["店铺", "金额", "金额（USD）"],
+        )
+
+        assert error is None
+
+    def test_required_column_used_as_agg_mapping_key_satisfies_contract(self):
+        code = "result_df = df.groupby('店铺', as_index=False).agg({'金额（USD）': 'sum'})"
+
+        error = CodeGenerationSkill.validate_required_columns(
+            code,
+            ["店铺", "金额（USD）"],
+            available_columns=["店铺", "金额", "金额（USD）"],
+        )
+
+        assert error is None
+
 
 # ---------------------------------------------------------------------------
 # SheetMindAgent._build_table_block helper
@@ -1416,6 +1511,57 @@ class TestBuildTableBlock:
 # ---------------------------------------------------------------------------
 
 class TestSheetMindAgentPipeline:
+    def test_ambiguous_field_stops_before_execution_and_returns_choices(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({
+            "金额": [10, 20],
+            "金额（RMB）": [70, 80],
+            "金额（USD）": [5, 6],
+        })
+        agent.sheet_skill.run = AsyncMock(return_value=[
+            {"fileName": "sales.xlsx", "sheets": ["Sheet1"]},
+        ])
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock(side_effect=AssertionError("must clarify first"))
+
+        result = run(agent.run(ctx, "汇总金额"))
+
+        block = next(block for block in result.blocks if block.kind == "field_resolution")
+        assert block.status == "needs_clarification"
+        assert block.reference == "金额"
+        assert {item.column for item in block.candidates} == {
+            "金额", "金额（RMB）", "金额（USD）",
+        }
+        assert agent.repair_loop.run.await_count == 0
+
+    def test_assumed_field_is_visible_and_enforced_for_codegen(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({"营业收入": [10, 20]})
+        agent.sheet_skill.run = AsyncMock(return_value=[
+            {"fileName": "sales.xlsx", "sheets": ["Sheet1"]},
+        ])
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock(return_value=(
+            pd.DataFrame({"营业收入": [30]}),
+            "result_df = pd.DataFrame({'营业收入': [df['营业收入'].sum()]})",
+            0,
+        ))
+        agent.insight_skill.run = AsyncMock(return_value="收入合计为30。")
+
+        result = run(agent.run(ctx, "汇总收入"))
+
+        notice = next(block for block in result.blocks if block.kind == "field_resolution")
+        assert notice.status == "assumed"
+        assert notice.selected_column == "营业收入"
+        assert ctx.execution_plan.required_source_columns == ["营业收入"]
+        assert agent.repair_loop.run.call_args.kwargs["required_columns"] == ["营业收入"]
+
     def test_invalid_rule_result_falls_back_to_codegen_repair_loop(self):
         from sheetmind.analysis.agent import SheetMindAgent
 
@@ -1575,7 +1721,7 @@ class TestSheetMindAgentPipeline:
         result = run(agent.run(ctx, query))
 
         assert len(seen_inputs) == 2
-        assert set(seen_inputs[0]["日期"].str[:4]) == {"2025"}
+        assert set(seen_inputs[0]["日期"].dt.year) == {2025}
         assert list(seen_inputs[1].columns) == ["店铺", "金额（RMB）"]
         assert result.first_table().rows[0]["店铺"] == "B"
         assert ctx.execution_plan is not None
@@ -1826,6 +1972,93 @@ class TestDataSourceSelection:
 # ---------------------------------------------------------------------------
 
 class TestEnhancementAcceptance:
+    def test_field_resolver_requires_clarification_for_tied_metric_variants(self):
+        skill = SemanticTypingSkill(MockRouter())
+        df = pd.DataFrame({"金额": [10], "金额（RMB）": [70], "金额（USD）": [5]})
+        field_map = run(skill.run(make_ctx(), "汇总金额", df=df))
+
+        [decision] = FieldResolver().decide_all("汇总金额", field_map, mentions=["金额"])
+
+        assert decision.status == "needs_clarification"
+        assert decision.selected is None
+        assert {item.column for item in decision.candidates} == set(df.columns)
+
+    def test_field_resolver_confirms_qualified_metric(self):
+        skill = SemanticTypingSkill(MockRouter())
+        df = pd.DataFrame({"金额": [10], "金额（RMB）": [70], "金额（USD）": [5]})
+        field_map = run(skill.run(make_ctx(), "汇总人民币金额", df=df))
+
+        [decision] = FieldResolver().decide_all(
+            "汇总人民币金额", field_map, mentions=["人民币金额", "金额"]
+        )
+
+        assert decision.status == "confirmed"
+        assert decision.selected is not None
+        assert decision.selected.column == "金额（RMB）"
+
+    def test_field_resolver_confirms_user_selected_exact_column(self):
+        skill = SemanticTypingSkill(MockRouter())
+        df = pd.DataFrame({"金额": [10], "金额（RMB）": [70], "金额（USD）": [5]})
+        query = "使用列“金额（RMB）”继续：汇总金额"
+        field_map = run(skill.run(make_ctx(), query, df=df))
+
+        [decision] = FieldResolver().decide_all(query, field_map, mentions=["金额"])
+
+        assert decision.status == "confirmed"
+        assert decision.selected is not None
+        assert decision.selected.column == "金额（RMB）"
+
+    def test_field_resolver_marks_partial_unique_match_as_assumed(self):
+        skill = SemanticTypingSkill(MockRouter())
+        df = pd.DataFrame({"营业收入": [10, 20]})
+        field_map = run(skill.run(make_ctx(), "汇总收入", df=df))
+
+        [decision] = FieldResolver().decide_all("汇总收入", field_map, mentions=["收入"])
+
+        assert decision.status == "assumed"
+        assert decision.selected is not None
+        assert decision.selected.column == "营业收入"
+
+    def test_type_normalizer_converts_string_dates(self):
+        ctx = make_ctx()
+        df = pd.DataFrame({"日期": ["2025-01-01", "2025-02-01"]})
+        field_map = run(SemanticTypingSkill(MockRouter()).run(ctx, "筛选日期", df=df))
+
+        normalized = DataTypeNormalizationTool().run(ctx, df=df, field_map=field_map)
+
+        assert pd.api.types.is_datetime64_any_dtype(normalized.df["日期"])
+        assert normalized.converted_columns == ["日期"]
+
+    def test_type_normalizer_converts_integer_year_month(self):
+        ctx = make_ctx()
+        df = pd.DataFrame({"月份": [202501, 202502]})
+        field_map = run(SemanticTypingSkill(MockRouter()).run(ctx, "按月份汇总", df=df))
+
+        normalized = DataTypeNormalizationTool().run(ctx, df=df, field_map=field_map)
+
+        assert normalized.df["月份"].dt.strftime("%Y-%m").tolist() == ["2025-01", "2025-02"]
+
+    def test_type_normalizer_converts_excel_serial_dates(self):
+        ctx = make_ctx()
+        df = pd.DataFrame({"日期": [45658, 45689]})
+        field_map = run(SemanticTypingSkill(MockRouter()).run(ctx, "筛选日期", df=df))
+
+        normalized = DataTypeNormalizationTool().run(ctx, df=df, field_map=field_map)
+
+        assert normalized.df["日期"].dt.strftime("%Y-%m-%d").tolist() == [
+            "2025-01-01", "2025-02-01",
+        ]
+
+    def test_type_normalizer_does_not_convert_numeric_identifier(self):
+        ctx = make_ctx()
+        df = pd.DataFrame({"订单号": [20250101, 20250102]})
+        field_map = run(SemanticTypingSkill(MockRouter()).run(ctx, "订单号", df=df))
+
+        normalized = DataTypeNormalizationTool().run(ctx, df=df, field_map=field_map)
+
+        assert normalized.converted_columns == []
+        assert pd.api.types.is_integer_dtype(normalized.df["订单号"])
+
     def test_semantic_typing_identifies_period_and_identifier(self):
         skill = SemanticTypingSkill(MockRouter())
         df = pd.DataFrame({

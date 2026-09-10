@@ -114,7 +114,7 @@ class RuleEngineTool(Tool):
 
         # 1. Apply date filters
         before_date_result = result
-        result = self._apply_date_filters(query, result)
+        result = self._apply_date_filters(query, result, field_map)
         date_filter_applied = result is not before_date_result
 
         # 2. Apply keyword filters (if filter trigger present)
@@ -262,10 +262,15 @@ class RuleEngineTool(Tool):
     # Date filter
     # ------------------------------------------------------------------
 
-    def _apply_date_filters(self, query: str, df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_date_filters(
+        self,
+        query: str,
+        df: pd.DataFrame,
+        field_map: Optional[SemanticFieldMap] = None,
+    ) -> pd.DataFrame:
         range_match = _DATE_RANGE.search(query)
         if range_match:
-            date_col = self._find_date_column(df)
+            date_col = self._find_date_column(query, df, field_map)
             if date_col:
                 start = pd.Timestamp(range_match.group(1))
                 end = pd.Timestamp(range_match.group(2))
@@ -278,7 +283,7 @@ class RuleEngineTool(Tool):
         if ym_match:
             year = int(ym_match.group(1))
             month = int(ym_match.group(2))
-            date_col = self._find_date_column(df)
+            date_col = self._find_date_column(query, df, field_map)
             if date_col:
                 return self._filter_year_month(df, date_col, year, month)
             # No date column found — skip silently
@@ -288,15 +293,28 @@ class RuleEngineTool(Tool):
         year_match = _DATE_YEAR_ONLY.search(query)
         if year_match:
             year = int(year_match.group(1))
-            date_col = self._find_date_column(df)
+            date_col = self._find_date_column(query, df, field_map)
             if date_col:
                 return self._filter_year(df, date_col, year)
 
         return df
 
     @staticmethod
-    def _find_date_column(df: pd.DataFrame) -> Optional[str]:
+    def _find_date_column(
+        query: str,
+        df: pd.DataFrame,
+        field_map: Optional[SemanticFieldMap] = None,
+    ) -> Optional[str]:
         """Find the most likely date column in df."""
+        if field_map:
+            match = FieldResolver().resolve(
+                query,
+                {column: info for column, info in field_map.items() if column in df.columns},
+                allowed_types={"datetime", "datetime-like"},
+            )
+            if match is not None:
+                return match.column
+
         # Priority 1: datetime dtype
         for col in df.columns:
             if pd.api.types.is_datetime64_any_dtype(df[col]):

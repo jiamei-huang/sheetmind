@@ -252,24 +252,167 @@ class CodeGenerationSkill(Skill):
         if not required_columns:
             return None
 
-        available = set(str(col) for col in available_columns) if available_columns is not None else None
-        referenced: set[str] = set()
+        available = set(str(col) for col in available_columns) if available_columns is not None else set(required_columns)
         try:
             tree = ast.parse(code)
         except SyntaxError:
             return None
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                value = node.value
-                if available is None or value in available:
-                    referenced.add(value)
+        referenced = CodeGenerationSkill._result_lineage_columns(tree, available)
 
         missing = [column for column in required_columns if column not in referenced]
         if not missing:
             return None
 
         return (
-            "字段约束失败：生成代码没有引用必须字段 "
-            f"{missing!r}。请改用这些精确列名，不能使用相似的未限定列。"
+            "字段约束失败：生成代码的 result_df 数据流没有实际使用必须字段 "
+            f"{missing!r}。请让这些精确列名参与筛选、分组、排序或计算，"
+            "不能只把列名写在无关变量或输出标签中。"
         )
+
+    @staticmethod
+    def _result_lineage_columns(tree: ast.AST, available: set[str]) -> set[str]:
+        """Return source columns that flow into the final result_df assignment."""
+        lineage: dict[str, tuple[set[str], set[str]]] = {}
+
+        def expression_lineage(node: ast.AST) -> tuple[set[str], set[str]]:
+            visitor = _ExpressionLineageVisitor(available)
+            visitor.visit(node)
+            return visitor.columns, visitor.dependencies
+
+        for node in getattr(tree, "body", []):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = getattr(node, "value", None)
+                if value is None:
+                    continue
+                columns, dependencies = expression_lineage(value)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    variable = _assignment_variable(target)
+                    if variable is None:
+                        continue
+                    if isinstance(target, ast.Name):
+                        lineage[variable] = (set(columns), set(dependencies))
+                    else:
+                        prior_columns, prior_dependencies = lineage.get(variable, (set(), set()))
+                        lineage[variable] = (
+                            prior_columns | columns,
+                            prior_dependencies | dependencies,
+                        )
+            elif isinstance(node, ast.AugAssign):
+                variable = _assignment_variable(node.target)
+                if variable is not None:
+                    columns, dependencies = expression_lineage(node.value)
+                    prior_columns, prior_dependencies = lineage.get(variable, (set(), set()))
+                    lineage[variable] = (
+                        prior_columns | columns,
+                        prior_dependencies | dependencies,
+                    )
+            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                variable = _mutated_variable(node.value)
+                if variable is not None and variable in lineage:
+                    columns, dependencies = expression_lineage(node.value)
+                    prior_columns, prior_dependencies = lineage[variable]
+                    lineage[variable] = (
+                        prior_columns | columns,
+                        prior_dependencies | dependencies,
+                    )
+
+        def expand(variable: str, seen: set[str]) -> set[str]:
+            if variable in seen or variable not in lineage:
+                return set()
+            columns, dependencies = lineage[variable]
+            resolved = set(columns)
+            next_seen = seen | {variable}
+            for dependency in dependencies:
+                resolved.update(expand(dependency, next_seen))
+            return resolved
+
+        return expand("result_df", set())
+
+
+_COLUMN_ARGUMENT_METHODS = {
+    "agg", "aggregate", "drop", "drop_duplicates", "dropna", "fillna", "filter",
+    "groupby", "join", "merge", "rename",
+    "melt", "nlargest", "nsmallest", "pivot", "pivot_table", "set_index",
+    "sort_values", "value_counts",
+}
+
+
+class _ExpressionLineageVisitor(ast.NodeVisitor):
+    """Collect dataframe dependencies and source-column selectors from one expression."""
+
+    def __init__(self, available: set[str]) -> None:
+        self.available = available
+        self.columns: set[str] = set()
+        self.dependencies: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load):
+            self.dependencies.add(node.id)
+
+    def visit_Dict(self, node: ast.Dict) -> None:
+        # Dictionary keys are commonly output labels, not source-column reads.
+        for value in node.values:
+            self.visit(value)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        self.columns.update(_literal_columns(node.slice, self.available))
+        self.visit(node.value)
+        self.visit(node.slice)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        method = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        if method in _COLUMN_ARGUMENT_METHODS:
+            for argument in node.args:
+                self.columns.update(_literal_columns(argument, self.available))
+            for keyword in node.keywords:
+                self.columns.update(_literal_columns(keyword.value, self.available))
+        if method in {"query", "eval"} and node.args:
+            expression = node.args[0]
+            if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+                self.columns.update(
+                    column for column in self.available if column in expression.value
+                )
+        self.generic_visit(node)
+
+
+def _literal_columns(node: ast.AST, available: set[str]) -> set[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return {node.value} if node.value in available else set()
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        columns: set[str] = set()
+        for element in node.elts:
+            columns.update(_literal_columns(element, available))
+        return columns
+    if isinstance(node, ast.Dict):
+        columns: set[str] = set()
+        for key in node.keys:
+            if key is not None:
+                columns.update(_literal_columns(key, available))
+        return columns
+    return set()
+
+
+def _assignment_variable(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, (ast.Subscript, ast.Attribute)):
+        value = node.value
+        while isinstance(value, (ast.Subscript, ast.Attribute)):
+            value = value.value
+        if isinstance(value, ast.Name):
+            return value.id
+    return None
+
+
+def _mutated_variable(node: ast.Call) -> Optional[str]:
+    if not isinstance(node.func, ast.Attribute):
+        return None
+    value = node.func.value
+    while isinstance(value, (ast.Subscript, ast.Attribute, ast.Call)):
+        if isinstance(value, ast.Call):
+            value = value.func
+        else:
+            value = value.value
+    return value.id if isinstance(value, ast.Name) else None

@@ -9,12 +9,18 @@ from pydantic import ValidationError
 from sheetmind.analysis import (
     ChartBlock,
     ChartSeries,
+    FieldCandidate,
+    FieldResolutionBlock,
     MetricBlock,
     ResultBlocks,
     SummaryBlock,
     TableBlock,
 )
 from sheetmind.analysis.streaming.emitter import StreamEmitter
+from sheetmind.analysis.validators.result_validator import (
+    ResultValidationError,
+    validate_result,
+)
 
 
 def test_result_blocks_serializes_native_protocol():
@@ -44,6 +50,42 @@ def test_result_blocks_serializes_native_protocol():
 def test_result_blocks_rejects_unknown_block_kind():
     with pytest.raises(ValidationError):
         ResultBlocks(blocks=[{"kind": "image", "data": "..."}])
+
+
+def test_result_blocks_serializes_field_clarification():
+    result = ResultBlocks(blocks=[
+        FieldResolutionBlock(
+            status="needs_clarification",
+            reference="金额",
+            message="“金额”可能对应多个字段，请选择。",
+            candidates=[
+                FieldCandidate(column="金额", confidence=0.5, reason="名称匹配"),
+                FieldCandidate(column="金额（RMB）", confidence=0.5, reason="名称匹配"),
+            ],
+        )
+    ])
+
+    payload = result.model_dump()
+    assert payload["blocks"][0]["kind"] == "field_resolution"
+    assert payload["blocks"][0]["status"] == "needs_clarification"
+    assert [item["column"] for item in payload["blocks"][0]["candidates"]] == [
+        "金额",
+        "金额（RMB）",
+    ]
+
+
+def test_field_clarification_requires_multiple_candidates():
+    result = ResultBlocks(blocks=[
+        FieldResolutionBlock(
+            status="needs_clarification",
+            reference="金额",
+            message="请选择字段。",
+            candidates=[FieldCandidate(column="金额", confidence=0.5, reason="名称匹配")],
+        )
+    ])
+
+    with pytest.raises(ResultValidationError):
+        validate_result(result)
 
 
 def test_result_helpers_find_typed_blocks():

@@ -71,6 +71,7 @@ class ExecutionStep(BaseModel):
     needs_new_computation: bool = True
     target_fields: List[str] = Field(default_factory=list)
     required_source_columns: List[str] = Field(default_factory=list)
+    field_resolutions: List["FieldResolutionRecord"] = Field(default_factory=list)
     confidence: float = 0.0
 
 
@@ -89,6 +90,7 @@ class ExecutionPlan(BaseModel):
     target_fields: List[str] = Field(default_factory=list)
     target_sheets: List[str] = Field(default_factory=list)
     required_source_columns: List[str] = Field(default_factory=list)
+    field_resolutions: List["FieldResolutionRecord"] = Field(default_factory=list)
     confidence: float = 0.0
     steps: List[ExecutionStep] = Field(default_factory=list)
     planner_used: bool = False
@@ -116,6 +118,32 @@ class SummaryBlock(BaseModel):
     kind: Literal["summary"] = "summary"
     title: Optional[str] = None
     content: str     # markdown-compatible; frontend renders with markdown support
+
+
+class FieldCandidate(BaseModel):
+    """One source-column candidate shown when field resolution is uncertain."""
+
+    column: str
+    confidence: float
+    reason: str
+
+
+class FieldResolutionRecord(BaseModel):
+    """Inspectable field choice stored on execution plans and steps."""
+
+    reference: str
+    status: Literal["confirmed", "assumed", "needs_clarification"]
+    selected_column: Optional[str] = None
+    confidence: float = 0.0
+    reason: str = ""
+    candidates: List[FieldCandidate] = Field(default_factory=list)
+
+
+class FieldResolutionBlock(FieldResolutionRecord):
+    """User-visible field assumption or clarification request."""
+
+    kind: Literal["field_resolution"] = "field_resolution"
+    message: str
 
 
 class MetricBlock(BaseModel):
@@ -177,7 +205,9 @@ class ResultBlocks(BaseModel):
 
     type: Literal["result_blocks"] = "result_blocks"
     output_intents: List[str] = Field(default_factory=lambda: ["auto"])
-    blocks: List[Union[SummaryBlock, MetricBlock, TableBlock, ChartBlock]] = Field(
+    blocks: List[
+        Union[SummaryBlock, FieldResolutionBlock, MetricBlock, TableBlock, ChartBlock]
+    ] = Field(
         default_factory=list
     )
 
