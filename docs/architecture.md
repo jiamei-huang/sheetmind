@@ -4,6 +4,7 @@ SheetMind is a two-process application with one public product surface: the Exce
 
 ```text
 Browser (React)
+  -> anonymous-session cookie and workspace restoration
   -> FastAPI routes
     -> project, file, task, and conversation services
     -> SheetMindAgent
@@ -31,6 +32,12 @@ FastAPI route modules validate transport data and coordinate application service
 ### `server/sheetmind/services`
 
 Services own project, task, conversation, and Excel persistence behavior. SQLite is local runtime state and is not committed.
+
+### Anonymous workspace
+
+The browser does not require an account. FastAPI resolves an HTTP-only anonymous-session cookie before route handling, and all user-owned routes verify project ownership through that session. The React app waits for project restoration before enabling uploads and remembers the last active project locally. Session identity remains server-controlled; project IDs sent by the browser are never sufficient authorization on their own.
+
+On the first run after migration, legacy projects without an owner are assigned to the first anonymous session that lists projects, preserving existing local workbooks. Project names are unique per session rather than globally. File writes are keyed by project and file name: identical content is reused, while changed content replaces the stored workbook. A SHA-256 digest makes duplicate detection deterministic.
 
 ### `server/sheetmind/analysis`
 

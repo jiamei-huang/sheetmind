@@ -53,7 +53,7 @@ const readLocalTasks = (projectId) => {
 };
 
 
-export const useTaskManagement = (activeProjectId, projectsReadyRef, suppressTaskReloadRef) => {
+export const useTaskManagement = (activeProjectId, projectsReady, suppressTaskReloadRef) => {
   const [tasksByProject, setTasksByProject] = useState({});
   const [activeTaskId, setActiveTaskIdState] = useState(null);
   const [isLoadingTasks, setIsLoadingTasks] = useState(false);
@@ -105,7 +105,7 @@ export const useTaskManagement = (activeProjectId, projectsReadyRef, suppressTas
       return;
     }
 
-    if (projectsReadyRef && !projectsReadyRef.current) return;
+    if (!projectsReady) return;
     let cancelled = false;
     setIsLoadingTasks(true);
     getProjectTasks(activeProjectId)
@@ -135,7 +135,7 @@ export const useTaskManagement = (activeProjectId, projectsReadyRef, suppressTas
     return () => {
       cancelled = true;
     };
-  }, [activeProjectId, projectsReadyRef, rememberActiveTask, suppressTaskReloadRef]);
+  }, [activeProjectId, projectsReady, rememberActiveTask, suppressTaskReloadRef]);
 
   const updateTask = useCallback((taskId, updater) => {
     setTasks((current) =>

@@ -14,12 +14,17 @@ from sheetmind.database import init_db
 from sheetmind.exceptions import SheetMindException, safe_error_message
 from sheetmind.config import settings
 from sheetmind.logging import configure_logging
+from sheetmind.services.anonymous_sessions import (
+    SESSION_COOKIE_NAME,
+    SESSION_LIFETIME_DAYS,
+)
 
 from .api.analysis import router as analysis_router
 from .api.conversations import router as conversations_router
 from .api.files import router as files_router
 from .api.projects import router as projects_router
 from .api.tasks import router as tasks_router
+from .api.dependencies import anonymous_sessions
 
 
 ALLOWED_ORIGINS = [
@@ -35,10 +40,26 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=ALLOWED_ORIGINS,
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1):\d+",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def attach_anonymous_session(request: Request, call_next):
+        session = anonymous_sessions.resolve(request.cookies.get(SESSION_COOKIE_NAME))
+        request.state.anonymous_session_id = session.session_id
+        response = await call_next(request)
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=session.session_id,
+            max_age=SESSION_LIFETIME_DAYS * 24 * 60 * 60,
+            httponly=True,
+            samesite="lax",
+            secure=settings.session_cookie_secure,
+        )
+        return response
 
     @app.exception_handler(SheetMindException)
     async def handle_sheetmind_error(_: Request, exc: SheetMindException):

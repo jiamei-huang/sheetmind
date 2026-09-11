@@ -30,6 +30,7 @@ export default function FileUploader({
   uploadedFiles: externalUploadedFiles, // 从父组件接收文件列表
   projectManagement, // 项目管理对象，用于获取项目名称
   suppressTaskReloadRef, // 禁止上传 Excel 时触发任务加载
+  isProjectReady = true,
 }) {
   const fileInputRef = useRef(null);
   const [internalUploadedFiles, setInternalUploadedFiles] = useState([]);
@@ -40,6 +41,7 @@ export default function FileUploader({
   const hasReachedLimit = uploadedFiles.length >= MAX_FILES;
 
   const handleBrowseClick = () => {
+    if (!isProjectReady || isUploading) return;
     if (hasReachedLimit) {
       onShowToast?.({
         title: "文件数量限制",
@@ -110,6 +112,7 @@ export default function FileUploader({
       }
 
       const name = file.name;
+      if (!isProjectReady) return;
       setIsUploading(true);
 
       try {
@@ -188,8 +191,8 @@ export default function FileUploader({
         const actualFileSize = file.size ? formatFileSize(file.size) : "Unknown";
 
         const newFile = {
-          id: fileInfo?.fileName || name,
-          fileId: fileInfo?.fileName || name,
+          id: fileInfo?.fileId || fileInfo?.fileName || name,
+          fileId: fileInfo?.fileId || fileInfo?.fileName || name,
           name: fileInfo?.fileName || response.fileName || name,
           size: actualFileSize, // 使用实际文件大小
           uploadedAt: new Date().toLocaleString(),
@@ -203,6 +206,7 @@ export default function FileUploader({
         // 如果创建了新项目，使用新的项目ID（finalProjectId）添加文件
         // 如果上传到已有项目，也使用 finalProjectId 添加文件
         let inserted = false;
+        const uploadStatus = fileInfo?.uploadStatus || "created";
 
         // 传递 finalProjectId（后端UUID）给 handleFilesUpdated
         // 因为此时 activeProjectId 可能还是前端临时ID，但新文件的 projectId 已经是后端UUID
@@ -210,6 +214,18 @@ export default function FileUploader({
           // prev 已经在 handleFilesUpdated 内部过滤过了，但为了双重保险，再次确认
           // 实际上，由于 handleFilesUpdated 已经过滤，这里的 prev 应该只包含当前项目的文件
 
+          const existingIndex = prev.findIndex(
+            (item) => item.fileId === newFile.fileId || item.name === newFile.name
+          );
+          if (existingIndex >= 0) {
+            inserted = true;
+            if (uploadStatus === "reused") return prev;
+            return prev.map((item, index) =>
+              index === existingIndex
+                ? { ...newFile, selectedSheets: item.selectedSheets || [] }
+                : item
+            );
+          }
           if (prev.length >= MAX_FILES) {
             return prev;
           }
@@ -232,10 +248,15 @@ export default function FileUploader({
 
         // 显示成功提示（如果文件已插入或创建了新项目）
         if (inserted) {
+          const message = uploadStatus === "reused"
+            ? `文件 ${newFile.name} 已存在，继续使用原文件`
+            : uploadStatus === "replaced"
+              ? `文件 ${newFile.name} 已更新`
+              : `文件 ${newFile.name} 已成功上传`;
           // 轻量提示：使用Toast（自动关闭）
           onShowToast?.({
             title: "上传成功",
-            message: `文件 ${newFile.name} 已成功上传`,
+            message,
             type: "success",
             autoClose: true,
           });
@@ -268,7 +289,7 @@ export default function FileUploader({
         setIsUploading(false);
       }
     },
-    [handleFilesUpdated, onShowToast, onShowErrorModal, activeProjectId, onProjectCreated, suppressTaskReloadRef]
+    [handleFilesUpdated, onShowToast, onShowErrorModal, activeProjectId, onProjectCreated, suppressTaskReloadRef, projectManagement, isProjectReady]
   );
 
   const handleFileInputChange = async (event) => {
@@ -289,6 +310,7 @@ export default function FileUploader({
   const handleDrop = async (event) => {
     event.preventDefault();
     setIsDragging(false);
+    if (!isProjectReady || isUploading) return;
 
     const droppedFiles = Array.from(event.dataTransfer?.files ?? []);
     if (!droppedFiles.length) {
@@ -379,7 +401,7 @@ export default function FileUploader({
             <button
               type="button"
               onClick={handleBrowseClick}
-              disabled={hasReachedLimit || isUploading}
+              disabled={!isProjectReady || hasReachedLimit || isUploading}
               className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-blue-600 border border-blue-200 rounded-md hover:bg-blue-50 disabled:text-blue-300 disabled:border-blue-100 transition-colors"
             >
               <Plus className="w-4 h-4" />
@@ -412,17 +434,17 @@ export default function FileUploader({
             hidden
             onChange={handleFileInputChange}
             multiple
-            disabled={hasReachedLimit || isUploading}
+            disabled={!isProjectReady || hasReachedLimit || isUploading}
           />
 
           <button
             type="button"
             onClick={handleBrowseClick}
-            disabled={hasReachedLimit || isUploading}
+            disabled={!isProjectReady || hasReachedLimit || isUploading}
             className="mt-4 w-full sm:w-auto px-4 py-2 sm:px-5 sm:py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-sm sm:text-base font-medium rounded-md transition-colors inline-flex items-center justify-center"
           >
             <Upload className="w-4 h-4 mr-2" />
-            {isUploading ? "Processing..." : "Browse Files"}
+            {!isProjectReady ? "Loading..." : isUploading ? "Processing..." : "Browse Files"}
           </button>
 
           {helperText && (

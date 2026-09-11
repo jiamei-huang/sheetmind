@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -39,12 +40,34 @@ def transaction() -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    statements = (
+    path = database_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS anonymous_sessions (
+                session_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP NOT NULL,
+                last_seen_at TIMESTAMP NOT NULL,
+                expires_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        _ensure_session_scoped_projects(conn)
+
+        statements = (
         """
         CREATE TABLE IF NOT EXISTS projects (
             project_id TEXT PRIMARY KEY,
-            project_name TEXT NOT NULL UNIQUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            session_id TEXT,
+            project_name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES anonymous_sessions(session_id) ON DELETE CASCADE,
+            UNIQUE (session_id, project_name)
         )
         """,
         """
@@ -53,6 +76,7 @@ def init_db() -> None:
             project_id TEXT NOT NULL,
             file_name TEXT NOT NULL,
             file_data BLOB NOT NULL,
+            content_sha256 TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )
@@ -83,14 +107,98 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_files_project_id ON files(project_id)",
         "CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id)",
         "CREATE INDEX IF NOT EXISTS idx_conversations_task_id ON conversations(task_id)",
-    )
+        )
 
-    with transaction() as conn:
         for statement in statements:
             conn.execute(statement)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         if "title" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN title TEXT")
+        file_columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+        if "content_sha256" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN content_sha256 TEXT")
+        _backfill_file_hashes(conn)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_project_content "
+            "ON files(project_id, file_name, content_sha256)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_session_id ON projects(session_id)")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _ensure_session_scoped_projects(conn: sqlite3.Connection) -> None:
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'"
+    ).fetchone()
+    if not table:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+    if "session_id" in columns:
+        return
+
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            CREATE TABLE projects_new (
+                project_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                project_name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES anonymous_sessions(session_id) ON DELETE CASCADE,
+                UNIQUE (session_id, project_name)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO projects_new (project_id, session_id, project_name, created_at)
+            SELECT project_id, NULL, project_name, created_at FROM projects
+            """
+        )
+        conn.execute("DROP TABLE projects")
+        conn.execute("ALTER TABLE projects_new RENAME TO projects")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _backfill_file_hashes(conn: sqlite3.Connection) -> None:
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'"
+    ).fetchone():
+        return
+
+    rows = conn.execute(
+        """
+        SELECT file_id, project_id, file_name, file_data, content_sha256
+        FROM files
+        ORDER BY created_at DESC, file_id DESC
+        """
+    ).fetchall()
+    seen_names: set[tuple[str, str]] = set()
+    for row in rows:
+        digest = row[4] or hashlib.sha256(row[3]).hexdigest()
+        name_key = (row[1], row[2])
+        if name_key in seen_names:
+            conn.execute("DELETE FROM files WHERE file_id = ?", (row[0],))
+            continue
+        seen_names.add(name_key)
+        if row[4] != digest:
+            conn.execute(
+                "UPDATE files SET content_sha256 = ? WHERE file_id = ?",
+                (digest, row[0]),
+            )
 
 
 def get_db() -> sqlite3.Connection:

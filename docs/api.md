@@ -2,12 +2,14 @@
 
 The API base URL is `http://127.0.0.1:8000/api` by default.
 
+All browser requests use the HTTP-only `sheetmind_anonymous_session` cookie. The server creates it automatically, renews it for 30 days, and scopes every project, task, file, analysis, and conversation operation to that anonymous workspace. Browser clients must enable credentials. Existing databases are migrated by assigning previously unowned projects to the first anonymous session that lists projects.
+
 ## Projects
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/projects` | List projects |
-| `POST` | `/projects` | Create a project and its first task |
+| `POST` | `/projects` | Get or create a same-name project in the current anonymous session |
 | `PATCH` | `/projects/{project_id}` | Rename a project |
 | `DELETE` | `/projects/{project_id}` | Delete a project and related state |
 
@@ -21,6 +23,8 @@ The API base URL is `http://127.0.0.1:8000/api` by default.
 | `DELETE` | `/files/project/{project_id}/{file_name}` | Delete a workbook |
 
 Uploads use JSON with base64 file content to preserve the current browser workflow.
+
+Each returned file includes `uploadStatus`: `created` for a new file, `reused` when the same name and content already exist, or `replaced` when the same name contains changed content. `reused` does not create another database record; `replaced` updates the existing record and keeps its `fileId`.
 
 ## Tasks and conversations
 

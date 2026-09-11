@@ -11,6 +11,7 @@ class Project:
     project_id: str
     project_name: str
     created_at: datetime
+    session_id: str | None = None
 
 
 @dataclass(frozen=True)

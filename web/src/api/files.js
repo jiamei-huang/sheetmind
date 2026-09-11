@@ -29,23 +29,11 @@ export const uploadExcelFile = async ({ file, projectId, projectName }) => {
     }
 
     if (!projectName?.trim()) throw new Error("创建新项目时必须提供项目名称");
-    let candidate = projectName.trim();
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      try {
-        const response = await apiClient.post("/projects", {
-          projectName: candidate,
-          files: [fileData],
-        });
-        return {
-          ...response.data,
-          projectName: candidate,
-          isExistingProject: false,
-        };
-      } catch (error) {
-        if (error?.response?.status !== 409 || attempt === 9) throw error;
-        candidate = `${projectName.trim()} (${attempt + 1})`;
-      }
-    }
+    const response = await apiClient.post("/projects", {
+      projectName: projectName.trim(),
+      files: [fileData],
+    });
+    return response.data;
   } catch (error) {
     throw new Error(errorMessage(error, "文件上传失败，请稍后重试"));
   }

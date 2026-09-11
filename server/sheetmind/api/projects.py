@@ -1,16 +1,18 @@
 """Project routes."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from .dependencies import projects, tasks, uploads
 from .schemas import CreateProjectRequest, ProjectInfo, RenameRequest
+from .session import current_session_id
 
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 
 @router.get("")
-def list_projects() -> dict[str, list[ProjectInfo]]:
+def list_projects(request: Request) -> dict[str, list[ProjectInfo]]:
+    session_id = current_session_id(request)
     return {
         "projects": [
             ProjectInfo(
@@ -18,27 +20,44 @@ def list_projects() -> dict[str, list[ProjectInfo]]:
                 projectName=item.project_name,
                 createdAt=item.created_at.isoformat(),
             )
-            for item in projects.list_projects()
+            for item in projects.list_projects(session_id)
         ]
     }
 
 
 @router.post("", status_code=201)
-def create_project(request: CreateProjectRequest) -> dict:
-    parsed_files = uploads.parse_files(request.files)
+def create_project(request: Request, payload: CreateProjectRequest) -> dict:
+    parsed_files = uploads.parse_files(payload.files)
     try:
-        project_id = projects.create_project(request.projectName, request.files)
-        tasks.create_task(project_id)
+        result = projects.get_or_create_project(
+            payload.projectName,
+            payload.files,
+            current_session_id(request),
+        )
+        if result.created:
+            tasks.create_task(result.project_id)
     except ValueError as exc:
-        status = 409 if "already exists" in str(exc) else 400
-        raise HTTPException(status_code=status, detail=str(exc)) from exc
-    return {"projectId": project_id, "files": parsed_files}
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    for info, write in zip(parsed_files, result.files):
+        info.update(fileId=write.file_id, uploadStatus=write.status)
+    return {
+        "projectId": result.project_id,
+        "projectName": payload.projectName.strip(),
+        "isExistingProject": not result.created,
+        "files": parsed_files,
+    }
 
 
 @router.patch("/{project_id}")
-def rename_project(project_id: str, request: RenameRequest) -> dict[str, bool]:
+def rename_project(
+    project_id: str,
+    payload: RenameRequest,
+    request: Request,
+) -> dict[str, bool]:
     try:
-        updated = projects.rename_project(project_id, request.name)
+        updated = projects.rename_project(
+            project_id, payload.name, current_session_id(request)
+        )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not updated:
@@ -47,7 +66,7 @@ def rename_project(project_id: str, request: RenameRequest) -> dict[str, bool]:
 
 
 @router.delete("/{project_id}")
-def delete_project(project_id: str) -> dict[str, bool]:
-    if not projects.delete_project(project_id):
+def delete_project(project_id: str, request: Request) -> dict[str, bool]:
+    if not projects.delete_project(project_id, current_session_id(request)):
         raise HTTPException(status_code=404, detail="Project not found")
     return {"success": True}

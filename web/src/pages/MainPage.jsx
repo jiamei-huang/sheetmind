@@ -21,7 +21,7 @@ export default function MainPage() {
   const projectManagement = useProjectManagement();
   const taskManagement = useTaskManagement(
     projectManagement.activeProjectId,
-    projectManagement.projectsReadyRef,
+    projectManagement.isReady,
     suppressTaskReloadRef
   );
   const fileManagement = useFileManagement(projectManagement.activeProjectId);
@@ -238,6 +238,7 @@ export default function MainPage() {
                 projectManagement={projectManagement}
                 suppressTaskReloadRef={suppressTaskReloadRef}
                 onProjectCreated={handleProjectCreated}
+                isProjectReady={projectManagement.isReady}
               />
             </div>
 

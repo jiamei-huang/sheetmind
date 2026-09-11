@@ -2,6 +2,8 @@
 
 SheetMind is an Excel analysis application for persistent projects, multi-turn questions, structured charts, and reproducible execution traces.
 
+The local web app uses a 30-day anonymous browser session. Projects, tasks, uploaded workbooks, and conversations are restored after refresh or server restart without requiring an account or another upload. Re-uploading identical file content is idempotent; changed content with the same file name replaces the stored workbook.
+
 ## Analysis runtime
 
 The backend first normalizes query syntax, classifies query structure, then builds

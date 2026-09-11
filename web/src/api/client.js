@@ -1,12 +1,14 @@
 import axios from "axios";
 
-const BACKEND_HOST = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+const browserHost = typeof window !== "undefined" ? window.location.hostname : "127.0.0.1";
+const BACKEND_HOST = import.meta.env.VITE_API_BASE_URL || `http://${browserHost}:8000`;
 const API_PREFIX = "/api";
 const BASE_URL = `${BACKEND_HOST}${API_PREFIX}`;
 
 const apiClient = axios.create({
   baseURL: BASE_URL,
   timeout: 300000,
+  withCredentials: true,
   headers: { "Content-Type": "application/json" },
 });
 

@@ -13,6 +13,9 @@ class Settings:
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
     log_dir: str = os.getenv("LOG_DIR", "logs")
     openai_base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    session_cookie_secure: bool = os.getenv(
+        "SHEETMIND_SESSION_COOKIE_SECURE", "false"
+    ).lower() in {"1", "true", "yes", "on"}
 
 
 settings = Settings()
