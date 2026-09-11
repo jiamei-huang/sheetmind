@@ -146,6 +146,27 @@ class FieldResolutionBlock(FieldResolutionRecord):
     message: str
 
 
+class SheetCandidate(BaseModel):
+    """One file/sheet candidate offered for an explicit user decision."""
+
+    candidate_id: str
+    file_name: str
+    sheet_name: str
+    columns: List[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    reason: str = ""
+
+
+class SheetResolutionBlock(BaseModel):
+    """A low-confidence or user-scope conflict in sheet selection."""
+
+    kind: Literal["sheet_resolution"] = "sheet_resolution"
+    status: Literal["scope_conflict", "needs_clarification"]
+    message: str
+    current_sheets: List[str] = Field(default_factory=list)
+    candidates: List[SheetCandidate] = Field(default_factory=list)
+
+
 class MetricBlock(BaseModel):
     """Single key metric (e.g. Total Revenue: 1,280,000 CNY)."""
     kind: Literal["metric"] = "metric"
@@ -206,7 +227,14 @@ class ResultBlocks(BaseModel):
     type: Literal["result_blocks"] = "result_blocks"
     output_intents: List[str] = Field(default_factory=lambda: ["auto"])
     blocks: List[
-        Union[SummaryBlock, FieldResolutionBlock, MetricBlock, TableBlock, ChartBlock]
+        Union[
+            SummaryBlock,
+            FieldResolutionBlock,
+            SheetResolutionBlock,
+            MetricBlock,
+            TableBlock,
+            ChartBlock,
+        ]
     ] = Field(
         default_factory=list
     )
@@ -284,6 +312,7 @@ class AnalysisContext(BaseModel):
     task_id: str
     files: List[FileRef] = Field(default_factory=list)
     selected_sheets: List[str] = Field(default_factory=list)
+    requested_sheet_scope: List[Dict[str, Any]] = Field(default_factory=list)
     conversation: List[Turn] = Field(default_factory=list)
     active_result: Optional[ResultBlocks] = None
     execution_plan: Optional[ExecutionPlan] = None

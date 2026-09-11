@@ -11,8 +11,11 @@ one operation or decompose multiple operations and their dependencies. Each
 atomic step independently extracts operation and output intents. Deterministic
 operation rules select guarded rules, generated pandas code, or insight writing;
 output planning separately selects table, chart, insight, or export-ready results.
-It recognizes period labels and identifier columns, prefers qualified metrics
-such as RMB amounts, and returns validated table, chart, metric, and summary
+Sheet selection combines workbook metadata with constrained model ranking and
+asks before leaving a user-selected sheet. Semantic typing combines physical
+column profiles, deterministic rules, and validated model refinement for
+ambiguous fields. It recognizes period labels and identifier columns, prefers
+qualified metrics such as RMB amounts, and returns validated table, chart, metric, and summary
 blocks. Independent branches can return multiple named tables or charts, which
 the web workspace exposes as tabs. Invalid chart data degrades to the remaining
 safe result blocks.

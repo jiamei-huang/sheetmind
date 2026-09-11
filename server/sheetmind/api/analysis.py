@@ -22,7 +22,17 @@ def _analysis_context(request: AnalyzeRequest):
     task = tasks.get_task(request.taskId)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return analysis_contexts.get_or_create(task.task_id, task.project_id)
+    ctx = analysis_contexts.get_or_create(task.task_id, task.project_id)
+    if request.selectedFiles:
+        ctx.requested_sheet_scope = [
+            selection.model_dump() for selection in request.selectedFiles
+        ]
+        ctx.selected_sheets = [
+            sheet
+            for selection in request.selectedFiles
+            for sheet in selection.sheets
+        ]
+    return ctx
 
 
 def _summary(result) -> str:

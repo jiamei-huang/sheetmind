@@ -56,6 +56,11 @@ from sheetmind.analysis.skills.routing_classification import (
     RoutingResult,
 )
 from sheetmind.analysis.skills.semantic_typing import SemanticTypingSkill
+from sheetmind.analysis.skills.sheet_selection import (
+    RankedSheetCandidate,
+    SheetSelectionDecision,
+    SheetSelectionSkill,
+)
 from sheetmind.analysis.tools.python_executor import PythonExecutorTool
 from sheetmind.analysis.tools.data_type_normalizer import DataTypeNormalizationTool
 from sheetmind.analysis.tools.rule_engine import RuleEngineTool
@@ -1983,6 +1988,151 @@ class TestDataSourceSelection:
 
         assert sheets == ["尾程"]
 
+    def test_sheet_metadata_detects_business_header(self):
+        import io
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        raw = pd.DataFrame([
+            ["销售数据", None, None],
+            ["店铺", "金额（RMB）", "月份"],
+            ["A", 100, "2026-01"],
+            ["B", 200, "2026-02"],
+        ])
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            raw.to_excel(writer, sheet_name="销售明细", header=False, index=False)
+
+        metadata = SheetSelector._read_sheet_metadata(buf.getvalue(), "销售明细")
+
+        assert metadata["columns"] == ["店铺", "金额（RMB）", "月份"]
+        assert "A" in metadata["sampleValues"]
+
+    def test_sheet_selection_reports_scope_conflict(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [
+            {
+                "candidateId": "sales.xlsx::Sheet1",
+                "fileName": "sales.xlsx",
+                "sheetName": "Sheet1",
+                "columns": ["订单号", "状态"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+            {
+                "candidateId": "sales.xlsx::Sheet2",
+                "fileName": "sales.xlsx",
+                "sheetName": "Sheet2",
+                "columns": ["店铺", "金额（RMB）"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+        ]
+        monkeypatch.setattr(
+            SheetSelector,
+            "list_sheet_metadata",
+            lambda self, project_id: metadata,
+        )
+        router = MockRouter(
+            '{"candidate_id":"sales.xlsx::Sheet2","confidence":0.91,"reason":"field match"}'
+        )
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{"fileName": "sales.xlsx", "sheets": ["Sheet1"]}]
+
+        decision = run(SheetSelectionSkill(router).run(
+            ctx,
+            "汇总人民币金额",
+            target_fields=["金额（RMB）"],
+        ))
+
+        assert decision.status == "scope_conflict"
+        assert decision.candidates[0].sheet_name == "Sheet2"
+        assert decision.selected_files == []
+
+    def test_sheet_selection_accepts_explicit_candidate_after_conflict(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [{
+            "candidateId": "sales.xlsx::Sheet2",
+            "fileName": "sales.xlsx",
+            "sheetName": "Sheet2",
+            "columns": ["店铺", "金额（RMB）"],
+            "sampleValues": [],
+            "recencyRank": 0,
+        }]
+        monkeypatch.setattr(
+            SheetSelector,
+            "list_sheet_metadata",
+            lambda self, project_id: metadata,
+        )
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{"fileName": "sales.xlsx", "sheets": ["Sheet1"]}]
+
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            ctx,
+            "使用文件“sales.xlsx”的工作表“Sheet2”继续：汇总人民币金额",
+        ))
+
+        assert decision.status == "confirmed"
+        assert decision.selected_files == [{
+            "fileName": "sales.xlsx",
+            "sheets": ["Sheet2"],
+            "confidence": decision.confidence,
+            "reason": "user explicitly confirmed sheet",
+        }]
+
+    def test_sheet_selection_asks_when_ranking_remains_uncertain(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [
+            {"candidateId": "book.xlsx::A", "fileName": "book.xlsx", "sheetName": "A", "columns": ["X"], "sampleValues": [], "recencyRank": 0},
+            {"candidateId": "book.xlsx::B", "fileName": "book.xlsx", "sheetName": "B", "columns": ["Y"], "sampleValues": [], "recencyRank": 0},
+        ]
+        monkeypatch.setattr(
+            SheetSelector,
+            "list_sheet_metadata",
+            lambda self, project_id: metadata,
+        )
+
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            make_ctx(),
+            "分析数据",
+        ))
+
+        assert decision.status == "needs_clarification"
+        assert {candidate.sheet_name for candidate in decision.candidates} == {"A", "B"}
+
+    def test_agent_returns_sheet_candidates_before_loading_data(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{"fileName": "sales.xlsx", "sheets": ["Sheet1"]}]
+        candidate = RankedSheetCandidate(
+            candidate_id="sales.xlsx::Sheet2",
+            file_name="sales.xlsx",
+            sheet_name="Sheet2",
+            columns=["店铺", "金额（RMB）"],
+            score=0.91,
+            reason="qualified metric match",
+        )
+        agent.sheet_skill.run = AsyncMock(return_value=SheetSelectionDecision(
+            status="scope_conflict",
+            candidates=[candidate],
+            confidence=0.91,
+            reason="scope mismatch",
+        ))
+        agent.df_loader.run = MagicMock(side_effect=AssertionError("must ask before loading"))
+
+        result = run(agent.run(ctx, "汇总人民币金额"))
+
+        block = result.blocks[0]
+        assert block.kind == "sheet_resolution"
+        assert block.status == "scope_conflict"
+        assert block.current_sheets == ["Sheet1"]
+        assert block.candidates[0].sheet_name == "Sheet2"
+        assert agent.df_loader.run.call_count == 0
+
     def test_excel_service_get_file_by_name_uses_latest_upload(self, tmp_path, monkeypatch):
         import sqlite3
         from sheetmind.services import excel as excel_service_module
@@ -2154,6 +2304,45 @@ class TestEnhancementAcceptance:
         assert field_map["订单号"].should_aggregate is False
         assert field_map["金额"].should_aggregate is True
         assert field_map["金额"].confidence > 0.8
+
+    def test_semantic_typing_uses_llm_for_aggregation_ambiguity(self):
+        router = MockRouter(
+            '{"fields":[{"column":"毛利率","type":"numeric","aggregation":"sum",'
+            '"qualifiers":["percent"],"canonical_name":"毛利率","aliases":["利润率"],'
+            '"confidence":0.88,"reason":"ratio metric"}]}'
+        )
+        df = pd.DataFrame({"毛利率": [0.1, 0.2, 0.3]})
+
+        field_map = run(SemanticTypingSkill(router).run(
+            make_ctx(),
+            "分析毛利率",
+            df=df,
+        ))
+
+        info = field_map["毛利率"]
+        assert router._mock.calls == 1
+        assert info.inference_source == "hybrid"
+        assert info.recommended_aggregation == "avg"
+        assert "percent" in info.qualifiers
+        assert "利润率" in info.aliases
+
+    def test_semantic_typing_rejects_llm_type_conflicting_with_data(self):
+        router = MockRouter(
+            '{"fields":[{"column":"状态","type":"numeric","aggregation":"sum",'
+            '"confidence":0.99,"reason":"incorrect"}]}'
+        )
+        df = pd.DataFrame({"状态": ["待付款", "已完成", "已取消"]})
+
+        field_map = run(SemanticTypingSkill(router).run(
+            make_ctx(),
+            "分析订单状态",
+            df=df,
+        ))
+
+        info = field_map["状态"]
+        assert info.type == "categorical"
+        assert info.inference_source == "rule"
+        assert info.should_aggregate is False
 
     def test_field_resolver_prefers_rmb_qualified_metric(self):
         from sheetmind.analysis.skills.field_resolution import FieldResolver

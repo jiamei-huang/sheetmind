@@ -448,6 +448,9 @@ function AIDataAnalysis({
       const response = await analyzeStream({
         taskId: actualTaskId,
         query: trimmedPrompt,
+        selectedFiles: uploadedFile?.fileName && selectedSheets.length > 0
+          ? [{ fileName: uploadedFile.fileName, sheets: selectedSheets }]
+          : [],
         onEvent: pushProgressEvent,
       });
 

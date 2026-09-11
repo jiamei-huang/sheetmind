@@ -167,6 +167,7 @@ class CodeGenerationSkill(Skill):
                 metadata_lines.append(
                     f"  {col!r}: type={info.type}, role={info.semantic_role}, "
                     f"should_aggregate={info.should_aggregate}, qualifiers={info.qualifiers}, "
+                    f"recommended_aggregation={info.recommended_aggregation}, "
                     f"recommended_aliases={info.aliases[:4]}"
                 )
             parts.append("【字段元数据】\n" + "\n".join(metadata_lines))

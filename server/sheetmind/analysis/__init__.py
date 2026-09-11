@@ -31,6 +31,8 @@ from .context import (
     MultiTurnMode,
     ResultBlocks,
     RoutingHint,
+    SheetCandidate,
+    SheetResolutionBlock,
     SummaryBlock,
     TableBlock,
     Turn,
@@ -60,6 +62,8 @@ __all__ = [
     "FieldCandidate",
     "FieldResolutionBlock",
     "FieldResolutionRecord",
+    "SheetCandidate",
+    "SheetResolutionBlock",
     # Routing enums
     "RoutingHint",
     "MultiTurnMode",

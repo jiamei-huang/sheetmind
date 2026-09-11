@@ -313,6 +313,7 @@ const TaskContentPanel = ({
       runtimeNote,
       metrics = [],
       fieldResolutions = [],
+      sheetResolutions = [],
     } = result;
 
     // 根据 type 决定显示什么内容
@@ -834,6 +835,39 @@ const TaskContentPanel = ({
                         ))}
                       </div>
                     )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {sheetResolutions.length > 0 && (
+          <div className="border border-amber-200 bg-amber-50 p-4">
+            <div className="flex items-start gap-3">
+              <Database className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+              <div className="min-w-0 flex-1 space-y-3">
+                <h6 className="text-sm font-semibold text-amber-950">请选择数据工作表</h6>
+                {sheetResolutions.map((resolution, resolutionIndex) => (
+                  <div key={`${resolution.status}-${resolutionIndex}`} className="space-y-2">
+                    <p className="text-sm text-amber-900">{resolution.message}</p>
+                    <div className="flex flex-wrap gap-2">
+                      {(resolution.candidates || []).map((candidate) => (
+                        <button
+                          key={candidate.candidate_id}
+                          type="button"
+                          title={candidate.reason || `使用工作表 ${candidate.sheet_name}`}
+                          onClick={() => onTaskPromptChange(
+                            task.id,
+                            `使用文件“${candidate.file_name}”的工作表“${candidate.sheet_name}”继续：${result.prompt || "分析数据"}`
+                          )}
+                          className="inline-flex max-w-full items-center gap-1.5 border border-amber-300 bg-white px-3 py-1.5 text-sm font-medium text-amber-950 hover:border-amber-500 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        >
+                          <Database className="w-3.5 h-3.5 flex-shrink-0" />
+                          <span className="break-all">{candidate.file_name} / {candidate.sheet_name}</span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 ))}
               </div>

@@ -15,17 +15,20 @@ export const toAnalysisViewModel = (payload, prompt) => {
     .map((block) => block.content);
   const metrics = payload.blocks.filter((block) => block.kind === "metric");
   const fieldResolutions = payload.blocks.filter((block) => block.kind === "field_resolution");
+  const sheetResolutions = payload.blocks.filter((block) => block.kind === "sheet_resolution");
   const needsFieldClarification = fieldResolutions.some(
     (block) => block.status === "needs_clarification"
   );
+  const needsSheetClarification = sheetResolutions.length > 0;
+  const needsClarification = needsFieldClarification || needsSheetClarification;
   const outputIntents = Array.isArray(payload.output_intents) && payload.output_intents.length
     ? payload.output_intents
     : ["auto"];
 
-  const type = needsFieldClarification
+  const type = needsClarification
     ? "clarification"
     : table && chart ? "both" : table ? "data" : chart ? "chart" : "insight_only";
-  const mode = needsFieldClarification
+  const mode = needsClarification
     ? "clarification"
     : chart && table
     ? "both"
@@ -34,7 +37,9 @@ export const toAnalysisViewModel = (payload, prompt) => {
       : table || outputIntents.some((intent) => intent === "table" || intent === "export_excel")
         ? "processing"
         : "insight";
-  const classification = needsFieldClarification
+  const classification = needsSheetClarification
+    ? "Sheet Confirmation"
+    : needsFieldClarification
     ? "Field Confirmation"
     : outputIntents.includes("export_excel")
     ? "Excel Export"
@@ -75,6 +80,7 @@ export const toAnalysisViewModel = (payload, prompt) => {
     suggestion: summaries.join("\n\n"),
     metrics,
     fieldResolutions,
+    sheetResolutions,
     runtimeNote:
       table && table.rows.length < totalRows
         ? `前端仅展示 ${table.rows.length.toLocaleString()} 行预览，后端已处理 ${totalRows.toLocaleString()} 行。`

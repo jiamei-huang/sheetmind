@@ -142,3 +142,35 @@ test("keeps field clarification choices in the analysis view model", () => {
   assert.equal(result.fieldResolutions[0].reference, "金额");
   assert.equal(result.fieldResolutions[0].candidates[1].column, "金额（RMB）");
 });
+
+test("keeps sheet conflict choices in the analysis view model", () => {
+  const result = toAnalysisViewModel(
+    {
+      type: "result_blocks",
+      blocks: [
+        {
+          kind: "sheet_resolution",
+          status: "scope_conflict",
+          message: "Sheet2 更匹配当前问题。",
+          current_sheets: ["Sheet1"],
+          candidates: [
+            {
+              candidate_id: "sales.xlsx::Sheet2",
+              file_name: "sales.xlsx",
+              sheet_name: "Sheet2",
+              columns: ["店铺", "金额（RMB）"],
+              confidence: 0.91,
+              reason: "column match",
+            },
+          ],
+        },
+      ],
+    },
+    "汇总人民币金额"
+  );
+
+  assert.equal(result.type, "clarification");
+  assert.equal(result.mode, "clarification");
+  assert.equal(result.classification, "Sheet Confirmation");
+  assert.equal(result.sheetResolutions[0].candidates[0].sheet_name, "Sheet2");
+});

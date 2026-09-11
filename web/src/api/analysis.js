@@ -39,7 +39,7 @@ export const toAnalysisErrorMessage = (error) => {
   return rawMessage;
 };
 
-export const analyzeStream = ({ taskId, query, onEvent }) =>
+export const analyzeStream = ({ taskId, query, selectedFiles = [], onEvent }) =>
   new Promise(async (resolve, reject) => {
     if (!taskId || !query?.trim()) {
       reject(new Error("Task ID and query are required"));
@@ -52,7 +52,7 @@ export const analyzeStream = ({ taskId, query, onEvent }) =>
       const response = await fetch(`${BASE_URL}/analysis/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ taskId, query: query.trim() }),
+        body: JSON.stringify({ taskId, query: query.trim(), selectedFiles }),
         signal: controller.signal,
       });
       if (!response.ok) {

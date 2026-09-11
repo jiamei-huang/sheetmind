@@ -103,7 +103,14 @@ class DataProfilingSkill(Skill):
             series = df[col]
             semantic = field_map.get(name) if field_map else None
             semantic_type = semantic.type if semantic else self._infer_type(series)
-            profiles.append(self._profile_column(name, series, semantic_type))
+            profiles.append(self._profile_column(
+                name,
+                series,
+                semantic_type,
+                recommended_aggregation=(
+                    semantic.recommended_aggregation if semantic else None
+                ),
+            ))
 
         metric_candidates = [profile.name for profile in profiles if profile.semantic_type == "numeric"]
         dimension_candidates = [
@@ -126,7 +133,13 @@ class DataProfilingSkill(Skill):
             warnings=warnings,
         )
 
-    def _profile_column(self, name: str, series: pd.Series, semantic_type: str) -> ColumnProfile:
+    def _profile_column(
+        self,
+        name: str,
+        series: pd.Series,
+        semantic_type: str,
+        recommended_aggregation: Optional[str] = None,
+    ) -> ColumnProfile:
         non_null = series.dropna()
         numeric_series = pd.to_numeric(series, errors="coerce")
         numeric_stats: Optional[Dict[str, float]] = None
@@ -155,7 +168,12 @@ class DataProfilingSkill(Skill):
             sample_values=samples,
             numeric_stats=numeric_stats,
             date_range=date_range,
-            recommended_aggregation=self._recommended_aggregation(name, semantic_type),
+            recommended_aggregation=(
+                None if recommended_aggregation == "none"
+                else recommended_aggregation
+                if recommended_aggregation is not None
+                else self._recommended_aggregation(name, semantic_type)
+            ),
         )
 
     @staticmethod

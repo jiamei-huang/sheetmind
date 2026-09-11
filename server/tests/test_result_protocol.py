@@ -13,6 +13,8 @@ from sheetmind.analysis import (
     FieldResolutionBlock,
     MetricBlock,
     ResultBlocks,
+    SheetCandidate,
+    SheetResolutionBlock,
     SummaryBlock,
     TableBlock,
 )
@@ -21,6 +23,7 @@ from sheetmind.analysis.validators.result_validator import (
     ResultValidationError,
     validate_result,
 )
+from sheetmind.api.schemas import AnalyzeRequest
 
 
 def test_result_blocks_serializes_native_protocol():
@@ -45,6 +48,17 @@ def test_result_blocks_serializes_native_protocol():
         "chart",
         "summary",
     ]
+
+
+def test_analysis_request_accepts_selected_sheet_scope():
+    request = AnalyzeRequest(
+        taskId="task-1",
+        query="汇总销售额",
+        selectedFiles=[{"fileName": "sales.xlsx", "sheets": ["Sheet1"]}],
+    )
+
+    assert request.selectedFiles[0].fileName == "sales.xlsx"
+    assert request.selectedFiles[0].sheets == ["Sheet1"]
 
 
 def test_result_blocks_rejects_unknown_block_kind():
@@ -86,6 +100,30 @@ def test_field_clarification_requires_multiple_candidates():
 
     with pytest.raises(ResultValidationError):
         validate_result(result)
+
+
+def test_result_blocks_serializes_sheet_scope_conflict():
+    result = ResultBlocks(blocks=[
+        SheetResolutionBlock(
+            status="scope_conflict",
+            message="Sheet2 更匹配当前问题。",
+            current_sheets=["Sheet1"],
+            candidates=[
+                SheetCandidate(
+                    candidate_id="sales.xlsx::Sheet2",
+                    file_name="sales.xlsx",
+                    sheet_name="Sheet2",
+                    columns=["店铺", "金额（RMB）"],
+                    confidence=0.91,
+                    reason="column match",
+                )
+            ],
+        )
+    ])
+
+    payload = validate_result(result).model_dump()
+    assert payload["blocks"][0]["kind"] == "sheet_resolution"
+    assert payload["blocks"][0]["candidates"][0]["sheet_name"] == "Sheet2"
 
 
 def test_result_helpers_find_typed_blocks():

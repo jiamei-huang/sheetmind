@@ -38,7 +38,13 @@ Uploads use JSON with base64 file content to preserve the current browser workfl
 `POST /analysis/stream` is the browser endpoint. The request is:
 
 ```json
-{ "taskId": "uuid", "query": "Show sales by region" }
+{
+  "taskId": "uuid",
+  "query": "Show sales by region",
+  "selectedFiles": [
+    {"fileName": "sales.xlsx", "sheets": ["Sheet1"]}
+  ]
+}
 ```
 
 The response uses Server-Sent Events with `thinking`, `progress`, `repairing`, `done`, and `error` event payloads. The `done.result` field contains native ResultBlocks. Its top-level `output_intents` array records the requested presentation contract (`auto`, `table`, `chart`, `insight`, or `export_excel`) independently from execution routing.
@@ -62,6 +68,29 @@ When a query refers to multiple equally plausible columns, analysis returns a `f
 ```
 
 An `assumed` block accompanies a completed result when one partial field match is usable but should be disclosed. A `confirmed` field is recorded in the execution plan and does not add a user-visible block.
+
+When the selected sheet conflicts with the query, or multiple sheets remain plausible after metadata and semantic ranking, analysis stops before loading data and returns a `sheet_resolution` block:
+
+```json
+{
+  "kind": "sheet_resolution",
+  "status": "scope_conflict",
+  "message": "当前选择的工作表与问题不一致；“Sheet2”中的字段更匹配。请选择是否切换后继续。",
+  "current_sheets": ["Sheet1"],
+  "candidates": [
+    {
+      "candidate_id": "sales.xlsx::Sheet2",
+      "file_name": "sales.xlsx",
+      "sheet_name": "Sheet2",
+      "columns": ["店铺", "金额（RMB）"],
+      "confidence": 0.91,
+      "reason": "planned fields match ['金额（RMB）']"
+    }
+  ]
+}
+```
+
+Clients should resubmit the original question with the exact selected workbook and sheet. The web client does this through its candidate buttons. The server never permits the sheet-selection model to introduce a workbook or sheet outside the recalled candidates.
 
 `progress` events include a stable `step_id` when the runtime enters a pipeline stage. Values are `routing`, `query_planning`, `sheet_selection`, `data_loading`, `semantic_typing`, `data_profiling`, `execution`, `chart_planning`, `insight_writing`, and `validation`; clients should use the message for display and the ID for state tracking.
 

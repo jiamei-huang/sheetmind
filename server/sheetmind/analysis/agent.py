@@ -28,6 +28,8 @@ from .context import (
     MultiTurnMode,
     ResultBlocks,
     RoutingHint,
+    SheetCandidate,
+    SheetResolutionBlock,
     SummaryBlock,
     TableBlock,
 )
@@ -46,7 +48,7 @@ from .skills.routing_classification import (
     RoutingResult,
 )
 from .skills.semantic_typing import SemanticFieldMap, SemanticTypingSkill
-from .skills.sheet_selection import SheetSelectionSkill
+from .skills.sheet_selection import SheetSelectionDecision, SheetSelectionSkill
 from .streaming.emitter import StreamEmitter
 from .tools.dataframe_loader import DataframeLoaderTool
 from .tools.data_type_normalizer import DataTypeNormalizationTool
@@ -274,9 +276,28 @@ class SheetMindAgent:
                 await emitter.emit_progress("正在选择数据文件...", step_id="sheet_selection")
 
             try:
-                selected_files = await self.sheet_skill.run(
-                    ctx, normalized_query.normalized_text
+                selection = await self.sheet_skill.run(
+                    ctx,
+                    normalized_query.normalized_text,
+                    target_fields=execution_plan.target_fields,
                 )
+                if isinstance(selection, SheetSelectionDecision):
+                    if selection.needs_user_input:
+                        sheet_block = self._sheet_resolution_block(ctx, selection)
+                        return ResultBlocks(
+                            output_intents=execution_plan.output_intents,
+                            blocks=[sheet_block],
+                        ), hint, mode
+                    selected_files = selection.selected_files
+                else:
+                    # Compatibility for tests and custom adapters that still
+                    # implement the historical list-returning interface.
+                    selected_files = selection
+                ctx.selected_sheets = [
+                    sheet
+                    for item in selected_files
+                    for sheet in item.get("sheets", [])
+                ]
                 execution_plan.target_sheets = list(ctx.selected_sheets)
             except Exception as exc:
                 logger.warning("[Pipeline] sheet selection failed: %s", exc)
@@ -812,6 +833,41 @@ class SheetMindAgent:
                 message=message,
             ))
         return blocks
+
+    @staticmethod
+    def _sheet_resolution_block(
+        ctx: AnalysisContext,
+        decision: SheetSelectionDecision,
+    ) -> SheetResolutionBlock:
+        current_sheets = [
+            str(sheet)
+            for scope in ctx.requested_sheet_scope
+            for sheet in scope.get("sheets", [])
+        ] or list(ctx.selected_sheets)
+        if decision.status == "scope_conflict":
+            candidate = decision.candidates[0]
+            message = (
+                f"当前选择的工作表与问题不一致；“{candidate.sheet_name}”中的字段更匹配。"
+                "请选择是否切换后继续。"
+            )
+        else:
+            message = "多个工作表都可能包含所需数据，请选择后继续。"
+        return SheetResolutionBlock(
+            status=decision.status,
+            message=message,
+            current_sheets=current_sheets,
+            candidates=[
+                SheetCandidate(
+                    candidate_id=candidate.candidate_id,
+                    file_name=candidate.file_name,
+                    sheet_name=candidate.sheet_name,
+                    columns=candidate.columns[:12],
+                    confidence=candidate.score,
+                    reason=candidate.reason,
+                )
+                for candidate in decision.candidates
+            ],
+        )
 
     # ------------------------------------------------------------------
     # Helpers

@@ -73,6 +73,8 @@ def validate_result(
                 _validate_summary(block, index=i)
             elif kind == "field_resolution":
                 _validate_field_resolution(block, index=i)
+            elif kind == "sheet_resolution":
+                _validate_sheet_resolution(block, index=i)
             # metric blocks and unknown kinds are passed through without validation
         except ResultValidationError as exc:
             if kind == "chart" and degrade_invalid_charts:
@@ -247,6 +249,19 @@ def _validate_field_resolution(block: Any, index: int) -> None:
     if status == "assumed" and not selected:
         raise ResultValidationError(
             f"FieldResolutionBlock[{index}]: assumed field requires selected_column"
+        )
+
+
+def _validate_sheet_resolution(block: Any, index: int) -> None:
+    status = block.get("status") if isinstance(block, dict) else getattr(block, "status", "")
+    candidates = block.get("candidates", []) if isinstance(block, dict) else getattr(block, "candidates", [])
+    if status not in {"scope_conflict", "needs_clarification"}:
+        raise ResultValidationError(
+            f"SheetResolutionBlock[{index}]: invalid status {status!r}"
+        )
+    if not candidates:
+        raise ResultValidationError(
+            f"SheetResolutionBlock[{index}]: at least one candidate is required"
         )
 
 

@@ -82,10 +82,101 @@ class SheetSelector:
         logger.debug(f"[SheetSelector] ====== Sheet 选择完成 ======")
         return selected
 
+    def list_sheet_metadata(self, project_id: str) -> List[Dict[str, Any]]:
+        """Return lightweight, query-independent metadata for every current sheet."""
+        candidates: List[Dict[str, Any]] = []
+        for recency_rank, file_name in enumerate(self._get_project_files(project_id)):
+            try:
+                file_bytes = self.excel_service.get_file_by_name(project_id, file_name)
+                if not file_bytes:
+                    continue
+                with pd.ExcelFile(io.BytesIO(file_bytes)) as xls:
+                    for sheet_name in xls.sheet_names:
+                        metadata = self._read_sheet_metadata(
+                            file_bytes,
+                            sheet_name,
+                        )
+                        candidates.append({
+                            "candidateId": f"{file_name}::{sheet_name}",
+                            "fileName": file_name,
+                            "sheetName": sheet_name,
+                            "columns": metadata["columns"],
+                            "sampleValues": metadata["sampleValues"],
+                            "rowCount": metadata["rowCount"],
+                            "recencyRank": recency_rank,
+                        })
+            except Exception as exc:
+                logger.warning(
+                    "[SheetSelector] failed to profile workbook %s: %s",
+                    file_name,
+                    exc,
+                )
+        return candidates
+
+    @staticmethod
+    def _read_sheet_metadata(file_bytes: bytes, sheet_name: str) -> Dict[str, Any]:
+        """Read enough rows to identify headers and representative values."""
+        raw = pd.read_excel(
+            io.BytesIO(file_bytes),
+            sheet_name=sheet_name,
+            header=None,
+            nrows=30,
+        )
+        if raw.empty:
+            return {"columns": [], "sampleValues": [], "rowCount": 0}
+
+        header_row = SheetSelector._detect_header_row(raw)
+        headers = []
+        for index, value in enumerate(raw.iloc[header_row].tolist(), start=1):
+            if pd.isna(value) or not str(value).strip():
+                headers.append(f"Unnamed: {index}")
+            else:
+                headers.append(str(value).strip())
+        data = raw.iloc[header_row + 1:].copy()
+        sample_values: List[str] = []
+        for value in data.to_numpy().flatten().tolist():
+            if pd.isna(value):
+                continue
+            text = str(value).strip()
+            if text and text not in sample_values:
+                sample_values.append(text)
+            if len(sample_values) >= 12:
+                break
+        return {
+            "columns": headers,
+            "sampleValues": sample_values,
+            "rowCount": max(len(data), 0),
+        }
+
+    @staticmethod
+    def _detect_header_row(raw: pd.DataFrame) -> int:
+        business_terms = (
+            "日期", "时间", "月份", "平台", "店铺", "产品", "sku", "金额",
+            "销售", "费用", "数量", "地区", "区域", "客户", "订单",
+        )
+        best_index = 0
+        best_score = -1.0
+        for index, row in raw.head(15).iterrows():
+            values = [value for value in row.tolist() if pd.notna(value) and str(value).strip()]
+            if not values:
+                continue
+            fill_ratio = len(values) / max(len(row), 1)
+            string_ratio = sum(isinstance(value, str) for value in values) / len(values)
+            keyword_hits = sum(
+                any(term in str(value).lower() for term in business_terms)
+                for value in values
+            )
+            uniqueness = len({str(value) for value in values}) / len(values)
+            score = fill_ratio + string_ratio + uniqueness + min(keyword_hits, 4) * 0.35
+            if fill_ratio >= 0.35 and string_ratio >= 0.45 and score > best_score:
+                best_index = int(index)
+                best_score = score
+        return best_index
+
     def _get_project_files(self, project_id: str) -> List[str]:
         """
         获取项目下的文件名
-        只返回最近上传的文件（避免加载历史文件）
+        返回每个文件名的最新版本，并按上传时间排序。
         """
         import time
         logger.debug(f"[SheetSelector] _get_project_files: project_id={project_id}")
@@ -110,13 +201,6 @@ class SheetSelector:
             logger.debug(f"[SheetSelector] 找到 {len(file_names)} 个文件（按时间排序，最新的在前）")
             for idx, file_name in enumerate(file_names):
                 logger.debug(f"[SheetSelector]   {idx+1}. {file_name}")
-
-            # ⚠️ 如果文件太多，只选择最近上传的（避免加载所有历史文件）
-            # 例如：如果超过 3 个文件，只选择前 3 个（最新的）
-            max_files = 3
-            if len(file_names) > max_files:
-                logger.debug(f"[SheetSelector] ⚠️ 文件数量超过 {max_files} 个，只选择最近 {max_files} 个文件")
-                file_names = file_names[:max_files]
 
             return file_names
         finally:

@@ -35,9 +35,15 @@ class ParseExcelRequest(BaseModel):
     fileName: str = Field(min_length=1)
 
 
+class AnalyzeSelectedFile(BaseModel):
+    fileName: str = Field(min_length=1)
+    sheets: list[str] = Field(min_length=1)
+
+
 class AnalyzeRequest(BaseModel):
     taskId: str = Field(min_length=1)
     query: str = Field(min_length=1, max_length=2000)
+    selectedFiles: list[AnalyzeSelectedFile] = Field(default_factory=list)
 
 
 class ProjectInfo(BaseModel):

@@ -10,7 +10,7 @@ Browser (React)
       -> deterministic query normalization
       -> hybrid structure detection and dependency-aware query planning
       -> operation/output intent extraction and deterministic route decision
-      -> sheet-selection and semantic field skills
+      -> hybrid sheet selection and semantic field typing
       -> dataframe tools and guarded Python execution
       -> output planning, chart, and insight skills
       -> ResultBlocks
@@ -105,10 +105,10 @@ The routing result exposes both intent objects and execution metadata for downst
 
 ## Semantic data contract
 
-`SemanticTypingSkill` produces field metadata that is reused by profiling, rule execution, code generation, and chart planning:
+`SemanticTypingSkill` builds a compact physical profile for each column, applies deterministic type and naming rules, and sends only ambiguous fields to the configured semantic-typing model. Model output must name an existing column, use supported type and aggregation enums, meet a confidence floor, and remain compatible with numeric/date/uniqueness evidence; invalid or unavailable model output leaves the rule result unchanged. The resulting field metadata is reused by profiling, rule execution, code generation, and chart planning:
 
 - Type: `numeric`, `datetime`, `datetime-like`, `categorical`, `identifier`, or `unknown`.
-- Role, aggregation safety, aliases, qualifiers, and confidence.
+- Role, aggregation safety and policy (`sum`, `avg`, `last`, `count_distinct`, or `none`), aliases, qualifiers, confidence, reason, and inference source.
 - Identifier columns such as SKU, order number, and customer ID are never treated as summable metrics.
 - Qualified aliases prioritize fields such as `金额（RMB）` when a query mentions `人民币金额`.
 
@@ -125,6 +125,12 @@ Candidates are compared only within the same canonical field concept and semanti
 `DataProfilingSkill` returns a structured profile and a compact prompt view. Profiles include null and cardinality ratios, samples, numeric statistics, date ranges, candidate metrics/dimensions/dates, and recommended aggregations.
 
 `DataTypeNormalizationTool` runs after semantic typing and before profiling or execution. It works on a dataframe copy and deterministically converts recognized calendar text, `YYYYMM`, `YYYYMMDD`, four-digit years, Excel serial dates, and Unix second/millisecond timestamps. A conversion is accepted only when at least 80% of non-null values parse successfully. Identifier fields are excluded, so numeric SKU and order IDs are not converted into dates.
+
+## Sheet selection contract
+
+`SheetSelectionSkill` recalls every current workbook/sheet using lightweight metadata: file name, sheet name, detected headers, representative values, and recency. Exact names, planned target fields, qualified metric names, and sample-value matches produce deterministic candidate scores. Clear matches stay on the rule path; ambiguous candidates are sent to the configured sheet-selection model, which may only rank supplied candidate IDs. A model response that invents a source or remains below the confidence threshold is rejected.
+
+The browser sends its current file/sheet scope with every analysis request. The scope is respected when it matches the query. If metadata indicates that the requested fields exist in a different sheet, execution stops with a `scope_conflict` result instead of silently switching or running against the wrong sheet. Multiple unresolved candidates produce `needs_clarification`. Selecting a candidate creates an explicit follow-up query that authorizes that exact workbook and sheet.
 
 ## Execution and presentation safeguards
 
