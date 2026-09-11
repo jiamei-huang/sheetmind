@@ -2196,6 +2196,60 @@ class TestDataSourceSelection:
         assert list(df.columns) == ["月份", "平台", "店铺", "费用金额", "平台.1", "店铺.1"]
         assert df.iloc[0]["平台"] == "速卖通"
 
+    def test_dataframe_loader_ignores_unsupported_text_filter_metadata(self):
+        import io
+        import zipfile
+        from xml.etree import ElementTree
+
+        from sheetmind.analysis.tools.dataframe_loader import DataframeLoaderTool
+
+        raw = pd.DataFrame([
+            [None, None, None],
+            ["月份", "平台", "仓储费"],
+            ["2026-12", "美国官网", 120],
+            ["2026-12", "北美亚马逊", 180],
+        ])
+        source = io.BytesIO()
+        with pd.ExcelWriter(source, engine="openpyxl") as writer:
+            raw.to_excel(writer, sheet_name="仓储", header=False, index=False)
+
+        malformed = io.BytesIO()
+        namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        with zipfile.ZipFile(io.BytesIO(source.getvalue()), "r") as zin:
+            with zipfile.ZipFile(malformed, "w") as zout:
+                for item in zin.infolist():
+                    payload = zin.read(item.filename)
+                    if item.filename == "xl/worksheets/sheet1.xml":
+                        root = ElementTree.fromstring(payload)
+                        auto_filter = ElementTree.SubElement(
+                            root, f"{{{namespace}}}autoFilter", {"ref": "A2:C4"}
+                        )
+                        filter_column = ElementTree.SubElement(
+                            auto_filter, f"{{{namespace}}}filterColumn", {"colId": "1"}
+                        )
+                        custom_filters = ElementTree.SubElement(
+                            filter_column, f"{{{namespace}}}customFilters"
+                        )
+                        ElementTree.SubElement(
+                            custom_filters,
+                            f"{{{namespace}}}customFilter",
+                            {"operator": "equal", "val": "美国维修仓"},
+                        )
+                        payload = ElementTree.tostring(
+                            root, encoding="utf-8", xml_declaration=True
+                        )
+                    zout.writestr(item, payload)
+
+        [df] = DataframeLoaderTool()._load_sheets(
+            malformed.getvalue(), "storage.xlsx", ["仓储"]
+        )
+
+        assert list(df.columns) == ["月份", "平台", "仓储费"]
+        assert df.to_dict("records") == [
+            {"月份": "2026-12", "平台": "美国官网", "仓储费": 120},
+            {"月份": "2026-12", "平台": "北美亚马逊", "仓储费": 180},
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Enhancement acceptance regressions

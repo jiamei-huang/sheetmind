@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import io
 import logging
+import zipfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from xml.etree import ElementTree
 
 import pandas as pd
 
@@ -29,6 +31,11 @@ logger = logging.getLogger(__name__)
 # Reintroduce sampling only with an explicit UI/API warning and a query plan that
 # cannot be mistaken for an exact answer.
 MAX_ROWS_PER_SHEET: Optional[int] = None
+
+_SPREADSHEET_XML_NAMESPACE = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_UNSUPPORTED_FILTER_VALUE_ERROR = (
+    "Value must be either numerical or a string containing a wildcard"
+)
 
 
 @dataclass
@@ -151,13 +158,42 @@ class DataframeLoaderTool(Tool):
         available = xls.sheet_names
         # Fall back to all sheets if none specified
         targets = sheet_names if sheet_names else available
+        sanitized_file_bytes: Optional[bytes] = None
+        removed_filter_count = 0
 
         for sheet in targets:
             if sheet not in available:
                 logger.warning("[DataframeLoader] sheet not found: %s in %s", sheet, file_name)
                 continue
             try:
-                header_row = self._detect_header_row(file_bytes, sheet)
+                read_bytes = file_bytes
+                try:
+                    header_row = self._detect_header_row(
+                        read_bytes, sheet, raise_errors=True
+                    )
+                    df = self._read_sheet(read_bytes, sheet, header_row)
+                except Exception as exc:
+                    if not self._is_unsupported_filter_error(exc):
+                        raise
+                    if sanitized_file_bytes is None:
+                        sanitized_file_bytes, removed_filter_count = (
+                            self._remove_filter_metadata(file_bytes)
+                        )
+                    if removed_filter_count == 0:
+                        raise
+                    read_bytes = sanitized_file_bytes
+                    header_row = self._detect_header_row(
+                        read_bytes, sheet, raise_errors=True
+                    )
+                    df = self._read_sheet(read_bytes, sheet, header_row)
+                    warning = (
+                        f"Ignored unsupported Excel filter metadata while reading "
+                        f"{file_name}:{sheet}."
+                    )
+                    logger.warning("[DataframeLoader] %s", warning)
+                    if report is not None and warning not in report.warnings:
+                        report.warnings.append(warning)
+
                 if report is not None:
                     report.source_sheets.append(sheet)
                     report.detected_header_rows[f"{file_name}:{sheet}"] = header_row
@@ -166,12 +202,6 @@ class DataframeLoaderTool(Tool):
                         "[DataframeLoader] sheet=%s: header detected at row %d, skipping %d leading row(s)",
                         sheet, header_row, header_row,
                     )
-                df = pd.read_excel(
-                    io.BytesIO(file_bytes),
-                    sheet_name=sheet,
-                    header=header_row,
-                    nrows=MAX_ROWS_PER_SHEET,
-                )
                 original_rows, original_columns = df.shape
                 df = self._clean_df(df)
                 if report is not None:
@@ -195,7 +225,60 @@ class DataframeLoaderTool(Tool):
         return dfs
 
     @staticmethod
-    def _detect_header_row(file_bytes: bytes, sheet: str, max_scan: int = 15) -> int:
+    def _read_sheet(file_bytes: bytes, sheet: str, header_row: int) -> pd.DataFrame:
+        return pd.read_excel(
+            io.BytesIO(file_bytes),
+            sheet_name=sheet,
+            header=header_row,
+            nrows=MAX_ROWS_PER_SHEET,
+        )
+
+    @staticmethod
+    def _is_unsupported_filter_error(exc: Exception) -> bool:
+        current: Optional[BaseException] = exc
+        while current is not None:
+            if _UNSUPPORTED_FILTER_VALUE_ERROR in str(current):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    @staticmethod
+    def _remove_filter_metadata(file_bytes: bytes) -> tuple[bytes, int]:
+        """Remove display-only filters from a temporary XLSX read copy."""
+        source = io.BytesIO(file_bytes)
+        output = io.BytesIO()
+        auto_filter_tag = f"{{{_SPREADSHEET_XML_NAMESPACE}}}autoFilter"
+        removed = 0
+
+        with zipfile.ZipFile(source, "r") as zin:
+            with zipfile.ZipFile(output, "w") as zout:
+                for item in zin.infolist():
+                    payload = zin.read(item.filename)
+                    is_filter_container = (
+                        item.filename.startswith("xl/worksheets/")
+                        or item.filename.startswith("xl/tables/")
+                    ) and item.filename.endswith(".xml")
+                    if is_filter_container and b"autoFilter" in payload:
+                        root = ElementTree.fromstring(payload)
+                        for parent in root.iter():
+                            for child in list(parent):
+                                if child.tag == auto_filter_tag:
+                                    parent.remove(child)
+                                    removed += 1
+                        payload = ElementTree.tostring(
+                            root, encoding="utf-8", xml_declaration=True
+                        )
+                    zout.writestr(item, payload)
+
+        return output.getvalue(), removed
+
+    @staticmethod
+    def _detect_header_row(
+        file_bytes: bytes,
+        sheet: str,
+        max_scan: int = 15,
+        raise_errors: bool = False,
+    ) -> int:
         """
         Detect the true header row index (0-based) for AI analysis.
 
@@ -220,6 +303,8 @@ class DataframeLoaderTool(Tool):
                 nrows=max_scan,
             )
         except Exception:
+            if raise_errors:
+                raise
             return 0
 
         if raw.empty:
