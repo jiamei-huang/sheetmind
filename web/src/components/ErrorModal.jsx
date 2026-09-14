@@ -5,7 +5,7 @@ import { AlertCircle } from "lucide-react";
  * 重要错误弹窗组件
  * 用于显示需要用户手动关闭的重要错误信息（如接口请求失败、上传失败等）
  */
-export default function ErrorModal({ message, onClose, title = "错误" }) {
+export default function ErrorModal({ message, onClose, title = "Error" }) {
   if (!message) {
     return null;
   }
@@ -28,7 +28,7 @@ export default function ErrorModal({ message, onClose, title = "错误" }) {
             onClick={onClose}
             className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-md transition-colors"
           >
-            确定
+            OK
           </button>
         </div>
       </div>

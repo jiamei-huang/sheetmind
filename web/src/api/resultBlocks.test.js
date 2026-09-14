@@ -74,7 +74,7 @@ test("uses backend output intent for Excel export classification", () => {
 test("rejects obsolete response shapes", () => {
   assert.throws(
     () => toAnalysisViewModel({ type: "data", data: {} }, "query"),
-    /无法识别/
+    /unrecognized analysis result/
   );
 });
 

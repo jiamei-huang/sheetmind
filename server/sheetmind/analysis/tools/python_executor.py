@@ -156,10 +156,10 @@ class PythonExecutorTool(Tool):
                 output_shape=(len(result_df), len(result_df.columns)),
             )
         except subprocess.TimeoutExpired:
-            return fail(f"执行超时（超过 {self.timeout} 秒），请简化查询或减少数据量。", "timeout")
+            return fail(f"Execution timed out after {self.timeout} seconds. Simplify the query or reduce the data size.", "timeout")
         except Exception as exc:
             logger.exception("[PythonExecutor] unexpected error: %s", exc)
-            return fail(f"执行过程中发生意外错误: {exc}", "runtime_error")
+            return fail(f"Unexpected error during execution: {exc}", "runtime_error")
         finally:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)

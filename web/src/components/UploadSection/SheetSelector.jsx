@@ -31,8 +31,8 @@ export default function SheetSelector({
     if (!projectId || !fileId || !fileName) {
       console.error("[SheetSelector] Missing projectId or fileName, cannot load preview");
       onShowErrorModal?.({
-        title: "预览失败",
-        message: "缺少项目ID或文件名，无法加载预览数据",
+        title: "Preview failed",
+        message: "Missing project ID or file name. The preview could not be loaded.",
       });
       return;
     }
@@ -66,8 +66,8 @@ export default function SheetSelector({
       } else {
         // 如果找不到对应的 sheet，显示错误
         onShowErrorModal?.({
-          title: "预览失败",
-          message: `未找到 Sheet "${sheetName}" 的预览数据`,
+          title: "Preview failed",
+          message: `No preview data was found for sheet "${sheetName}".`,
         });
       }
     } catch (error) {
@@ -76,9 +76,9 @@ export default function SheetSelector({
         error?.response?.data?.detail ||
         error?.response?.data?.message ||
         error?.message ||
-        "加载预览数据失败，请稍后重试";
+        "Could not load preview data. Please try again.";
       onShowErrorModal?.({
-        title: "预览失败",
+        title: "Preview failed",
         message: errorMessage,
       });
     } finally {

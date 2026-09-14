@@ -64,20 +64,20 @@ class FileUploader:
         suffix = Path(file_name).suffix.lower()
         if suffix not in SUPPORTED_EXCEL_EXTENSIONS:
             raise ValueError(
-                f"不支持文件“{file_name}”。当前仅支持 Excel 文件"
-                "（.xlsx、.xls）。"
+                f"Unsupported file \"{file_name}\". SheetMind currently supports Excel files only "
+                "(.xlsx, .xls)."
             )
         if not file_bytes:
-            raise ValueError(f"文件“{file_name}”为空，无法作为 Excel 工作簿上传。")
+            raise ValueError(f"File \"{file_name}\" is empty and cannot be uploaded as an Excel workbook.")
         try:
             with pd.ExcelFile(io.BytesIO(file_bytes)) as xls:
                 sheet_names = [str(sheet) for sheet in xls.sheet_names]
         except Exception as exc:
             raise ValueError(
-                f"文件“{file_name}”不是有效的 Excel 工作簿，或文件已损坏。"
+                f"File \"{file_name}\" is not a valid Excel workbook or may be corrupted."
             ) from exc
         if not sheet_names:
-            raise ValueError(f"Excel 文件“{file_name}”不包含任何 Sheet。")
+            raise ValueError(f"Excel file \"{file_name}\" does not contain any sheets.")
         return sheet_names
 
     def decode_base64_file(self, base64_data: str) -> bytes:

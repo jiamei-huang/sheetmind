@@ -81,6 +81,61 @@ logger = logging.getLogger(__name__)
 _MAX_TABLE_ROWS = 1000
 
 
+_DIRECT_WORKBOOK_EDIT_TERMS = (
+    "直接修改",
+    "直接改",
+    "改好",
+    "写回",
+    "写入",
+    "加好列",
+    "加公式",
+    "写公式",
+    "保存到excel",
+    "保存到 excel",
+    "保存回",
+    "下载改好",
+    "修改原",
+    "edit the workbook",
+    "edit original",
+    "modify the workbook",
+    "modify original",
+    "write back",
+    "save back",
+    "add a formula",
+    "insert formula",
+    "update the excel",
+    "change the excel",
+)
+
+
+def _requests_direct_workbook_edit(query: str) -> bool:
+    lowered = query.lower()
+    return any(term in lowered for term in _DIRECT_WORKBOOK_EDIT_TERMS)
+
+
+def _workbook_edit_boundary_result(query: str) -> ResultBlocks:
+    content = (
+        "I can't directly edit the original Excel workbook yet. "
+        "SheetMind works on a parsed data preview so the uploaded file stays unchanged.\n\n"
+        "I can help you design the transformation, calculate or preview the new column, "
+        "explain the formula logic, and export a clean result after review."
+    )
+    block = SummaryBlock(content=content)
+    return ResultBlocks(
+        status="success",
+        output_intents=["insight"],
+        questions=[
+            QuestionResult(
+                question_id="q1",
+                query=query,
+                status="success",
+                blocks=[block],
+            )
+        ],
+        blocks=[block],
+    )
+
+
 class SheetMindAgent:
     """
     Top-level orchestrator for one SheetMind analysis run.
@@ -223,8 +278,11 @@ class SheetMindAgent:
         # ----------------------------------------------------------------
         # 1. Routing classification
         # ----------------------------------------------------------------
+        if _requests_direct_workbook_edit(query):
+            return _workbook_edit_boundary_result(query), RoutingHint.INSIGHT_ONLY, MultiTurnMode.NEW_QUERY
+
         if emitter:
-            await emitter.emit_progress("正在理解您的问题...", step_id="routing")
+            await emitter.emit_progress("Understanding your question...", step_id="routing")
 
         normalized_query = await self.normalization_skill.run(ctx, query)
         try:
@@ -277,7 +335,7 @@ class SheetMindAgent:
             )
 
         if routing.structure.needs_semantic_planning and emitter:
-            await emitter.emit_progress("正在识别问题结构...", step_id="query_planning")
+            await emitter.emit_progress("Identifying the question structure...", step_id="query_planning")
         query_plan = await self.planning_skill.run(
             ctx,
             query,
@@ -415,7 +473,7 @@ class SheetMindAgent:
                     blocks=clarification_blocks,
                 )
                 return validate_result(clarification_result), hint, mode
-            error_msg = "数据查询执行失败。系统已记录失败阶段和数据来源，请检查计算详情后重试。"
+            error_msg = "The data query failed. The failed stage and data source were recorded for review."
             logger.warning("[Pipeline] planned execution failed for task=%s", ctx.task_id)
             status_block = StatusBlock(
                 status="failed",
@@ -461,7 +519,7 @@ class SheetMindAgent:
             if chart_df is None or chart_df.empty:
                 continue
             if emitter:
-                await emitter.emit_progress("正在生成图表...", step_id="chart_planning")
+                await emitter.emit_progress("Building the chart...", step_id="chart_planning")
             step_query = step.normalized_query or step.query
             result_field_map = await self.semantic_skill.run(ctx, step_query, df=chart_df)
             chart = await self.chart_skill.run(
@@ -479,7 +537,7 @@ class SheetMindAgent:
         # 6-7. Assemble a self-contained result for every sub-question.
         # ----------------------------------------------------------------
         if emitter:
-            await emitter.emit_progress("正在生成分析洞察...", step_id="insight_writing")
+            await emitter.emit_progress("Writing analysis insights...", step_id="insight_writing")
 
         question_ids = list(dict.fromkeys(
             step.question_id or step.step_id for step in query_plan.steps
@@ -524,7 +582,7 @@ class SheetMindAgent:
             if question_failed:
                 status_block = StatusBlock(
                     status="failed",
-                    message="该问题执行失败，其他问题的可用结果仍已保留。",
+                    message="This question failed. Available results for the other questions were preserved.",
                     error_code=(terminal_step.execution_report.error_code if terminal_step.execution_report else "execution_failed"),
                     details={"step_ids": [step.step_id for step in question_steps]},
                 )
@@ -540,7 +598,7 @@ class SheetMindAgent:
                         artifact_id=artifact_id,
                     )
                     if partial_table is not None:
-                        partial_table.title = f"{evidence_step.query}（中间结果）"
+                        partial_table.title = f"{evidence_step.query} (intermediate result)"
                         partial_table.calculation_basis = self._build_calculation_basis(
                             ctx,
                             evidence_step,
@@ -552,7 +610,7 @@ class SheetMindAgent:
             elif question_df is None or question_df.empty:
                 status_block = StatusBlock(
                     status="empty",
-                    message="本次查询没有匹配到数据。请检查筛选条件、币种或数据来源。",
+                    message="No data matched this query. Check the filters, currency, or data source.",
                     error_code="empty_result",
                     details={
                         "source_rows": terminal_step.execution_report.source_rows
@@ -645,7 +703,7 @@ class SheetMindAgent:
         )
 
         if emitter:
-            await emitter.emit_progress("正在校验结果...", step_id="validation")
+            await emitter.emit_progress("Validating results...", step_id="validation")
         result = validate_result(result, degrade_invalid_charts=True)
 
         return result, hint, mode
@@ -703,7 +761,7 @@ class SheetMindAgent:
             if not selected_files:
                 if emitter:
                     await emitter.emit_progress(
-                        f"正在为“{step.query[:24]}”选择数据源...",
+                        f"Selecting a data source for \"{step.query[:24]}\"...",
                         step_id="sheet_selection",
                     )
                 try:
@@ -763,7 +821,7 @@ class SheetMindAgent:
 
             try:
                 if emitter:
-                    await emitter.emit_progress("正在加载数据...", step_id="data_loading")
+                    await emitter.emit_progress("Loading data...", step_id="data_loading")
                 load_report = self.df_loader.run(
                     ctx,
                     selected_files=selected_files,
@@ -947,7 +1005,7 @@ class SheetMindAgent:
 
             if emitter:
                 await emitter.emit_progress(
-                    f"正在执行第 {index}/{len(plan.steps)} 步...",
+                    f"Running step {index}/{len(plan.steps)}...",
                     step_id="execution",
                 )
 
@@ -968,7 +1026,7 @@ class SheetMindAgent:
                 continue
 
             if emitter:
-                await emitter.emit_progress("正在识别字段类型...", step_id="semantic_typing")
+                await emitter.emit_progress("Detecting field types...", step_id="semantic_typing")
             field_map = await self.semantic_skill.run(ctx, step_query, df=input_df)
             decisions = FieldResolver().decide_all(
                 step_query,
@@ -1015,7 +1073,7 @@ class SheetMindAgent:
                 )
 
             if emitter:
-                await emitter.emit_progress("正在生成数据画像...", step_id="data_profiling")
+                await emitter.emit_progress("Profiling the data...", step_id="data_profiling")
             data_summary = await self.profiling_skill.run(
                 ctx,
                 step_query,
@@ -1578,10 +1636,10 @@ class SheetMindAgent:
                 continue
             seen.add(key)
             if status == "needs_clarification":
-                message = f"“{record.reference}”可能对应多个字段，请选择后继续。"
+                message = f"\"{record.reference}\" may match multiple fields. Choose one to continue."
             else:
                 message = (
-                    f"本次推测使用列“{record.selected_column}”（{record.reason}）。"
+                    f"Assumed column \"{record.selected_column}\" for this run ({record.reason})."
                 )
             blocks.append(FieldResolutionBlock(
                 reference=record.reference,
@@ -1606,21 +1664,21 @@ class SheetMindAgent:
         ] or list(ctx.selected_sheets)
         if decision.reason == "no sheets are checked for analysis":
             message = (
-                "当前没有勾选任何数据工作表。"
-                "请先在 Import Your Data 中勾选至少一个 Sheet，再重新提交问题。"
+                "No data sheets are selected. "
+                "Select at least one sheet in Import Your Data, then submit the question again."
             )
         elif decision.status == "scope_conflict":
             candidate = decision.candidates[0]
             message = (
-                "当前勾选范围内没有合适的数据源。"
-                f"“{candidate.file_name} / {candidate.sheet_name}”更匹配这个问题。"
-                "请先在 Import Your Data 中勾选该 Sheet，再重新提交问题；系统不会读取未勾选的数据。"
+                "The selected scope does not contain the best data source. "
+                f"\"{candidate.file_name} / {candidate.sheet_name}\" is a better match. "
+                "Select that sheet in Import Your Data and submit the question again. SheetMind will not read unselected data."
             )
         else:
             message = (
-                "多个已勾选的数据源都能回答这个问题。"
-                "请在 Import Your Data 中只保留要使用的文件与 Sheet，"
-                "或在问题中明确写出文件名和 Sheet 名后重新提交。"
+                "Multiple selected data sources could answer this question. "
+                "Keep only the intended files and sheets selected in Import Your Data, "
+                "or include the file and sheet name in the question before submitting again."
             )
         return SheetResolutionBlock(
             status=decision.status,
@@ -1807,7 +1865,7 @@ class SheetMindAgent:
     ) -> tuple:
         """Render a chart from the last table result without rerunning codegen."""
         if emitter:
-            await emitter.emit_progress("正在基于上一次结果生成图表...", step_id="chart_planning")
+            await emitter.emit_progress("Building a chart from the previous result...", step_id="chart_planning")
 
         field_map = await self.semantic_skill.run(ctx, query, df=previous_result_df)
         step = (
@@ -1863,7 +1921,7 @@ class SheetMindAgent:
         if chart_block is None:
             status_block = StatusBlock(
                 status="failed",
-                message="上一次结果缺少可绘制的维度或数值字段。",
+                message="The previous result does not contain drawable dimension or numeric fields.",
                 error_code="chart_not_supported",
             )
             question = QuestionResult(
@@ -1882,7 +1940,7 @@ class SheetMindAgent:
             return result, hint, mode
 
         if emitter:
-            await emitter.emit_progress("正在生成分析洞察...", step_id="insight_writing")
+            await emitter.emit_progress("Writing analysis insights...", step_id="insight_writing")
 
         question_id = step.question_id if step else "q1"
         artifact_id = self.artifact_store.save(
@@ -2087,21 +2145,21 @@ class SheetMindAgent:
         fields = fields[:12]
 
         operation_labels = {
-            "filter": "筛选",
-            "keyword_filter": "筛选",
-            "date_filter": "日期筛选",
-            "aggregate": "分组汇总",
-            "aggregation": "分组汇总",
-            "groupby": "分组汇总",
-            "which": "分组比较",
-            "extreme": "极值比较",
-            "sort": "排序",
-            "top_n": "Top N 筛选",
-            "trend": "趋势计算",
-            "pivot": "透视汇总",
-            "compare": "对比",
-            "chart_data_prep": "生成图表",
-            "complex_transform": "数据处理",
+            "filter": "filtering",
+            "keyword_filter": "filtering",
+            "date_filter": "date filtering",
+            "aggregate": "grouped aggregation",
+            "aggregation": "grouped aggregation",
+            "groupby": "grouped aggregation",
+            "which": "group comparison",
+            "extreme": "extreme value comparison",
+            "sort": "sorting",
+            "top_n": "Top N filtering",
+            "trend": "trend calculation",
+            "pivot": "pivot-style aggregation",
+            "compare": "comparison",
+            "chart_data_prep": "chart data preparation",
+            "complex_transform": "data processing",
         }
         operations: List[str] = []
         executed_operations = report.operations if report and report.operations else step.operation_intents
@@ -2110,17 +2168,17 @@ class SheetMindAgent:
             if label and label not in operations:
                 operations.append(label)
         if from_previous_result:
-            operations.insert(0, "复用上一轮结果")
-        operations = list(dict.fromkeys(operations)) or ["数据处理"]
+            operations.insert(0, "previous result reuse")
+        operations = list(dict.fromkeys(operations)) or ["data processing"]
 
-        source_text = "、".join(f"「{item}」" for item in source_sheets) or "当前所选工作表"
-        field_text = "、".join(f"「{item}」" for item in fields) or "结果字段"
-        operation_text = "、".join(operations)
+        source_text = ", ".join(f"\"{item}\"" for item in source_sheets) or "the selected sheets"
+        field_text = ", ".join(f"\"{item}\"" for item in fields) or "result fields"
+        operation_text = ", ".join(operations)
         return CalculationBasis(
             source_sheets=source_sheets,
             fields=fields,
             operations=operations,
-            summary=f"基于 {source_text}，使用 {field_text}，执行{operation_text}。",
+            summary=f"Based on {source_text}, using {field_text}, with {operation_text}.",
         )
 
     @staticmethod

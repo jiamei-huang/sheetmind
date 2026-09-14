@@ -20,7 +20,7 @@ const legacyTextResult = (prompt, message) => {
   suggestion: failed ? "" : message.content ?? "",
   status: failed ? "failed" : "success",
   statusMessages: failed
-    ? [{ kind: "status", status: "failed", message: message.content ?? "分析执行失败。" }]
+    ? [{ kind: "status", status: "failed", message: message.content ?? "Analysis failed." }]
     : [],
   summaryItems: [],
   questionResults: [],

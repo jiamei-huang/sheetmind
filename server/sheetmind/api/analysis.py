@@ -81,7 +81,7 @@ async def _run_stream(
         conversations.add_message(
             request.taskId,
             "assistant",
-            "分析执行中断，请重新提交该问题。",
+            "Analysis was interrupted. Submit the question again.",
             metadata={"runId": run_id, "status": "failed"},
         )
         if not emitter.is_closed:
@@ -138,7 +138,7 @@ async def analyze(request: Request, payload: AnalyzeRequest) -> dict:
         conversations.add_message(
             payload.taskId,
             "assistant",
-            "分析执行中断，请重新提交该问题。",
+            "Analysis was interrupted. Submit the question again.",
             metadata={"runId": run_id, "status": "failed"},
         )
         raise

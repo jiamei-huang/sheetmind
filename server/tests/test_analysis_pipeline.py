@@ -1780,8 +1780,8 @@ class TestInsightWritingSkill:
             None,
         )
 
-        assert "逐币种回答" in prompt
-        assert "全局最高" in prompt
+        assert "Answer per currency" in prompt
+        assert "global highest" in prompt
 
     def test_multi_result_prompt_contains_every_question_and_computed_result(self):
         router = MockRouter("已逐项回答。")
@@ -1803,7 +1803,7 @@ class TestInsightWritingSkill:
         ))
 
         prompt = router._mock.requests[0]["messages"][0]["content"]
-        assert "必须逐项回答全部2个子问题" in prompt
+        assert "Answer all 2 sub-questions in English" in prompt
         assert "哪个物流商花费最多" in prompt
         assert "A物流" in prompt
         assert "哪个店铺物流费用最贵" in prompt
@@ -1822,8 +1822,8 @@ class TestInsightWritingSkill:
             result_sets=result_sets,
         )
 
-        assert "1. 物流商问题：物流商=A物流，费用=30.0" in summary
-        assert "2. 店铺问题：店铺=乐天，费用=20.0" in summary
+        assert "1. 物流商问题: 物流商=A物流, 费用=30.0" in summary
+        assert "2. 店铺问题: 店铺=乐天, 费用=20.0" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -3369,7 +3369,7 @@ class TestSheetMindAgentPipeline:
         assert result.has_chart
         assert result.has_table
         assert result.first_table().calculation_basis is not None
-        assert "复用上一轮结果" in result.first_table().calculation_basis.operations
+        assert "previous result reuse" in result.first_table().calculation_basis.operations
         assert agent.df_loader.run.call_count == 0
         assert agent.repair_loop.run.await_count == 0
 
@@ -3935,7 +3935,7 @@ class TestDataSourceSelection:
             "sheets": ["尾程"],
         }]
 
-        with pytest.raises(ToolError, match="未勾选"):
+        with pytest.raises(ToolError, match="not selected"):
             DataframeLoaderTool().run(
                 ctx,
                 selected_files=[{

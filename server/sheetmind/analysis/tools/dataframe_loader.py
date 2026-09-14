@@ -89,7 +89,7 @@ class DataframeLoaderTool(Tool):
 
         if not selected_files:
             raise ToolError(
-                "没有选中任何文件，无法加载数据。",
+                "No files are selected, so data cannot be loaded.",
                 retryable=False,
             )
 
@@ -139,7 +139,7 @@ class DataframeLoaderTool(Tool):
 
         if not all_dfs:
             raise ToolError(
-                "文件加载失败：未能读取到有效数据。",
+                "File loading failed: no valid data could be read.",
                 detail=f"Tried files: {[f.get('fileName') for f in selected_files]}",
             )
 
@@ -171,7 +171,7 @@ class DataframeLoaderTool(Tool):
         requested = ctx.requested_sheet_scope
         if not requested:
             raise ToolError(
-                "没有勾选任何工作表，无法读取或处理数据。",
+                "No sheets are selected, so data cannot be read or processed.",
                 retryable=False,
             )
 
@@ -200,7 +200,8 @@ class DataframeLoaderTool(Tool):
 
         if violations:
             raise ToolError(
-                "以下数据源未勾选，系统不会读取：" + "、".join(violations),
+                "The following data sources are not selected, so SheetMind will not read them: "
+                + ", ".join(violations),
                 retryable=False,
             )
 
@@ -221,7 +222,7 @@ class DataframeLoaderTool(Tool):
             xls = pd.ExcelFile(io.BytesIO(file_bytes))
         except Exception as exc:
             raise ToolError(
-                f"Excel 文件解析失败：{file_name}",
+                f"Excel parsing failed: {file_name}",
                 detail=str(exc),
             ) from exc
 
@@ -442,7 +443,7 @@ class DataframeLoaderTool(Tool):
             return dfs[0]
         if merge_strategy != "union":
             raise ToolError(
-                "多个工作表不能自动拼接。请分别提问，或明确说明需要纵向合并。",
+                "Multiple sheets cannot be combined automatically. Ask about them separately or explicitly request vertical stacking.",
                 retryable=False,
             )
 
@@ -450,7 +451,7 @@ class DataframeLoaderTool(Tool):
         schemas = [tuple(column for column in df.columns if column not in source_columns) for df in dfs]
         if len(set(schemas)) != 1:
             raise ToolError(
-                "所选工作表字段结构不同，不能直接纵向合并；请说明关联字段或分别分析。",
+                "The selected sheets have different field structures and cannot be stacked directly. Specify join keys or analyze them separately.",
                 retryable=False,
             )
         return pd.concat(dfs, ignore_index=True)

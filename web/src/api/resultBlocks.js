@@ -5,7 +5,7 @@ const DEFAULT_PALETTE = DATA_VIZ_COLORS;
 
 export const toAnalysisViewModel = (payload, prompt) => {
   if (payload?.type !== "result_blocks" || !Array.isArray(payload.blocks)) {
-    throw new Error("后端返回了无法识别的分析结果。请刷新页面后重试。");
+    throw new Error("The backend returned an unrecognized analysis result. Refresh the page and try again.");
   }
 
   const tables = payload.blocks.filter((block) => block.kind === "table");
@@ -66,7 +66,7 @@ export const toAnalysisViewModel = (payload, prompt) => {
           : "Insight";
   const totalRows = table?.total_rows ?? table?.rows?.length ?? 0;
   const previews = tables.map((tableBlock, index) => ({
-    title: tableBlock.title || `结果 ${index + 1}`,
+    title: tableBlock.title || `Result ${index + 1}`,
     columns: tableBlock.columns ?? [],
     rows: tableBlock.rows ?? [],
     totalRowCount: tableBlock.total_rows ?? tableBlock.rows?.length ?? 0,
@@ -76,7 +76,7 @@ export const toAnalysisViewModel = (payload, prompt) => {
     previewRowCount: tableBlock.preview_row_count ?? tableBlock.rows?.length ?? 0,
   }));
   const chartDatas = charts.map((chartBlock, index) => ({
-    title: chartBlock.title || `图表 ${index + 1}`,
+    title: chartBlock.title || `Chart ${index + 1}`,
     defaultType: chartBlock.chart_type ?? "bar",
     labels: chartBlock.labels ?? [],
     series: chartBlock.series ?? [],
@@ -114,7 +114,7 @@ export const toAnalysisViewModel = (payload, prompt) => {
     sheetResolutions,
     runtimeNote:
       table && table.rows.length < totalRows
-        ? `前端仅展示 ${table.rows.length.toLocaleString()} 行预览，后端已处理 ${totalRows.toLocaleString()} 行。`
+        ? `Showing ${table.rows.length.toLocaleString()} preview rows. The backend processed ${totalRows.toLocaleString()} rows.`
         : "",
     previews,
     preview: previews[0] ?? null,

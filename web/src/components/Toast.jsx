@@ -111,7 +111,7 @@ export default function Toast({
           {/* 关闭按钮 */}
           <button
             type="button"
-            aria-label="关闭提示"
+            aria-label="Dismiss notification"
             onClick={onDismiss}
             className="flex-shrink-0 text-slate-400 hover:text-slate-600 transition-colors p-1 -mr-1"
           >

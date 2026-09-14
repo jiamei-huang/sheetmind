@@ -3,11 +3,11 @@ SheetMind Runtime — SSE Streaming Emitter
 =============================================
 Implements the five SSE event types defined in the spec (§7):
 
-  thinking   — initial status, shown immediately ("正在分析您的问题...")
-  progress   — intermediate step updates ("正在执行数据查询...")
-  repairing  — repair loop triggered ("修复执行错误，重试中...")
+  thinking   — initial status, shown immediately ("Analyzing your question...")
+  progress   — intermediate step updates ("Running the data query...")
+  repairing  — repair loop triggered ("Fixing an execution error and retrying...")
   done       — final result (contains the full ResultBlocks payload)
-  error      — analysis failed ("分析未能完成，请重试。")
+  error      — analysis failed ("Analysis could not be completed. Please try again.")
 
 Wire format: standard Server-Sent Events
   data: {"event": "thinking", "message": "..."}\n\n
@@ -16,7 +16,7 @@ Usage inside SheetMindAgent:
     emitter = StreamEmitter()
     # pass emitter into skills so they can emit progress
     await emitter.emit_thinking()
-    await emitter.emit_progress("正在执行数据查询...")
+    await emitter.emit_progress("Running the data query...")
     await emitter.emit_done(result_dict)
 
 Usage in FastAPI endpoint:
@@ -46,7 +46,7 @@ def _sse_frame(event: str, **payload: Any) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def thinking_frame(message: str = "正在分析您的问题...") -> str:
+def thinking_frame(message: str = "Analyzing your question...") -> str:
     return _sse_frame("thinking", message=message)
 
 
@@ -57,7 +57,7 @@ def progress_frame(message: str, step_id: Optional[str] = None) -> str:
     return _sse_frame("progress", **payload)
 
 
-def repairing_frame(message: str = "修复执行错误，重试中...") -> str:
+def repairing_frame(message: str = "Fixing an execution error and retrying...") -> str:
     return _sse_frame("repairing", message=message)
 
 
@@ -65,7 +65,7 @@ def done_frame(result: Dict[str, Any]) -> str:
     return _sse_frame("done", result=result)
 
 
-def error_frame(message: str = "分析未能完成，请重试。") -> str:
+def error_frame(message: str = "Analysis could not be completed. Please try again.") -> str:
     return _sse_frame("error", message=message)
 
 
@@ -97,20 +97,20 @@ class StreamEmitter:
         if not self._closed:
             await self._queue.put(frame)
 
-    async def emit_thinking(self, message: str = "正在分析您的问题...") -> None:
+    async def emit_thinking(self, message: str = "Analyzing your question...") -> None:
         await self.emit(thinking_frame(message))
 
     async def emit_progress(self, message: str, step_id: Optional[str] = None) -> None:
         await self.emit(progress_frame(message, step_id=step_id))
 
-    async def emit_repairing(self, message: str = "修复执行错误，重试中...") -> None:
+    async def emit_repairing(self, message: str = "Fixing an execution error and retrying...") -> None:
         await self.emit(repairing_frame(message))
 
     async def emit_done(self, result: Dict[str, Any]) -> None:
         await self.emit(done_frame(result))
         await self._close()
 
-    async def emit_error(self, message: str = "分析未能完成，请重试。") -> None:
+    async def emit_error(self, message: str = "Analysis could not be completed. Please try again.") -> None:
         await self.emit(error_frame(message))
         await self._close()
 

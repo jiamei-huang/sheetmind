@@ -169,7 +169,7 @@ function AIDataAnalysis({
     const preview = result?.previews?.[previewIndex ?? targetTask?.activePreviewIndex ?? 0]
       ?? result?.preview;
     if (!preview?.columns?.length) {
-      onShowToast?.({ title: "导出失败", message: "无表格数据可导出", type: "error" });
+      onShowToast?.({ title: "Export failed", message: "No table data is available to export.", type: "error" });
       return;
     }
 
@@ -182,10 +182,10 @@ function AIDataAnalysis({
           `analysis-data-${taskId}-${resolvedResultIndex + 1}`
         );
       }
-      onShowToast?.({ title: "导出成功", message: "计算结果已下载为 Excel", type: "success", autoClose: true });
+      onShowToast?.({ title: "Export complete", message: "The calculated result was downloaded as Excel.", type: "success", autoClose: true });
     } catch (err) {
       console.error("[Export Table]", err);
-      onShowToast?.({ title: "导出失败", message: err?.message || "导出数据时出错", type: "error" });
+      onShowToast?.({ title: "Export failed", message: err?.message || "Something went wrong while exporting data.", type: "error" });
     }
   }, [onShowToast, effectiveTasks]);
 
@@ -212,17 +212,17 @@ function AIDataAnalysis({
       const idx = resultIndex ?? results.length - 1;
       const result = results[idx] ?? null;
       if (!result?.chartData) {
-        onShowToast?.({ title: "导出失败", message: "无图表数据可导出", type: "error" });
+        onShowToast?.({ title: "Export failed", message: "No chart data is available to export.", type: "error" });
         return;
       }
       const chartData = result.chartDatas?.[chartIndex] ?? result.chartData;
 
       try {
-        onShowToast?.({ title: "导出中", message: "正在生成图表图片...", type: "info", autoClose: true });
+        onShowToast?.({ title: "Exporting", message: "Generating chart image...", type: "info", autoClose: true });
 
         const container = chartContainerRefs.current[`${taskId}-${idx}`];
         if (!container) {
-          onShowToast?.({ title: "导出失败", message: "无法定位图表区域，请稍后重试", type: "error" });
+          onShowToast?.({ title: "Export failed", message: "Could not locate the chart area. Please try again.", type: "error" });
           return;
         }
         const { default: html2canvas } = await import("html2canvas");
@@ -237,10 +237,10 @@ function AIDataAnalysis({
         link.href = dataUrl;
         link.download = `chart-${taskId}-${idx}.png`;
         link.click();
-        onShowToast?.({ title: "导出成功", message: "图表图片已下载", type: "success", autoClose: true });
+        onShowToast?.({ title: "Export complete", message: "The chart image was downloaded.", type: "success", autoClose: true });
       } catch (err) {
         console.error("[Export Image]", err);
-        onShowToast?.({ title: "导出失败", message: err?.message || "生成图片时出错", type: "error" });
+        onShowToast?.({ title: "Export failed", message: err?.message || "Something went wrong while generating the image.", type: "error" });
       }
     },
     [onShowToast, effectiveTasks]
@@ -255,16 +255,16 @@ function AIDataAnalysis({
       const chartData = result?.chartDatas?.[chartIndex]
         ?? result?.chartData;
       if (!chartData?.labels?.length || !chartData.series?.length) {
-        onShowToast?.({ title: "导出失败", message: "无图表数据可导出", type: "error" });
+        onShowToast?.({ title: "Export failed", message: "No chart data is available to export.", type: "error" });
         return;
       }
 
       try {
         await downloadChartDataAsExcel(chartData, `chart-data-${taskId}-${idx}`);
-        onShowToast?.({ title: "导出成功", message: "图表数据已下载为 Excel", type: "success", autoClose: true });
+        onShowToast?.({ title: "Export complete", message: "The chart data was downloaded as Excel.", type: "success", autoClose: true });
       } catch (err) {
         console.error("[Export Data]", err);
-        onShowToast?.({ title: "导出失败", message: err?.message || "导出数据时出错", type: "error" });
+        onShowToast?.({ title: "Export failed", message: err?.message || "Something went wrong while exporting data.", type: "error" });
       }
     },
     [onShowToast, effectiveTasks]
@@ -295,8 +295,8 @@ function AIDataAnalysis({
     if (!task) {
       console.error("[AIDataAnalysis] No task found, cannot proceed with analysis");
       onShowErrorModal?.({
-        message: "未找到任务，请先创建任务",
-        title: "任务错误",
+        message: "No task was found. Create a task first.",
+        title: "Task error",
       });
       return;
     }
@@ -310,8 +310,8 @@ function AIDataAnalysis({
     if (!ready) {
       // 轻量提示：使用Toast（自动关闭）
       onShowToast?.({
-        title: "缺少必要信息",
-        message: "请先上传Excel文件并选择至少一个Sheet",
+        title: "Missing information",
+        message: "Upload an Excel file and select at least one sheet first.",
         type: "info",
         autoClose: true,
       });
@@ -322,7 +322,7 @@ function AIDataAnalysis({
     if (!trimmedPrompt) {
       // 轻量提示：使用Toast（自动关闭）
       onShowToast?.({
-        message: "请输入要处理或分析的内容描述",
+        message: "Enter what you want to analyze or clean.",
         type: "info",
         autoClose: true,
       });
@@ -344,7 +344,7 @@ function AIDataAnalysis({
       )
     );
     setIsAnalyzing(true);
-    setProgressMsg("正在准备分析...");
+    setProgressMsg("Preparing analysis...");
     setProgressSteps([]);
 
     let currentTaskId = taskId;
@@ -370,8 +370,8 @@ function AIDataAnalysis({
 
         if (!currentProjectId) {
           onShowErrorModal?.({
-            message: "项目ID缺失，无法创建任务。请确保已上传Excel文件。",
-            title: "任务错误",
+            message: "Project ID is missing. Make sure an Excel file has been uploaded.",
+            title: "Task error",
           });
           return;
         }
@@ -382,8 +382,8 @@ function AIDataAnalysis({
           console.error("[AIDataAnalysis] uploadedFile:", uploadedFile);
           console.error("[AIDataAnalysis] activeProjectId from props:", activeProjectId);
           onShowErrorModal?.({
-            message: `当前项目不是后端项目（项目ID: ${currentProjectId}），无法创建任务。请先上传Excel文件创建项目。如果已上传，请刷新页面。`,
-            title: "任务错误",
+            message: `The current project is not ready for analysis (project ID: ${currentProjectId}). Upload an Excel file to create a project. If you already uploaded one, refresh the page.`,
+            title: "Task error",
           });
           return;
         }
@@ -413,8 +413,8 @@ function AIDataAnalysis({
         } catch (createError) {
           console.error("[AIDataAnalysis] Error creating backend task:", createError);
           onShowErrorModal?.({
-            message: `创建任务失败：${createError?.response?.data?.detail || createError?.message || "未知错误"}`,
-            title: "任务创建失败",
+            message: `Could not create the task: ${createError?.response?.data?.detail || createError?.message || "Unknown error"}`,
+            title: "Task creation failed",
           });
           return;
         }
@@ -423,8 +423,8 @@ function AIDataAnalysis({
       if (!actualTaskId) {
         // 重要错误：使用弹窗（手动关闭）
         onShowErrorModal?.({
-          message: "任务ID缺失，请先创建任务",
-          title: "任务错误",
+          message: "Task ID is missing. Create a task first.",
+          title: "Task error",
         });
         return;
       }
@@ -495,8 +495,8 @@ function AIDataAnalysis({
 
       // 轻量提示：使用Toast（自动关闭）
       onShowToast?.({
-        title: "分析完成",
-        message: "预览已就绪，可以查看结果",
+        title: "Analysis complete",
+        message: "The preview is ready.",
         type: "success",
         autoClose: true,
       });
@@ -518,7 +518,7 @@ function AIDataAnalysis({
       // 重要错误：使用弹窗（手动关闭）
       onShowErrorModal?.({
         message,
-        title: "分析未完成",
+        title: "Analysis incomplete",
       });
     } finally {
       setIsAnalyzing(false);
@@ -591,8 +591,8 @@ function AIDataAnalysis({
       setIsConfirmDiscardOpen(false);
       setConfirmDiscardTaskId(null);
       onShowToast?.({
-        title: "任务已删除",
-        message: "任务已成功删除",
+        title: "Task deleted",
+        message: "The task was deleted.",
         type: "info",
         autoClose: true,
       });
@@ -616,8 +616,8 @@ function AIDataAnalysis({
       setRenameTaskId(null);
       setRenameTaskTitle("");
       onShowToast?.({
-        title: "重命名成功",
-        message: "任务名称已更新",
+        title: "Renamed",
+        message: "The task name was updated.",
         type: "success",
         autoClose: true,
       });
@@ -635,8 +635,8 @@ function AIDataAnalysis({
       setIsDeleteModalOpen(false);
       setDeleteTaskId(null);
       onShowToast?.({
-        title: "删除成功",
-        message: "任务已成功删除",
+        title: "Deleted",
+        message: "The task was deleted.",
         type: "info",
         autoClose: true,
       });

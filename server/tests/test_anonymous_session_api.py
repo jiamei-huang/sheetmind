@@ -135,7 +135,7 @@ def test_unsupported_uploads_are_rejected_before_project_creation(tmp_path, monk
             projects = await client.get("/api/projects")
 
         assert [response.status_code for response in responses] == [400, 400]
-        assert all(".xlsx、.xls" in response.json()["detail"] for response in responses)
+        assert all(".xlsx, .xls" in response.json()["detail"] for response in responses)
         assert projects.json() == {"projects": []}
 
     run_async(scenario())
@@ -171,7 +171,7 @@ def test_excel_extension_with_invalid_content_is_not_stored(tmp_path, monkeypatc
             files = await client.get(f"/api/files/project/{project_id}")
 
         assert response.status_code == 400
-        assert "有效的 Excel" in response.json()["detail"]
+        assert "valid Excel" in response.json()["detail"]
         assert files.json()["files"] == []
 
     run_async(scenario())

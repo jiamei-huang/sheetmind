@@ -70,7 +70,7 @@ export default function SheetPreviewModal({ sheetName, columns = [], rows = [], 
               ) : (
                 <tr>
                   <td colSpan={columns.length} className="px-4 py-8 text-center text-slate-500">
-                    暂无数据
+                    No data
                   </td>
                 </tr>
               )}

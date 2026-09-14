@@ -40,13 +40,15 @@ class InsightWritingSkill(Skill):
     description = "Generate natural-language insight text using LLM"
 
     _SYSTEM_PROMPT = (
-        "你是一个专业的数据分析文本生成专家。\n\n"
-        "【输出原则】\n"
-        "1. 语言专业、简洁、有针对性\n"
-        "2. 基于实际数据，避免空泛描述\n"
-        "3. 突出关键发现和变化\n"
-        "4. 使用简洁 Markdown 排版，只允许短标题、段落、编号或项目列表；禁止代码和原始 HTML\n"
-        "5. 每段只表达一个要点，避免把多个结论挤在同一个长段落中\n"
+        "You are a professional data analysis writer for SheetMind.\n\n"
+        "Output rules:\n"
+        "1. Always write user-facing prose in English.\n"
+        "2. Keep original column names, sheet names, and data values unchanged, even when they are not English.\n"
+        "3. Be concise, specific, and grounded only in the computed data.\n"
+        "4. Highlight the key finding, change, or risk instead of giving generic commentary.\n"
+        "5. Use concise Markdown with short headings, paragraphs, numbered lists, or bullets only. Do not output code or raw HTML.\n"
+        "6. Use one main idea per paragraph.\n"
+        "7. If the user asks to directly edit, save back, or write formulas into the original Excel workbook, state that SheetMind cannot directly edit the original workbook yet, then offer to design the transformation, preview the result, or export a clean table.\n"
     )
 
     async def run(
@@ -114,26 +116,26 @@ class InsightWritingSkill(Skill):
         if result_df is not None and not result_df.empty:
             try:
                 data_str = (
-                    "\n\n计算结果：\n"
+                    "\n\nComputed result:\n"
                     + result_df.to_string(index=False, max_cols=10, max_rows=200)
                 )
             except Exception:
-                data_str = f"\n\n列名：{cols}，共 {rows} 行"
+                data_str = f"\n\nColumns: {cols}, rows: {rows}"
 
         currency_instruction = ""
         if InsightWritingSkill._currency_column(result_df) is not None:
             currency_instruction = (
-                "\n结果按币种分区，必须逐币种回答；不同币种金额不可直接比较，"
-                "不得声称存在一个全局最高平台或计算跨币种总计。"
+                "\nThe result is partitioned by currency. Answer per currency. "
+                "Do not compare raw amounts across currencies, claim a global highest platform, or compute cross-currency totals."
             )
 
         return (
-            f"用户查询：{query}\n"
-            f"处理结果：{rows} 行，列：{cols}"
-            f"\n\n已计算事实：\n{InsightWritingSkill._facts_block(result_df)}"
+            f"User query: {query}\n"
+            f"Processed result: {rows} rows, columns: {cols}"
+            f"\n\nComputed facts:\n{InsightWritingSkill._facts_block(result_df)}"
             f"{data_str}{currency_instruction}\n\n"
-            "请严格根据上方实际数据，用一句话（20-50字）说明关键发现（如谁最高/最低），"
-            "禁止引用数据中不存在的名称。"
+            "Write one concise English sentence explaining the key finding, such as the highest or lowest item. "
+            "Only mention names that appear in the computed data."
         )
 
     @staticmethod
@@ -147,25 +149,25 @@ class InsightWritingSkill(Skill):
         for index, (subquery, result_df) in enumerate(included_results, start=1):
             try:
                 data = (
-                    "无结果"
+                    "No result"
                     if result_df.empty
                     else result_df.to_string(index=False, max_cols=10, max_rows=max_rows)
                 )
             except Exception:
-                data = f"列名：{list(result_df.columns)}，共 {len(result_df)} 行"
+                data = f"Columns: {list(result_df.columns)}, rows: {len(result_df)}"
             sections.append(
-                f"子问题{index}：{subquery}\n"
-                f"已计算事实：\n{InsightWritingSkill._facts_block(result_df)}\n"
-                f"计算结果：\n{data}"
+                f"Sub-question {index}: {subquery}\n"
+                f"Computed facts:\n{InsightWritingSkill._facts_block(result_df)}\n"
+                f"Computed result:\n{data}"
             )
 
         count = len(sections)
         return (
-            f"用户完整查询：{query}\n\n"
+            f"Full user query: {query}\n\n"
             + "\n\n".join(sections)
-            + f"\n\n必须逐项回答全部{count}个子问题，不得遗漏任何一项。"
-            "按原顺序使用“1. …”“2. …”编号，每项直接给出名称和对应数值；"
-            "只允许使用该子问题下的计算结果，禁止串用其他子问题的字段或数据。"
+            + f"\n\nAnswer all {count} sub-questions in English and do not skip any. "
+            "Use numbered items in the original order. Each item should directly give the relevant name and value. "
+            "Use only the computed result under that sub-question."
         )
 
     @staticmethod
@@ -196,24 +198,24 @@ class InsightWritingSkill(Skill):
         # Auto-unit detection
         unit = ""
         if max_val >= 10000:
-            unit = "（单位可能为元）"
+            unit = "(unit may be currency)"
         elif max_val < 1 and max_val > 0:
-            unit = "（可能为比例/百分比）"
+            unit = "(may be a ratio or percentage)"
 
         return (
-            f"图表类型：{chart.chart_type}\n"
-            f"X轴：{chart.x_axis_label or '类别'} | Y轴：{chart.y_axis_label or '数值'}\n"
-            f"标签数量：{len(chart.labels)} | 系列数量：{len(chart.series)}\n"
-            f"Y轴范围：最大={max_val:.2f}，最小={min_val:.2f}，均值={avg_val:.2f} {unit}\n"
-            f"最高值标签：{max_label} | 最低值标签：{min_label}\n"
-            f"已计算事实：\n{InsightWritingSkill._facts_block(result_df)}\n"
-            f"用户查询：{query}\n\n"
-            "请用以下 Markdown 格式输出图表洞察（100-300字），不要使用 emoji：\n"
-            "### 关键结论\n\n"
-            "- **最高值：** ...\n"
-            "- **最低值：** ...\n\n"
-            "### 分析\n\n"
-            "用一到两个短段落解释差异、占比或趋势。"
+            f"Chart type: {chart.chart_type}\n"
+            f"X-axis: {chart.x_axis_label or 'Category'} | Y-axis: {chart.y_axis_label or 'Value'}\n"
+            f"Label count: {len(chart.labels)} | Series count: {len(chart.series)}\n"
+            f"Y-axis range: max={max_val:.2f}, min={min_val:.2f}, avg={avg_val:.2f} {unit}\n"
+            f"Highest label: {max_label} | Lowest label: {min_label}\n"
+            f"Computed facts:\n{InsightWritingSkill._facts_block(result_df)}\n"
+            f"User query: {query}\n\n"
+            "Write chart insight in English using this Markdown format. Do not use emoji:\n"
+            "### Key Takeaways\n\n"
+            "- **Highest:** ...\n"
+            "- **Lowest:** ...\n\n"
+            "### Analysis\n\n"
+            "Use one or two short paragraphs to explain differences, share, or trend."
         )
 
     @staticmethod
@@ -227,30 +229,29 @@ class InsightWritingSkill(Skill):
             try:
                 desc = result_df.describe(include="all").to_string(max_cols=8)
                 head = result_df.head(10).to_string(index=False, max_cols=8)
-                data_summary = f"数据统计：\n{desc}\n\n前10行：\n{head}"
+                data_summary = f"Data statistics:\n{desc}\n\nFirst 10 rows:\n{head}"
             except Exception:
-                data_summary = f"列名：{list(result_df.columns)}, 行数：{len(result_df)}"
+                data_summary = f"Columns: {list(result_df.columns)}, rows: {len(result_df)}"
 
         conv = ctx.conversation_text(max_turns=4)
 
         return (
-            f"用户查询：{query}\n\n"
-            + (f"对话历史：\n{conv}\n\n" if conv else "")
-            + f"已计算事实：\n{InsightWritingSkill._facts_block(result_df)}\n\n"
-            + (f"数据信息：\n{data_summary}\n\n" if data_summary else "")
-            + "请只根据已计算事实和数据信息提供专业数据洞察（200-500字）。"
-            "使用2-4个简短 Markdown 小标题，分别说明关键发现、数据模式和业务建议；"
-            "每个小标题下使用短段落或项目列表；业务建议必须逐条使用项目列表，"
-            "每条建议单独一行，不要输出 emoji。"
+            f"User query: {query}\n\n"
+            + (f"Conversation history:\n{conv}\n\n" if conv else "")
+            + f"Computed facts:\n{InsightWritingSkill._facts_block(result_df)}\n\n"
+            + (f"Data information:\n{data_summary}\n\n" if data_summary else "")
+            + "Provide professional data insight in English using only the computed facts and data information. "
+            "Use 2-4 short Markdown headings for key findings, data patterns, and business recommendations. "
+            "Use short paragraphs or bullets under each heading. Put each recommendation on its own bullet. Do not use emoji."
         )
 
     @staticmethod
     def _facts_block(result_df: Optional[pd.DataFrame]) -> str:
         """Create a compact, deterministic facts block that anchors LLM prose."""
         if result_df is None or result_df.empty:
-            return "无可用的结构化计算结果。"
+            return "No structured computed result is available."
 
-        facts = [f"行数={len(result_df)}，列数={len(result_df.columns)}"]
+        facts = [f"rows={len(result_df)}, columns={len(result_df.columns)}"]
         numeric_cols = list(result_df.select_dtypes(include="number").columns[:3])
         currency_col = InsightWritingSkill._currency_column(result_df)
         if currency_col is not None:
@@ -308,29 +309,29 @@ class InsightWritingSkill(Skill):
             lines: List[str] = []
             for index, (subquery, frame) in enumerate(result_sets, start=1):
                 if frame.empty:
-                    answer = "没有符合条件的数据。"
+                    answer = "No matching data."
                 elif len(frame) == 1:
                     row = frame.iloc[0]
-                    answer = "，".join(
+                    answer = ", ".join(
                         f"{column}={row[column]}"
                         for column in list(frame.columns)[:4]
                     )
                 else:
-                    answer = InsightWritingSkill._facts_block(frame).replace("\n", "；")
-                lines.append(f"{index}. {subquery}：{answer}")
+                    answer = InsightWritingSkill._facts_block(frame).replace("\n", "; ")
+                lines.append(f"{index}. {subquery}: {answer}")
             return "\n".join(lines)
 
         if scenario == "chart" and chart_block:
             all_vals = [v for s in chart_block.series for v in s.values if v is not None]
             if all_vals:
                 return (
-                    f"### 关键结论\n\n"
-                    f"- **最高值：** {max(all_vals):.2f}\n"
-                    f"- **最低值：** {min(all_vals):.2f}"
+                    f"### Key Takeaways\n\n"
+                    f"- **Highest:** {max(all_vals):.2f}\n"
+                    f"- **Lowest:** {min(all_vals):.2f}"
                 )
-            return "图表已生成。"
+            return "The chart is ready."
 
         if result_df is not None:
-            return f"已处理数据。{InsightWritingSkill._facts_block(result_df)}"
+            return f"Data processed. {InsightWritingSkill._facts_block(result_df)}"
 
-        return "分析完成。"
+        return "Analysis complete."

@@ -28,16 +28,16 @@ export const uploadExcelFile = async ({ file, projectId, projectName }) => {
       return { ...response.data, isExistingProject: true };
     }
 
-    if (!projectName?.trim()) throw new Error("创建新项目时必须提供项目名称");
+    if (!projectName?.trim()) throw new Error("Project name is required when creating a new project.");
     const response = await apiClient.post("/projects", {
       projectName: projectName.trim(),
       files: [fileData],
     });
     return response.data;
   } catch (error) {
-    throw new Error(errorMessage(error, "文件上传失败，请稍后重试"));
+    throw new Error(errorMessage(error, "File upload failed. Please try again."));
   }
-  throw new Error("文件上传失败，请稍后重试");
+  throw new Error("File upload failed. Please try again.");
 };
 
 

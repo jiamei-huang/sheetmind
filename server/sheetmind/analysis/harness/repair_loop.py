@@ -113,7 +113,7 @@ class RepairLoop:
                 return None, last_code, repairs_used
 
             if is_repair and emit_progress:
-                await emit_progress(f"修复执行错误（第 {attempt} 次）...")
+                await emit_progress(f"Fixing an execution error (attempt {attempt})...")
 
             # --- Code generation ---
             try:
@@ -143,7 +143,7 @@ class RepairLoop:
                     return None, last_code, repairs_used
                 seen_errors.add(error_key)
                 if attempt < MAX_REPAIRS:
-                    error_feedback = f"代码生成失败: {exc}"
+                    error_feedback = f"Code generation failed: {exc}"
                     continue
                 return None, last_code, repairs_used
 
@@ -168,7 +168,7 @@ class RepairLoop:
 
             # --- Execution ---
             if emit_progress and not is_repair:
-                await emit_progress("正在执行数据查询...")
+                await emit_progress("Running the data query...")
 
             field_error = CodeGenerationSkill.validate_required_columns(
                 code,
@@ -200,7 +200,7 @@ class RepairLoop:
                         )
                     return None, last_code, repairs_used
                 seen_errors.add(error_key)
-                error_feedback = f"代码：\n{code}\n\n执行错误：\n{field_error}"
+                error_feedback = f"Code:\n{code}\n\nExecution error:\n{field_error}"
                 continue
 
             result_df, error = self.executor.run(
@@ -234,7 +234,7 @@ class RepairLoop:
                 return None, last_code, repairs_used
 
             repairs_used = attempt + 1
-            error_key = (error or "未知错误").strip()
+            error_key = (error or "Unknown error").strip()
             if error_key in seen_errors:
                 logger.warning("[RepairLoop] repeated execution error; stopping retries")
                 if trace:
@@ -252,8 +252,8 @@ class RepairLoop:
                 (error or "")[:200],
             )
             error_feedback = (
-                f"代码：\n{code}\n\n"
-                f"执行错误：\n{error or '未知错误'}"
+                f"Code:\n{code}\n\n"
+                f"Execution error:\n{error or 'Unknown error'}"
             )
             if trace:
                 trace.add_event(EVT_REPAIR, output_summary=f"attempt {attempt+1} failed, retrying")

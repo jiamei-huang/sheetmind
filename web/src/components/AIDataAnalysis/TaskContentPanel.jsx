@@ -62,7 +62,7 @@ const ResultStatusMessages = ({ items = [], className = "" }) => (
           <Icon className="mt-0.5 h-4 w-4 shrink-0" />
           <div className="min-w-0">
             <h6 className="text-sm font-semibold">
-              {isError ? "分析失败" : "未找到结果"}
+              {isError ? "Analysis failed" : "No results found"}
             </h6>
             <p className="mt-0.5 text-sm leading-6">{item.message}</p>
           </div>
@@ -73,20 +73,30 @@ const ResultStatusMessages = ({ items = [], className = "" }) => (
 );
 
 const PROGRESS_STAGES = [
-  { key: "thinking", label: "理解问题" },
-  { key: "select", label: "选择数据" },
-  { key: "load", label: "加载 Excel" },
-  { key: "execute", label: "执行分析" },
-  { key: "chart", label: "生成图表" },
-  { key: "insight", label: "整理洞察" },
+  { key: "thinking", label: "Understand" },
+  { key: "select", label: "Select data" },
+  { key: "load", label: "Load Excel" },
+  { key: "execute", label: "Analyze" },
+  { key: "chart", label: "Build chart" },
+  { key: "insight", label: "Write insight" },
 ];
 
 const inferProgressStage = (message = "") => {
-  if (message.includes("选择")) return 1;
-  if (message.includes("加载")) return 2;
-  if (message.includes("筛选") || message.includes("执行") || message.includes("分析数据") || message.includes("代码")) return 3;
-  if (message.includes("图表") || message.includes("图")) return 4;
-  if (message.includes("洞察") || message.includes("总结")) return 5;
+  const lower = message.toLowerCase();
+  if (message.includes("选择") || lower.includes("select")) return 1;
+  if (message.includes("加载") || lower.includes("load")) return 2;
+  if (
+    message.includes("筛选")
+    || message.includes("执行")
+    || message.includes("分析数据")
+    || message.includes("代码")
+    || lower.includes("query")
+    || lower.includes("execute")
+    || lower.includes("analy")
+    || lower.includes("code")
+  ) return 3;
+  if (message.includes("图表") || message.includes("图") || lower.includes("chart")) return 4;
+  if (message.includes("洞察") || message.includes("总结") || lower.includes("insight") || lower.includes("summary")) return 5;
   return 0;
 };
 
@@ -307,7 +317,7 @@ const TaskContentPanel = ({
 
   const renderAnalysisProgress = () => (
     <div className="space-y-4 rounded-lg bg-blue-50 p-4">
-      <Loader label={progressMsg || "正在分析数据..."} />
+      <Loader label={progressMsg || "Analyzing data..."} />
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
         {PROGRESS_STAGES.map((stage, index) => {
           const isDone = index < currentProgressIndex;
@@ -521,7 +531,7 @@ const TaskContentPanel = ({
               {availablePreviews.length > 1 && (
                 <div
                   role="tablist"
-                  aria-label="分析结果"
+                  aria-label="Analysis results"
                   className="flex overflow-x-auto border-b border-slate-200 bg-slate-50 px-3"
                 >
                   {availablePreviews.map((item, index) => {
@@ -572,7 +582,7 @@ const TaskContentPanel = ({
               </div>
               {((availablePreviews.length === 1 && runtimeNote) || isPreviewTruncated) && (
                 <div className="bg-amber-50 px-4 py-2 text-xs leading-5 text-amber-800">
-                  {(availablePreviews.length === 1 && runtimeNote) || "后端会按全量数据执行分析，前端表格只展示预览行以保持页面流畅。"}
+                  {(availablePreviews.length === 1 && runtimeNote) || "The backend analyzes the full dataset. This table shows preview rows to keep the page responsive."}
                 </div>
               )}
               {preview.calculationBasis?.summary && (
@@ -580,18 +590,18 @@ const TaskContentPanel = ({
                   <summary className="flex cursor-pointer list-none items-start gap-2 text-xs text-slate-700 marker:content-none">
                     <Calculator className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" />
                     <span className="min-w-0 flex-1 leading-5">
-                      <strong className="mr-1 font-semibold text-slate-900">计算依据</strong>
+                      <strong className="mr-1 font-semibold text-slate-900">Calculation basis</strong>
                       {preview.calculationBasis.summary}
                     </span>
                     <ChevronDown className="mt-0.5 h-4 w-4 shrink-0 text-slate-400 transition-transform group-open:rotate-180" />
                   </summary>
                   <dl className="mt-3 grid gap-2 pl-6 text-xs sm:grid-cols-[6rem_1fr]">
-                    <dt className="font-medium text-slate-500">来源 Sheet</dt>
-                    <dd className="break-words text-slate-700">{preview.calculationBasis.source_sheets?.join("、") || "当前所选工作表"}</dd>
-                    <dt className="font-medium text-slate-500">使用字段</dt>
-                    <dd className="break-words text-slate-700">{preview.calculationBasis.fields?.join("、") || "结果字段"}</dd>
-                    <dt className="font-medium text-slate-500">处理方式</dt>
-                    <dd className="break-words text-slate-700">{preview.calculationBasis.operations?.join("、") || "数据处理"}</dd>
+                    <dt className="font-medium text-slate-500">Source sheet</dt>
+                    <dd className="break-words text-slate-700">{preview.calculationBasis.source_sheets?.join(", ") || "Selected sheets"}</dd>
+                    <dt className="font-medium text-slate-500">Fields used</dt>
+                    <dd className="break-words text-slate-700">{preview.calculationBasis.fields?.join(", ") || "Result fields"}</dd>
+                    <dt className="font-medium text-slate-500">Method</dt>
+                    <dd className="break-words text-slate-700">{preview.calculationBasis.operations?.join(", ") || "Data processing"}</dd>
                   </dl>
                 </details>
               )}
@@ -720,7 +730,7 @@ const TaskContentPanel = ({
             {availableCharts.length > 1 && (
               <div
                 role="tablist"
-                aria-label="分析图表"
+                aria-label="Analysis charts"
                 className="flex overflow-x-auto border-b border-slate-200 bg-slate-50 px-3"
               >
                 {availableCharts.map((item, index) => {
@@ -968,8 +978,8 @@ const TaskContentPanel = ({
               <div className="min-w-0 flex-1 space-y-3">
                 <h6 className="text-sm font-semibold text-amber-950">
                   {fieldResolutions.some((item) => item.status === "needs_clarification")
-                    ? "请选择分析字段"
-                    : "字段使用说明"}
+                    ? "Choose an analysis field"
+                    : "Field usage note"}
                 </h6>
                 {fieldResolutions.map((resolution) => (
                   <div key={`${resolution.reference}-${resolution.status}`} className="space-y-2">
@@ -980,10 +990,10 @@ const TaskContentPanel = ({
                           <button
                             key={candidate.column}
                             type="button"
-                            title={candidate.reason || `使用字段 ${candidate.column}`}
+                            title={candidate.reason || `Use field ${candidate.column}`}
                             onClick={() => onTaskPromptChange(
                               task.id,
-                              `使用列“${candidate.column}”继续：${result.prompt || resolution.reference}`
+                              `Continue with column "${candidate.column}": ${result.prompt || resolution.reference}`
                             )}
                             className="inline-flex items-center gap-1.5 border border-amber-300 bg-white px-3 py-1.5 text-sm font-medium text-amber-950 hover:border-amber-500 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500"
                           >
@@ -1005,7 +1015,7 @@ const TaskContentPanel = ({
             <div className="flex items-start gap-3">
               <Database className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
               <div className="min-w-0 flex-1 space-y-3">
-                <h6 className="text-sm font-semibold text-amber-950">请选择数据工作表</h6>
+                <h6 className="text-sm font-semibold text-amber-950">Choose a data sheet</h6>
                 {sheetResolutions.map((resolution, resolutionIndex) => (
                   <div key={`${resolution.status}-${resolutionIndex}`} className="space-y-2">
                     <p className="text-sm text-amber-900">{resolution.message}</p>
@@ -1041,7 +1051,7 @@ const TaskContentPanel = ({
     } else if (result.statusMessages?.length) {
       summary = result.statusMessages.map((item) => item.message).filter(Boolean).join(" ");
     }
-    if (!summary) return "查看本轮分析的数据、图表和计算依据。";
+    if (!summary) return "View this analysis run's data, charts, and calculation basis.";
     return summary;
   };
 
@@ -1120,7 +1130,7 @@ const TaskContentPanel = ({
           <div className="sm-status sm-status-error mt-4">
             <AlertCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-red-500" />
             <div className="space-y-1">
-              <p className="text-sm font-semibold text-red-900">分析未完成</p>
+              <p className="text-sm font-semibold text-red-900">Analysis incomplete</p>
               <p className="text-sm text-red-700">{task.analysisError}</p>
             </div>
           </div>
@@ -1152,7 +1162,7 @@ const TaskContentPanel = ({
               }}
               disabled={!pendingTask || !isUploadReady || isAnalyzing}
               maxLength={MAX_ANALYSIS_QUERY_LENGTH}
-              placeholder="Ask a question about your data..."
+              placeholder="Ask about trends, missing values, formulas, cleanup steps, or business insights..."
               aria-label="Data analysis question"
               className={`block min-h-9 max-h-24 w-full resize-none overflow-y-auto border-0 bg-transparent px-1 py-1 text-[15px] leading-6 text-slate-800 outline-none placeholder:text-slate-400 disabled:text-slate-400 ${showPromptCounter ? "pb-7" : ""}`}
               rows={1}

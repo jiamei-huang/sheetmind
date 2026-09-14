@@ -74,4 +74,4 @@ def safe_error_message(exc: Exception) -> str:
         return exc.message
 
     # 非自定义异常：返回通用信息，避免泄露堆栈、路径等
-    return "操作失败，请稍后重试"
+    return "The operation failed. Please try again."

@@ -9,4 +9,4 @@ export const unsupportedUploadNames = (files = []) =>
     .map((file) => String(file?.name || "Unnamed file"));
 
 export const unsupportedUploadMessage = (fileNames = []) =>
-  `不支持以下文件：${fileNames.join("、")}。当前仅支持 Excel 文件（.xlsx、.xls）。`;
+  `Unsupported files: ${fileNames.join(", ")}. SheetMind currently supports Excel files only (.xlsx, .xls).`;
