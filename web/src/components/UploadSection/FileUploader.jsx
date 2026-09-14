@@ -446,9 +446,6 @@ export default function FileUploader({
         </div>
         <h2 className="text-base sm:text-lg font-semibold text-slate-800">Import Your Data</h2>
       </div>
-      <p className="mb-3 max-w-3xl text-xs leading-5 text-slate-500 sm:text-sm">
-        Your original workbook stays unchanged. SheetMind analyzes a parsed data preview, suggests transformations, and lets you review results before export.
-      </p>
 
       {uploadedFiles.length > 0 && !isDataManagerOpen ? (
         <div className="sm-panel flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
@@ -478,7 +475,7 @@ export default function FileUploader({
       <div className="sm-panel px-4 py-4 sm:px-5">
         <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="text-sm sm:text-[16px] font-semibold text-slate-900">
-            Select Excel Files
+            Excel files
           </div>
           <div className="flex items-center gap-2">
             {uploadedFiles.length > 0 && (
@@ -522,6 +519,9 @@ export default function FileUploader({
           <p className="text-[11px] sm:text-xs text-slate-400">
             or click to browse (.xlsx, .xls files)
           </p>
+          <p className="mt-1 text-[11px] sm:text-xs text-slate-400">
+            Your original Excel files stay unchanged.
+          </p>
 
           <button
             type="button"
@@ -561,7 +561,9 @@ export default function FileUploader({
                     {hasReachedLimit ? `Maximum of ${MAX_FILES} files reached` : "Drop another Excel file here"}
                   </p>
                   {!hasReachedLimit && (
-                    <p className="text-xs text-slate-400">.xlsx or .xls</p>
+                    <p className="text-xs text-slate-400">
+                      .xlsx or .xls · Original files stay unchanged
+                    </p>
                   )}
                 </div>
               </div>

@@ -993,7 +993,9 @@ const TaskContentPanel = ({
                             title={candidate.reason || `Use field ${candidate.column}`}
                             onClick={() => onTaskPromptChange(
                               task.id,
-                              `Continue with column "${candidate.column}": ${result.prompt || resolution.reference}`
+                              result.responseLanguage === "zh"
+                                ? `使用字段“${candidate.column}”继续：${result.prompt || resolution.reference}`
+                                : `Continue with column "${candidate.column}": ${result.prompt || resolution.reference}`
                             )}
                             className="inline-flex items-center gap-1.5 border border-amber-300 bg-white px-3 py-1.5 text-sm font-medium text-amber-950 hover:border-amber-500 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500"
                           >
@@ -1162,7 +1164,7 @@ const TaskContentPanel = ({
               }}
               disabled={!pendingTask || !isUploadReady || isAnalyzing}
               maxLength={MAX_ANALYSIS_QUERY_LENGTH}
-              placeholder="Ask about trends, missing values, formulas, cleanup steps, or business insights..."
+              placeholder="Ask a question about your selected sheets..."
               aria-label="Data analysis question"
               className={`block min-h-9 max-h-24 w-full resize-none overflow-y-auto border-0 bg-transparent px-1 py-1 text-[15px] leading-6 text-slate-800 outline-none placeholder:text-slate-400 disabled:text-slate-400 ${showPromptCounter ? "pb-7" : ""}`}
               rows={1}

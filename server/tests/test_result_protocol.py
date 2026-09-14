@@ -28,6 +28,7 @@ from sheetmind.api.schemas import AnalyzeRequest
 
 def test_result_blocks_serializes_native_protocol():
     result = ResultBlocks(
+        response_language="zh",
         blocks=[
             MetricBlock(label="Revenue", value=1200, unit="CNY"),
             TableBlock(columns=["region", "sales"], rows=[{"region": "East", "sales": 1200}]),
@@ -42,6 +43,7 @@ def test_result_blocks_serializes_native_protocol():
 
     payload = result.model_dump()
     assert payload["type"] == "result_blocks"
+    assert payload["response_language"] == "zh"
     assert [block["kind"] for block in payload["blocks"]] == [
         "metric",
         "table",

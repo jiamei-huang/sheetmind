@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from .language import ResponseLanguage
+
 
 # ---------------------------------------------------------------------------
 # Routing
@@ -153,6 +155,7 @@ class ExecutionPlan(BaseModel):
 
     route: RoutingHint
     mode: MultiTurnMode
+    response_language: ResponseLanguage = "en"
     original_query: str = ""
     normalized_query: str = ""
     operation_intents: List[str] = Field(default_factory=list)
@@ -353,6 +356,7 @@ class ResultBlocks(BaseModel):
 
     type: Literal["result_blocks"] = "result_blocks"
     run_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    response_language: ResponseLanguage = "en"
     status: Literal[
         "success", "partial", "empty", "failed", "needs_input"
     ] = "success"

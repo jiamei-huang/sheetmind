@@ -42,6 +42,12 @@ from .context import (
 )
 from .harness.repair_loop import RepairLoop
 from .artifacts import get_artifact_store
+from .language import (
+    ResponseLanguage,
+    infer_response_language,
+    resolve_response_language,
+    user_text,
+)
 from .models.router import ModelRouter
 from .skills.chart_planning import ChartPlanningSkill
 from .skills.code_generation import CodeGenerationSkill
@@ -113,16 +119,29 @@ def _requests_direct_workbook_edit(query: str) -> bool:
     return any(term in lowered for term in _DIRECT_WORKBOOK_EDIT_TERMS)
 
 
-def _workbook_edit_boundary_result(query: str) -> ResultBlocks:
-    content = (
-        "I can't directly edit the original Excel workbook yet. "
-        "SheetMind works on a parsed data preview so the uploaded file stays unchanged.\n\n"
-        "I can help you design the transformation, calculate or preview the new column, "
-        "explain the formula logic, and export a clean result after review."
+def _workbook_edit_boundary_result(
+    query: str,
+    response_language: Optional[ResponseLanguage] = None,
+) -> ResultBlocks:
+    language = response_language or infer_response_language(query)
+    content = user_text(
+        language,
+        en=(
+            "I can't directly edit the original Excel workbook yet. "
+            "SheetMind works on a parsed data preview so the uploaded file stays unchanged.\n\n"
+            "I can help you design the transformation, calculate or preview the new column, "
+            "explain the formula logic, and export a clean result after review."
+        ),
+        zh=(
+            "SheetMind 暂时不能直接修改原始 Excel 文件。系统会分析解析后的数据预览，"
+            "因此你上传的文件会保持不变。\n\n"
+            "我可以帮助你设计处理逻辑、计算或预览新列、解释公式，并在确认后导出结果。"
+        ),
     )
     block = SummaryBlock(content=content)
     return ResultBlocks(
         status="success",
+        response_language=language,
         output_intents=["insight"],
         questions=[
             QuestionResult(
@@ -275,11 +294,16 @@ class SheetMindAgent:
           6. InsightWritingSkill → summary_text
           7. Assemble + validate ResultBlocks
         """
+        response_language = infer_response_language(query)
         # ----------------------------------------------------------------
         # 1. Routing classification
         # ----------------------------------------------------------------
         if _requests_direct_workbook_edit(query):
-            return _workbook_edit_boundary_result(query), RoutingHint.INSIGHT_ONLY, MultiTurnMode.NEW_QUERY
+            return (
+                _workbook_edit_boundary_result(query, response_language),
+                RoutingHint.INSIGHT_ONLY,
+                MultiTurnMode.NEW_QUERY,
+            )
 
         if emitter:
             await emitter.emit_progress("Understanding your question...", step_id="routing")
@@ -320,6 +344,7 @@ class SheetMindAgent:
         ):
             shortcut_plan = QueryPlan(
                 steps=[QueryPlanningSkill._single_step(query, routing)],
+                response_language=response_language,
                 confidence=routing.confidence,
                 reasoning="Direct presentation from the previous result.",
             )
@@ -332,6 +357,7 @@ class SheetMindAgent:
                 hint=hint,
                 mode=mode,
                 emitter=emitter,
+                response_language=response_language,
             )
 
         if routing.structure.needs_semantic_planning and emitter:
@@ -343,6 +369,11 @@ class SheetMindAgent:
             sheet_catalog=planning_sheet_catalog,
             force_semantic_planning=len(planning_sheet_catalog) > 1,
         )
+        response_language = resolve_response_language(
+            query,
+            query_plan.response_language,
+        )
+        query_plan.response_language = response_language
         self._assign_question_ids(query_plan)
         active_candidate_ids = self._candidate_ids_from_scope(ctx.active_source_scope)
         planned_candidate_sets = [
@@ -393,6 +424,7 @@ class SheetMindAgent:
                 hint=hint,
                 mode=mode,
                 emitter=emitter,
+                response_language=response_language,
             )
 
         execution_plan = self._build_execution_plan(query_plan, routing)
@@ -418,7 +450,11 @@ class SheetMindAgent:
             emitter=emitter,
         )
         if source_resolution is not None:
-            sheet_block = self._sheet_resolution_block(ctx, source_resolution)
+            sheet_block = self._sheet_resolution_block(
+                ctx,
+                source_resolution,
+                response_language=response_language,
+            )
             question = QuestionResult(
                 question_id="q1",
                 query=query,
@@ -427,6 +463,7 @@ class SheetMindAgent:
             )
             return ResultBlocks(
                 status="needs_input",
+                response_language=response_language,
                 focus_question_id="q1",
                 output_intents=execution_plan.output_intents,
                 questions=[question],
@@ -452,6 +489,7 @@ class SheetMindAgent:
             clarification_blocks = self._field_resolution_blocks(
                 execution_plan.field_resolutions,
                 status="needs_clarification",
+                response_language=response_language,
             )
             if clarification_blocks:
                 questions = [
@@ -467,13 +505,18 @@ class SheetMindAgent:
                 ]
                 clarification_result = ResultBlocks(
                     status="needs_input",
+                    response_language=response_language,
                     focus_question_id=questions[-1].question_id if questions else None,
                     output_intents=execution_plan.output_intents,
                     questions=questions,
                     blocks=clarification_blocks,
                 )
                 return validate_result(clarification_result), hint, mode
-            error_msg = "The data query failed. The failed stage and data source were recorded for review."
+            error_msg = user_text(
+                response_language,
+                en="The data query failed. The failed stage and data source were recorded for review.",
+                zh="数据查询执行失败。失败阶段和数据来源已记录，便于检查。",
+            )
             logger.warning("[Pipeline] planned execution failed for task=%s", ctx.task_id)
             status_block = StatusBlock(
                 status="failed",
@@ -494,6 +537,7 @@ class SheetMindAgent:
             ]
             return ResultBlocks(
                 status="failed",
+                response_language=response_language,
                 focus_question_id=questions[-1].question_id if questions else None,
                 output_intents=execution_plan.output_intents,
                 questions=questions,
@@ -547,6 +591,7 @@ class SheetMindAgent:
         assumed_blocks = self._field_resolution_blocks(
             execution_plan.field_resolutions,
             status="assumed",
+            response_language=response_language,
         )
 
         for question_id in question_ids:
@@ -582,7 +627,11 @@ class SheetMindAgent:
             if question_failed:
                 status_block = StatusBlock(
                     status="failed",
-                    message="This question failed. Available results for the other questions were preserved.",
+                    message=user_text(
+                        response_language,
+                        en="This question failed. Available results for the other questions were preserved.",
+                        zh="这个问题执行失败，其他问题的可用结果已保留。",
+                    ),
                     error_code=(terminal_step.execution_report.error_code if terminal_step.execution_report else "execution_failed"),
                     details={"step_ids": [step.step_id for step in question_steps]},
                 )
@@ -598,7 +647,11 @@ class SheetMindAgent:
                         artifact_id=artifact_id,
                     )
                     if partial_table is not None:
-                        partial_table.title = f"{evidence_step.query} (intermediate result)"
+                        partial_table.title = user_text(
+                            response_language,
+                            en=f"{evidence_step.query} (intermediate result)",
+                            zh=f"{evidence_step.query}（中间结果）",
+                        )
                         partial_table.calculation_basis = self._build_calculation_basis(
                             ctx,
                             evidence_step,
@@ -610,7 +663,11 @@ class SheetMindAgent:
             elif question_df is None or question_df.empty:
                 status_block = StatusBlock(
                     status="empty",
-                    message="No data matched this query. Check the filters, currency, or data source.",
+                    message=user_text(
+                        response_language,
+                        en="No data matched this query. Check the filters, currency, or data source.",
+                        zh="没有与该问题匹配的数据。请检查筛选条件、币种或数据来源。",
+                    ),
                     error_code="empty_result",
                     details={
                         "source_rows": terminal_step.execution_report.source_rows
@@ -670,6 +727,7 @@ class SheetMindAgent:
                     result_df=question_df,
                     chart_block=question_charts[0] if question_charts else None,
                     table_block=table_block,
+                    response_language=response_language,
                 )
                 if summary_text and step_output_plan.include_summary:
                     question_blocks.append(SummaryBlock(content=summary_text))
@@ -696,6 +754,7 @@ class SheetMindAgent:
         )
         result = ResultBlocks(
             status=overall_status,
+            response_language=response_language,
             focus_question_id=questions[-1].question_id if questions else None,
             output_intents=execution_plan.output_intents,
             questions=questions,
@@ -1528,6 +1587,14 @@ class SheetMindAgent:
         return ExecutionPlan(
             route=primary_route,
             mode=plan.mode or routing.mode,
+            response_language=(
+                plan.response_language
+                or infer_response_language(
+                    routing.normalized_query.original_text
+                    if routing.normalized_query is not None
+                    else ""
+                )
+            ),
             original_query=(
                 routing.normalized_query.original_text
                 if routing.normalized_query is not None
@@ -1625,6 +1692,7 @@ class SheetMindAgent:
         records: List[FieldResolutionRecord],
         *,
         status: str,
+        response_language: ResponseLanguage = "en",
     ) -> List[FieldResolutionBlock]:
         blocks: List[FieldResolutionBlock] = []
         seen: set[tuple[str, str]] = set()
@@ -1636,10 +1704,16 @@ class SheetMindAgent:
                 continue
             seen.add(key)
             if status == "needs_clarification":
-                message = f"\"{record.reference}\" may match multiple fields. Choose one to continue."
+                message = user_text(
+                    response_language,
+                    en=f"\"{record.reference}\" may match multiple fields. Choose one to continue.",
+                    zh=f"“{record.reference}”可能对应多个字段，请选择一个后继续。",
+                )
             else:
-                message = (
-                    f"Assumed column \"{record.selected_column}\" for this run ({record.reason})."
+                message = user_text(
+                    response_language,
+                    en=f"Assumed column \"{record.selected_column}\" for this run ({record.reason}).",
+                    zh=f"本次分析使用字段“{record.selected_column}”（{record.reason}）。",
                 )
             blocks.append(FieldResolutionBlock(
                 reference=record.reference,
@@ -1656,6 +1730,8 @@ class SheetMindAgent:
     def _sheet_resolution_block(
         ctx: AnalysisContext,
         decision: SheetSelectionDecision,
+        *,
+        response_language: ResponseLanguage = "en",
     ) -> SheetResolutionBlock:
         current_sheets = [
             str(sheet)
@@ -1663,22 +1739,42 @@ class SheetMindAgent:
             for sheet in scope.get("sheets", [])
         ] or list(ctx.selected_sheets)
         if decision.reason == "no sheets are checked for analysis":
-            message = (
-                "No data sheets are selected. "
-                "Select at least one sheet in Import Your Data, then submit the question again."
+            message = user_text(
+                response_language,
+                en=(
+                    "No data sheets are selected. "
+                    "Select at least one sheet in Import Your Data, then submit the question again."
+                ),
+                zh="尚未选择数据表。请在 Import Your Data 中至少勾选一个 Sheet，然后重新提交问题。",
             )
         elif decision.status == "scope_conflict":
             candidate = decision.candidates[0]
-            message = (
-                "The selected scope does not contain the best data source. "
-                f"\"{candidate.file_name} / {candidate.sheet_name}\" is a better match. "
-                "Select that sheet in Import Your Data and submit the question again. SheetMind will not read unselected data."
+            message = user_text(
+                response_language,
+                en=(
+                    "The selected scope does not contain the best data source. "
+                    f"\"{candidate.file_name} / {candidate.sheet_name}\" is a better match. "
+                    "Select that sheet in Import Your Data and submit the question again. SheetMind will not read unselected data."
+                ),
+                zh=(
+                    "当前勾选范围不包含最匹配的数据来源。"
+                    f"“{candidate.file_name} / {candidate.sheet_name}”与问题更匹配。"
+                    "请在 Import Your Data 中勾选该 Sheet 后重新提交；SheetMind 不会读取未勾选的数据。"
+                ),
             )
         else:
-            message = (
-                "Multiple selected data sources could answer this question. "
-                "Keep only the intended files and sheets selected in Import Your Data, "
-                "or include the file and sheet name in the question before submitting again."
+            message = user_text(
+                response_language,
+                en=(
+                    "Multiple selected data sources could answer this question. "
+                    "Keep only the intended files and sheets selected in Import Your Data, "
+                    "or include the file and sheet name in the question before submitting again."
+                ),
+                zh=(
+                    "多个已勾选的数据来源都可能回答这个问题。"
+                    "请在 Import Your Data 中只保留需要的文件和 Sheet，"
+                    "或在问题中明确文件名和 Sheet 名后重新提交。"
+                ),
             )
         return SheetResolutionBlock(
             status=decision.status,
@@ -1862,6 +1958,7 @@ class SheetMindAgent:
         hint: RoutingHint,
         mode: MultiTurnMode,
         emitter: Optional[StreamEmitter],
+        response_language: ResponseLanguage = "en",
     ) -> tuple:
         """Render a chart from the last table result without rerunning codegen."""
         if emitter:
@@ -1894,6 +1991,7 @@ class SheetMindAgent:
         clarification_blocks = self._field_resolution_blocks(
             records,
             status="needs_clarification",
+            response_language=response_language,
         )
         if clarification_blocks:
             question = QuestionResult(
@@ -1904,6 +2002,7 @@ class SheetMindAgent:
             )
             result = ResultBlocks(
                 status="needs_input",
+                response_language=response_language,
                 focus_question_id=question.question_id,
                 output_intents=["chart"],
                 questions=[question],
@@ -1921,7 +2020,11 @@ class SheetMindAgent:
         if chart_block is None:
             status_block = StatusBlock(
                 status="failed",
-                message="The previous result does not contain drawable dimension or numeric fields.",
+                message=user_text(
+                    response_language,
+                    en="The previous result does not contain drawable dimension or numeric fields.",
+                    zh="上一轮结果不包含可用于绘图的维度或数值字段。",
+                ),
                 error_code="chart_not_supported",
             )
             question = QuestionResult(
@@ -1932,6 +2035,7 @@ class SheetMindAgent:
             )
             result = ResultBlocks(
                 status="failed",
+                response_language=response_language,
                 focus_question_id=question.question_id,
                 output_intents=["chart"],
                 questions=[question],
@@ -1978,11 +2082,13 @@ class SheetMindAgent:
             result_df=previous_result_df,
             chart_block=chart_block,
             table_block=table_block,
+            response_language=response_language,
         )
 
         blocks: List[Any] = self._field_resolution_blocks(
             records,
             status="assumed",
+            response_language=response_language,
         )
         if summary_text:
             blocks.append(SummaryBlock(content=summary_text))
@@ -2010,6 +2116,7 @@ class SheetMindAgent:
         )
         result = ResultBlocks(
             status="success",
+            response_language=response_language,
             focus_question_id=question_id,
             output_intents=["chart"],
             questions=[question],
@@ -2104,6 +2211,11 @@ class SheetMindAgent:
         from_previous_result: bool = False,
     ) -> CalculationBasis:
         """Describe reproducible inputs and operations without exposing model reasoning."""
+        response_language: ResponseLanguage = (
+            ctx.execution_plan.response_language
+            if ctx.execution_plan is not None
+            else "en"
+        )
         source_sheets: List[str] = []
         raw_scope: List[Dict[str, Any]] = [
             {
@@ -2144,23 +2256,43 @@ class SheetMindAgent:
                 fields.append(column)
         fields = fields[:12]
 
-        operation_labels = {
-            "filter": "filtering",
-            "keyword_filter": "filtering",
-            "date_filter": "date filtering",
-            "aggregate": "grouped aggregation",
-            "aggregation": "grouped aggregation",
-            "groupby": "grouped aggregation",
-            "which": "group comparison",
-            "extreme": "extreme value comparison",
-            "sort": "sorting",
-            "top_n": "Top N filtering",
-            "trend": "trend calculation",
-            "pivot": "pivot-style aggregation",
-            "compare": "comparison",
-            "chart_data_prep": "chart data preparation",
-            "complex_transform": "data processing",
-        }
+        operation_labels = (
+            {
+                "filter": "筛选",
+                "keyword_filter": "关键词筛选",
+                "date_filter": "日期筛选",
+                "aggregate": "分组汇总",
+                "aggregation": "分组汇总",
+                "groupby": "分组汇总",
+                "which": "分组比较",
+                "extreme": "极值比较",
+                "sort": "排序",
+                "top_n": "Top N 筛选",
+                "trend": "趋势计算",
+                "pivot": "透视汇总",
+                "compare": "比较",
+                "chart_data_prep": "图表数据整理",
+                "complex_transform": "数据处理",
+            }
+            if response_language == "zh"
+            else {
+                "filter": "filtering",
+                "keyword_filter": "filtering",
+                "date_filter": "date filtering",
+                "aggregate": "grouped aggregation",
+                "aggregation": "grouped aggregation",
+                "groupby": "grouped aggregation",
+                "which": "group comparison",
+                "extreme": "extreme value comparison",
+                "sort": "sorting",
+                "top_n": "Top N filtering",
+                "trend": "trend calculation",
+                "pivot": "pivot-style aggregation",
+                "compare": "comparison",
+                "chart_data_prep": "chart data preparation",
+                "complex_transform": "data processing",
+            }
+        )
         operations: List[str] = []
         executed_operations = report.operations if report and report.operations else step.operation_intents
         for intent in executed_operations:
@@ -2168,17 +2300,34 @@ class SheetMindAgent:
             if label and label not in operations:
                 operations.append(label)
         if from_previous_result:
-            operations.insert(0, "previous result reuse")
-        operations = list(dict.fromkeys(operations)) or ["data processing"]
+            operations.insert(
+                0,
+                "复用上一轮结果" if response_language == "zh" else "previous result reuse",
+            )
+        operations = list(dict.fromkeys(operations)) or [
+            "数据处理" if response_language == "zh" else "data processing"
+        ]
 
-        source_text = ", ".join(f"\"{item}\"" for item in source_sheets) or "the selected sheets"
-        field_text = ", ".join(f"\"{item}\"" for item in fields) or "result fields"
+        source_text = ", ".join(f"\"{item}\"" for item in source_sheets) or user_text(
+            response_language,
+            en="the selected sheets",
+            zh="已勾选的 Sheet",
+        )
+        field_text = ", ".join(f"\"{item}\"" for item in fields) or user_text(
+            response_language,
+            en="result fields",
+            zh="结果字段",
+        )
         operation_text = ", ".join(operations)
         return CalculationBasis(
             source_sheets=source_sheets,
             fields=fields,
             operations=operations,
-            summary=f"Based on {source_text}, using {field_text}, with {operation_text}.",
+            summary=user_text(
+                response_language,
+                en=f"Based on {source_text}, using {field_text}, with {operation_text}.",
+                zh=f"基于 {source_text}，使用 {field_text}，执行了 {operation_text}。",
+            ),
         )
 
     @staticmethod

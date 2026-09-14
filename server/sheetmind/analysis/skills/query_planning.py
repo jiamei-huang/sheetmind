@@ -16,6 +16,7 @@ from ..context import (
     QuerySemantics,
     RoutingHint,
 )
+from ..language import ResponseLanguage, infer_response_language, resolve_response_language
 from ..models.configs import ModelRole
 from .base import Skill
 from .field_resolution import normalise_field_text, query_qualifiers
@@ -39,6 +40,7 @@ class QueryPlan(BaseModel):
     is_multi_step: bool = False
     source: Literal["single", "llm", "rule_fallback"] = "single"
     mode: Optional[MultiTurnMode] = None
+    response_language: Optional[ResponseLanguage] = None
     confidence: float = 0.0
     reasoning: str = ""
 
@@ -72,6 +74,7 @@ class QueryPlanningSkill(Skill):
         **kwargs: Any,
     ) -> QueryPlan:
         routing = routing or await self.routing_skill.run(ctx, query)
+        inferred_language = infer_response_language(query)
         sheet_catalog = kwargs.get("sheet_catalog") or []
         force_semantic_planning = bool(kwargs.get("force_semantic_planning"))
         if (
@@ -84,6 +87,7 @@ class QueryPlanningSkill(Skill):
                 is_multi_step=False,
                 source="single",
                 mode=routing.mode,
+                response_language=inferred_language,
                 confidence=routing.confidence,
                 reasoning=routing.reasoning,
             )
@@ -91,10 +95,11 @@ class QueryPlanningSkill(Skill):
         raw_steps: List[Dict[str, Any]]
         source: Literal["llm", "rule_fallback"]
         planned_mode = routing.mode
+        response_language = inferred_language
         confidence = 0.65
         reasoning = "Structure detection requested semantic planning."
         try:
-            raw_steps, planned_mode, confidence, reasoning = await self._llm_decompose(
+            raw_steps, planned_mode, response_language, confidence, reasoning = await self._llm_decompose(
                 ctx,
                 query,
                 routing.mode,
@@ -105,6 +110,7 @@ class QueryPlanningSkill(Skill):
             logger.warning("[QueryPlanning] planner fallback: %s", exc)
             raw_steps = self._rule_decompose(query)
             source = "rule_fallback"
+            response_language = inferred_language
             reasoning = f"Deterministic fallback after planner error: {exc}"
 
         # A one-step plan may classify context and fields, but it must not
@@ -118,6 +124,7 @@ class QueryPlanningSkill(Skill):
             is_multi_step=len(steps) > 1,
             source=source,
             mode=planned_mode,
+            response_language=response_language,
             confidence=min(max(confidence, 0.0), 1.0),
             reasoning=reasoning,
         )
@@ -177,7 +184,7 @@ class QueryPlanningSkill(Skill):
         default_mode: MultiTurnMode,
         *,
         sheet_catalog: Optional[List[Dict[str, Any]]] = None,
-    ) -> tuple[List[Dict[str, Any]], MultiTurnMode, float, str]:
+    ) -> tuple[List[Dict[str, Any]], MultiTurnMode, ResponseLanguage, float, str]:
         provider = self.router.get_provider(ModelRole.QUERY_PLANNING)
         system = (
             "你是多轮数据分析执行规划器。先判断当前查询是否依赖最近对话或上一轮结果。\n"
@@ -205,6 +212,9 @@ class QueryPlanningSkill(Skill):
             "若上一轮表格已包含绘图所需维度和指标，优先使用previous_result，"
             "不要重复筛选、分组或汇总。\n"
             "然后判断查询是一个问题还是多个问题。\n"
+            "response_language只能是zh或en，表示所有面向用户的动态回答语言。"
+            "根据当前用户查询的主要自然语言判断，忽略文件名、Sheet名、字段名、SKU等原始标识；"
+            "若用户明确要求中文或英文，则服从该要求。\n"
             "单一问题原样返回1个步骤；多个问题拆成最多6个原子步骤，并标出前置依赖。\n"
             "只负责结构、拆分和依赖，不选择执行引擎，不生成代码。\n"
             "每一步必须可单独执行；筛选、汇总、Top-N、比较、图表、解释应按用户语义排序。\n"
@@ -212,7 +222,7 @@ class QueryPlanningSkill(Skill):
             "并行问题不添加依赖。\n"
             "图表或原因分析可以依赖计算步骤，但不应改写前一步的计算要求。\n"
             "只输出JSON："
-            '{"mode":"new","steps":[{"id":"s1","query":"...","depends_on":[],'
+            '{"mode":"new","response_language":"zh","steps":[{"id":"s1","query":"...","depends_on":[],'
             '"input_source":"source","scope_from":null,"target_fields":["精确列名"],'
             '"needs_new_computation":true,"semantics":{"source_hints":[],"source_candidate_ids":[],'
             '"source_mode":"single","dimensions":[],"metrics":[],"filters":[],"sort":[],"limit":null}}],'
@@ -251,6 +261,10 @@ class QueryPlanningSkill(Skill):
             raise ValueError(f"planner returned invalid step count: {len(raw) if isinstance(raw, list) else 0}")
 
         planned_mode = self._parse_mode(data.get("mode"), default_mode)
+        response_language = resolve_response_language(
+            query,
+            data.get("response_language"),
+        )
         steps: List[Dict[str, Any]] = []
         known_ids: List[str] = []
         for index, item in enumerate(raw, start=1):
@@ -321,7 +335,7 @@ class QueryPlanningSkill(Skill):
 
         confidence = float(data.get("confidence", 0.75))
         reasoning = str(data.get("reasoning", "LLM decomposition"))
-        return steps, planned_mode, confidence, reasoning
+        return steps, planned_mode, response_language, confidence, reasoning
 
     @staticmethod
     def _parse_mode(raw_mode: Any, default_mode: MultiTurnMode) -> MultiTurnMode:

@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from sheetmind.analysis.streaming.emitter import StreamEmitter
+from sheetmind.analysis.language import infer_response_language, user_text
 
 from .dependencies import (
     analysis_agent,
@@ -60,6 +61,7 @@ async def _run_stream(
     emitter: StreamEmitter,
     run_id: str,
 ) -> None:
+    response_language = infer_response_language(request.query)
     try:
         async with ctx._run_lock:
             _apply_requested_scope(ctx, request)
@@ -78,14 +80,19 @@ async def _run_stream(
             )
     except Exception as exc:
         logger.exception("Analysis failed for task %s", request.taskId)
+        message = user_text(
+            response_language,
+            en="Analysis was interrupted. Submit the question again.",
+            zh="分析意外中断，请重新提交问题。",
+        )
         conversations.add_message(
             request.taskId,
             "assistant",
-            "Analysis was interrupted. Submit the question again.",
+            message,
             metadata={"runId": run_id, "status": "failed"},
         )
         if not emitter.is_closed:
-            await emitter.emit_error(str(exc))
+            await emitter.emit_error(message)
 
 
 @router.post("/stream")
@@ -121,6 +128,7 @@ async def analyze(request: Request, payload: AnalyzeRequest) -> dict:
         payload.query.strip(),
         metadata={"runId": run_id, "status": "running"},
     )
+    response_language = infer_response_language(payload.query)
     try:
         async with ctx._run_lock:
             _apply_requested_scope(ctx, payload)
@@ -135,10 +143,15 @@ async def analyze(request: Request, payload: AnalyzeRequest) -> dict:
         return result.model_dump()
     except Exception:
         logger.exception("Analysis failed for task %s", payload.taskId)
+        message = user_text(
+            response_language,
+            en="Analysis was interrupted. Submit the question again.",
+            zh="分析意外中断，请重新提交问题。",
+        )
         conversations.add_message(
             payload.taskId,
             "assistant",
-            "Analysis was interrupted. Submit the question again.",
+            message,
             metadata={"runId": run_id, "status": "failed"},
         )
         raise

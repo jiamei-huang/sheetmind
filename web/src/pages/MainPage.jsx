@@ -218,15 +218,12 @@ export default function MainPage() {
           />
 
           <section className="mx-auto w-full max-w-7xl px-4 pb-40 pt-5 sm:px-6 sm:pt-6 lg:px-8">
-            <div className="mb-5 border-b border-slate-200 pb-5">
-              <p className="text-xs font-semibold uppercase tracking-wide text-blue-600">
-                AI spreadsheet analyst for Excel data
-              </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
-                Understand, clean, and reason about your workbook.
+            <div className="mb-6">
+              <h1 className="text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
+                Ask questions. Find insights in your Excel data.
               </h1>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-                Upload an Excel file, ask questions, detect data issues, and preview cleaning logic before exporting a clean table.
+                Upload one or more Excel workbooks to compare data, calculate metrics, and uncover patterns with AI.
               </p>
             </div>
 

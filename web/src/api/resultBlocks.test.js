@@ -8,6 +8,7 @@ test("converts native result blocks into the analysis view model", () => {
   const result = toAnalysisViewModel(
     {
       type: "result_blocks",
+      response_language: "zh",
       output_intents: ["table", "chart"],
       blocks: [
         { kind: "metric", label: "Revenue", value: 1200, unit: "CNY" },
@@ -39,6 +40,7 @@ test("converts native result blocks into the analysis view model", () => {
   );
 
   assert.equal(result.type, "both");
+  assert.equal(result.responseLanguage, "zh");
   assert.deepEqual(result.outputIntents, ["table", "chart"]);
   assert.equal(result.mode, "both");
   assert.equal(result.classification, "Data + Visualization");

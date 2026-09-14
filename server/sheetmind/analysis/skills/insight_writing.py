@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from ..context import AnalysisContext, ChartBlock, TableBlock
+from ..language import ResponseLanguage, language_name, resolve_response_language, user_text
 from ..models.configs import ModelRole
 from .base import Skill
 
@@ -39,17 +40,20 @@ class InsightWritingSkill(Skill):
     name = "insight_writing"
     description = "Generate natural-language insight text using LLM"
 
-    _SYSTEM_PROMPT = (
-        "You are a professional data analysis writer for SheetMind.\n\n"
-        "Output rules:\n"
-        "1. Always write user-facing prose in English.\n"
-        "2. Keep original column names, sheet names, and data values unchanged, even when they are not English.\n"
-        "3. Be concise, specific, and grounded only in the computed data.\n"
-        "4. Highlight the key finding, change, or risk instead of giving generic commentary.\n"
-        "5. Use concise Markdown with short headings, paragraphs, numbered lists, or bullets only. Do not output code or raw HTML.\n"
-        "6. Use one main idea per paragraph.\n"
-        "7. If the user asks to directly edit, save back, or write formulas into the original Excel workbook, state that SheetMind cannot directly edit the original workbook yet, then offer to design the transformation, preview the result, or export a clean table.\n"
-    )
+    @staticmethod
+    def _system_prompt(response_language: ResponseLanguage) -> str:
+        output_language = language_name(response_language)
+        return (
+            "You are a professional data analysis writer for SheetMind.\n\n"
+            "Output rules:\n"
+            f"1. Write all user-facing prose in {output_language}.\n"
+            "2. Keep original column names, sheet names, SKU values, platform names, and data values unchanged. Do not translate identifiers.\n"
+            "3. Be concise, specific, and grounded only in the computed data.\n"
+            "4. Highlight the key finding, change, or risk instead of giving generic commentary.\n"
+            "5. Use concise Markdown with short headings, paragraphs, numbered lists, or bullets only. Do not output code or raw HTML.\n"
+            "6. Use one main idea per paragraph.\n"
+            "7. If the user asks to directly edit, save back, or write formulas into the original Excel workbook, state in the required response language that SheetMind cannot directly edit the original workbook yet, then offer to design the transformation, preview the result, or export a clean table.\n"
+        )
 
     async def run(
         self,
@@ -60,24 +64,26 @@ class InsightWritingSkill(Skill):
         chart_block: Optional[ChartBlock] = None,
         table_block: Optional[TableBlock] = None,
         result_sets: Optional[List[tuple[str, pd.DataFrame]]] = None,
+        response_language: Optional[ResponseLanguage] = None,
         **kwargs: Any,
     ) -> str:
         provider = self.router.get_provider(ModelRole.INSIGHT_WRITING)
+        language = resolve_response_language(query, response_language)
 
         if scenario == "multi_result" and result_sets:
-            user_msg = self._multi_result_prompt(query, result_sets)
+            user_msg = self._multi_result_prompt(query, result_sets, language)
         elif scenario == "chart" and chart_block is not None:
-            user_msg = self._chart_insight_prompt(query, chart_block, result_df)
+            user_msg = self._chart_insight_prompt(query, chart_block, result_df, language)
         elif scenario in {"insight_only", "text_insight"}:
-            user_msg = self._text_insight_prompt(query, result_df, ctx)
+            user_msg = self._text_insight_prompt(query, result_df, ctx, language)
         else:
             # "processing" — brief description
-            user_msg = self._processing_prompt(query, result_df, table_block)
+            user_msg = self._processing_prompt(query, result_df, table_block, language)
 
         try:
             text = await provider.complete(
                 messages=[{"role": "user", "content": user_msg}],
-                system=self._SYSTEM_PROMPT,
+                system=self._system_prompt(language),
                 max_tokens=512,
                 temperature=0.3,
             )
@@ -90,6 +96,7 @@ class InsightWritingSkill(Skill):
                 result_df,
                 chart_block,
                 result_sets=result_sets,
+                response_language=language,
             )
 
     # ------------------------------------------------------------------
@@ -101,6 +108,7 @@ class InsightWritingSkill(Skill):
         query: str,
         result_df: Optional[pd.DataFrame],
         table_block: Optional[TableBlock],
+        response_language: ResponseLanguage = "en",
     ) -> str:
         rows = len(result_df) if result_df is not None else (len(table_block.rows) if table_block else 0)
         cols = list(result_df.columns[:5]) if result_df is not None else (table_block.columns[:5] if table_block else [])
@@ -134,7 +142,7 @@ class InsightWritingSkill(Skill):
             f"Processed result: {rows} rows, columns: {cols}"
             f"\n\nComputed facts:\n{InsightWritingSkill._facts_block(result_df)}"
             f"{data_str}{currency_instruction}\n\n"
-            "Write one concise English sentence explaining the key finding, such as the highest or lowest item. "
+            f"Write one concise sentence in {language_name(response_language)} explaining the key finding, such as the highest or lowest item. "
             "Only mention names that appear in the computed data."
         )
 
@@ -142,6 +150,7 @@ class InsightWritingSkill(Skill):
     def _multi_result_prompt(
         query: str,
         result_sets: List[tuple[str, pd.DataFrame]],
+        response_language: ResponseLanguage = "en",
     ) -> str:
         sections: List[str] = []
         included_results = result_sets[:6]
@@ -165,7 +174,7 @@ class InsightWritingSkill(Skill):
         return (
             f"Full user query: {query}\n\n"
             + "\n\n".join(sections)
-            + f"\n\nAnswer all {count} sub-questions in English and do not skip any. "
+            + f"\n\nAnswer all {count} sub-questions in {language_name(response_language)} and do not skip any. "
             "Use numbered items in the original order. Each item should directly give the relevant name and value. "
             "Use only the computed result under that sub-question."
         )
@@ -175,6 +184,7 @@ class InsightWritingSkill(Skill):
         query: str,
         chart: ChartBlock,
         result_df: Optional[pd.DataFrame],
+        response_language: ResponseLanguage = "en",
     ) -> str:
         # Build basic stats from chart data
         all_values: List[float] = []
@@ -202,6 +212,21 @@ class InsightWritingSkill(Skill):
         elif max_val < 1 and max_val > 0:
             unit = "(may be a ratio or percentage)"
 
+        markdown_format = user_text(
+            response_language,
+            en=(
+                "### Key Takeaways\n\n"
+                "- **Highest:** ...\n"
+                "- **Lowest:** ...\n\n"
+                "### Analysis\n\n"
+            ),
+            zh=(
+                "### 关键结论\n\n"
+                "- **最高：** ...\n"
+                "- **最低：** ...\n\n"
+                "### 分析\n\n"
+            ),
+        )
         return (
             f"Chart type: {chart.chart_type}\n"
             f"X-axis: {chart.x_axis_label or 'Category'} | Y-axis: {chart.y_axis_label or 'Value'}\n"
@@ -210,11 +235,8 @@ class InsightWritingSkill(Skill):
             f"Highest label: {max_label} | Lowest label: {min_label}\n"
             f"Computed facts:\n{InsightWritingSkill._facts_block(result_df)}\n"
             f"User query: {query}\n\n"
-            "Write chart insight in English using this Markdown format. Do not use emoji:\n"
-            "### Key Takeaways\n\n"
-            "- **Highest:** ...\n"
-            "- **Lowest:** ...\n\n"
-            "### Analysis\n\n"
+            f"Write chart insight in {language_name(response_language)} using this Markdown format. Do not use emoji:\n"
+            f"{markdown_format}"
             "Use one or two short paragraphs to explain differences, share, or trend."
         )
 
@@ -223,6 +245,7 @@ class InsightWritingSkill(Skill):
         query: str,
         result_df: Optional[pd.DataFrame],
         ctx: AnalysisContext,
+        response_language: ResponseLanguage = "en",
     ) -> str:
         data_summary = ""
         if result_df is not None and not result_df.empty:
@@ -240,7 +263,7 @@ class InsightWritingSkill(Skill):
             + (f"Conversation history:\n{conv}\n\n" if conv else "")
             + f"Computed facts:\n{InsightWritingSkill._facts_block(result_df)}\n\n"
             + (f"Data information:\n{data_summary}\n\n" if data_summary else "")
-            + "Provide professional data insight in English using only the computed facts and data information. "
+            + f"Provide professional data insight in {language_name(response_language)} using only the computed facts and data information. "
             "Use 2-4 short Markdown headings for key findings, data patterns, and business recommendations. "
             "Use short paragraphs or bullets under each heading. Put each recommendation on its own bullet. Do not use emoji."
         )
@@ -304,12 +327,17 @@ class InsightWritingSkill(Skill):
         result_df: Optional[pd.DataFrame],
         chart_block: Optional[ChartBlock],
         result_sets: Optional[List[tuple[str, pd.DataFrame]]] = None,
+        response_language: ResponseLanguage = "en",
     ) -> str:
         if scenario == "multi_result" and result_sets:
             lines: List[str] = []
             for index, (subquery, frame) in enumerate(result_sets, start=1):
                 if frame.empty:
-                    answer = "No matching data."
+                    answer = user_text(
+                        response_language,
+                        en="No matching data.",
+                        zh="没有匹配的数据。",
+                    )
                 elif len(frame) == 1:
                     row = frame.iloc[0]
                     answer = ", ".join(
@@ -318,20 +346,41 @@ class InsightWritingSkill(Skill):
                     )
                 else:
                     answer = InsightWritingSkill._facts_block(frame).replace("\n", "; ")
-                lines.append(f"{index}. {subquery}: {answer}")
+                separator = "：" if response_language == "zh" else ": "
+                lines.append(f"{index}. {subquery}{separator}{answer}")
             return "\n".join(lines)
 
         if scenario == "chart" and chart_block:
             all_vals = [v for s in chart_block.series for v in s.values if v is not None]
             if all_vals:
-                return (
-                    f"### Key Takeaways\n\n"
-                    f"- **Highest:** {max(all_vals):.2f}\n"
-                    f"- **Lowest:** {min(all_vals):.2f}"
+                return user_text(
+                    response_language,
+                    en=(
+                        f"### Key Takeaways\n\n"
+                        f"- **Highest:** {max(all_vals):.2f}\n"
+                        f"- **Lowest:** {min(all_vals):.2f}"
+                    ),
+                    zh=(
+                        f"### 关键结论\n\n"
+                        f"- **最高：** {max(all_vals):.2f}\n"
+                        f"- **最低：** {min(all_vals):.2f}"
+                    ),
                 )
-            return "The chart is ready."
+            return user_text(
+                response_language,
+                en="The chart is ready.",
+                zh="图表已生成。",
+            )
 
         if result_df is not None:
-            return f"Data processed. {InsightWritingSkill._facts_block(result_df)}"
+            return user_text(
+                response_language,
+                en=f"Data processed: {len(result_df)} rows and {len(result_df.columns)} columns.",
+                zh=f"数据处理完成，共 {len(result_df)} 行、{len(result_df.columns)} 列。",
+            )
 
-        return "Analysis complete."
+        return user_text(
+            response_language,
+            en="Analysis complete.",
+            zh="分析完成。",
+        )

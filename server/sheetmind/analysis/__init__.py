@@ -48,6 +48,7 @@ from .context import (
     Turn,
 )
 from .context_store import ContextStore, get_context_store
+from .language import ResponseLanguage, infer_response_language
 from .artifacts import AnalysisArtifactStore, get_artifact_store
 from .models.router import ModelRouter
 from .streaming.emitter import StreamEmitter
@@ -88,6 +89,8 @@ __all__ = [
     # Routing enums
     "RoutingHint",
     "MultiTurnMode",
+    "ResponseLanguage",
+    "infer_response_language",
     # Context store
     "ContextStore",
     "get_context_store",

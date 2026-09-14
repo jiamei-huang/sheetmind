@@ -31,6 +31,7 @@ from numbers import Real
 from typing import Any
 
 from ..context import ChartBlock, ResultBlocks, SummaryBlock, TableBlock
+from ..language import user_text
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,11 @@ def validate_result(
     if removed_charts:
         has_summary = any(_block_kind(block) == "summary" for block in valid_blocks)
         if not has_summary:
-            valid_blocks.insert(0, SummaryBlock(content="The chart data is incomplete, so the available analysis result was preserved."))
+            valid_blocks.insert(0, SummaryBlock(content=user_text(
+                result.response_language,
+                en="The chart data is incomplete, so the available analysis result was preserved.",
+                zh="图表数据不完整，已保留当前可用的分析结果。",
+            )))
         result.blocks = valid_blocks
         for question in result.questions:
             question.blocks = [
@@ -112,7 +117,11 @@ def validate_result(
             ]
             if question.status == "success" and not question.blocks:
                 question.blocks = [
-                    SummaryBlock(content="The chart data is incomplete and cannot be displayed yet.")
+                    SummaryBlock(content=user_text(
+                        result.response_language,
+                        en="The chart data is incomplete and cannot be displayed yet.",
+                        zh="图表数据不完整，暂时无法显示。",
+                    ))
                 ]
 
     return result

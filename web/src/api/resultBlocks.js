@@ -90,6 +90,7 @@ export const toAnalysisViewModel = (payload, prompt) => {
 
   return {
     type,
+    responseLanguage: payload.response_language === "zh" ? "zh" : "en",
     outputIntents,
     mode,
     classification,

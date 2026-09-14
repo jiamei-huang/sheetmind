@@ -1803,7 +1803,7 @@ class TestInsightWritingSkill:
         ))
 
         prompt = router._mock.requests[0]["messages"][0]["content"]
-        assert "Answer all 2 sub-questions in English" in prompt
+        assert "Answer all 2 sub-questions in Simplified Chinese" in prompt
         assert "哪个物流商花费最多" in prompt
         assert "A物流" in prompt
         assert "哪个店铺物流费用最贵" in prompt
@@ -3369,7 +3369,7 @@ class TestSheetMindAgentPipeline:
         assert result.has_chart
         assert result.has_table
         assert result.first_table().calculation_basis is not None
-        assert "previous result reuse" in result.first_table().calculation_basis.operations
+        assert "复用上一轮结果" in result.first_table().calculation_basis.operations
         assert agent.df_loader.run.call_count == 0
         assert agent.repair_loop.run.await_count == 0
 
