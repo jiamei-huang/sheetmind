@@ -27,7 +27,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import pandas as pd
 
-from ..context import AnalysisContext
+from ..context import AnalysisContext, QuerySemantics
 from ..skills.code_generation import CodeGenerationSkill
 from ..skills.semantic_typing import SemanticFieldMap
 from ..tools.python_executor import PythonExecutorTool
@@ -78,6 +78,7 @@ class RepairLoop:
         wants_chart: bool = False,
         is_compound: bool = False,
         required_columns: Optional[List[str]] = None,
+        semantics: Optional[QuerySemantics] = None,
         trace: Optional[Trace] = None,
         emit_progress: Optional[Callable] = None,
     ) -> Tuple[Optional[pd.DataFrame], str, int]:
@@ -126,6 +127,7 @@ class RepairLoop:
                     wants_chart=wants_chart,
                     is_compound=is_compound,
                     required_columns=required_columns,
+                    semantics=semantics,
                 )
             except Exception as exc:
                 logger.warning("[RepairLoop] code gen failed attempt=%d: %s", attempt + 1, exc)
@@ -173,6 +175,12 @@ class RepairLoop:
                 required_columns,
                 available_columns=df.columns,
             )
+            if field_error is None:
+                field_error = CodeGenerationSkill.validate_currency_safety(
+                    code,
+                    query,
+                    df,
+                )
             if field_error:
                 logger.warning("[RepairLoop] field contract failed attempt=%d: %s", attempt + 1, field_error)
                 if trace:

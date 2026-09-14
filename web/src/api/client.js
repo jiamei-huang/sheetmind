@@ -1,7 +1,7 @@
 import axios from "axios";
 
 const browserHost = typeof window !== "undefined" ? window.location.hostname : "127.0.0.1";
-const BACKEND_HOST = import.meta.env.VITE_API_BASE_URL || `http://${browserHost}:8000`;
+const BACKEND_HOST = import.meta.env?.VITE_API_BASE_URL || `http://${browserHost}:8000`;
 const API_PREFIX = "/api";
 const BASE_URL = `${BACKEND_HOST}${API_PREFIX}`;
 

@@ -13,9 +13,16 @@ test("converts native result blocks into the analysis view model", () => {
         { kind: "metric", label: "Revenue", value: 1200, unit: "CNY" },
         {
           kind: "table",
+          title: "Sales by region",
           columns: ["region", "sales"],
           rows: [{ region: "East", sales: 1200 }],
           total_rows: 20,
+          calculation_basis: {
+            source_sheets: ["sales.xlsx / Sheet1"],
+            fields: ["region", "sales"],
+            operations: ["分组求和", "排序比较"],
+            summary: "基于 sales.xlsx / Sheet1，按 region 汇总 sales。",
+          },
         },
         {
           kind: "chart",
@@ -37,6 +44,8 @@ test("converts native result blocks into the analysis view model", () => {
   assert.equal(result.classification, "Data + Visualization");
   assert.equal(result.metrics[0].value, 1200);
   assert.equal(result.preview.totalRowCount, 20);
+  assert.equal(result.preview.title, "Sales by region");
+  assert.deepEqual(result.preview.calculationBasis.fields, ["region", "sales"]);
   assert.equal(result.chartData.defaultType, "bar");
   assert.equal(result.chartData.confidence, 0.91);
   assert.match(result.chartData.reason, /numeric metric/);
@@ -173,4 +182,50 @@ test("keeps sheet conflict choices in the analysis view model", () => {
   assert.equal(result.mode, "clarification");
   assert.equal(result.classification, "Sheet Confirmation");
   assert.equal(result.sheetResolutions[0].candidates[0].sheet_name, "Sheet2");
+});
+
+test("keeps one conclusion per question and full-result artifact ids", () => {
+  const result = toAnalysisViewModel(
+    {
+      type: "result_blocks",
+      run_id: "run-1",
+      status: "success",
+      focus_question_id: "q2",
+      output_intents: ["table"],
+      questions: [
+        {
+          question_id: "q1",
+          query: "哪个物流商最高",
+          status: "success",
+          blocks: [{ kind: "summary", content: "日本海外仓最高。" }],
+        },
+        {
+          question_id: "q2",
+          query: "哪个平台最高",
+          status: "success",
+          blocks: [{ kind: "summary", content: "亚马逊最高。" }],
+        },
+      ],
+      blocks: [
+        { kind: "summary", content: "日本海外仓最高。" },
+        {
+          kind: "table",
+          columns: ["物流商", "费用"],
+          rows: [{ 物流商: "日本海外仓", 费用: 300 }],
+          total_rows: 1205,
+          preview_row_count: 1000,
+          artifact_id: "artifact-1",
+        },
+        { kind: "summary", content: "亚马逊最高。" },
+      ],
+    },
+    "两个问题"
+  );
+
+  assert.deepEqual(result.summaryItems.map((item) => item.content), [
+    "日本海外仓最高。", "亚马逊最高。",
+  ]);
+  assert.equal(result.preview.artifactId, "artifact-1");
+  assert.equal(result.runId, "run-1");
+  assert.equal(result.focusQuestionId, "q2");
 });

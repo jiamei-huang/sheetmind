@@ -1,4 +1,6 @@
-const DEFAULT_PALETTE = ["#2563eb", "#8b5cf6", "#10b981", "#f59e0b", "#ef4444", "#06b6d4"];
+import { DATA_VIZ_COLORS } from "../constants/colors.js";
+
+const DEFAULT_PALETTE = DATA_VIZ_COLORS;
 
 
 export const toAnalysisViewModel = (payload, prompt) => {
@@ -16,6 +18,18 @@ export const toAnalysisViewModel = (payload, prompt) => {
   const metrics = payload.blocks.filter((block) => block.kind === "metric");
   const fieldResolutions = payload.blocks.filter((block) => block.kind === "field_resolution");
   const sheetResolutions = payload.blocks.filter((block) => block.kind === "sheet_resolution");
+  const statusMessages = payload.blocks.filter((block) => block.kind === "status");
+  const questionResults = Array.isArray(payload.questions)
+    ? payload.questions.map((question) => ({
+        questionId: question.question_id,
+        query: question.query,
+        status: question.status,
+        summaries: (question.blocks ?? [])
+          .filter((block) => block.kind === "summary" && block.content)
+          .map((block) => block.content),
+        executionReport: question.execution_report ?? null,
+      }))
+    : [];
   const needsFieldClarification = fieldResolutions.some(
     (block) => block.status === "needs_clarification"
   );
@@ -57,6 +71,9 @@ export const toAnalysisViewModel = (payload, prompt) => {
     rows: tableBlock.rows ?? [],
     totalRowCount: tableBlock.total_rows ?? tableBlock.rows?.length ?? 0,
     totals: tableBlock.totals ?? {},
+    calculationBasis: tableBlock.calculation_basis ?? null,
+    artifactId: tableBlock.artifact_id ?? null,
+    previewRowCount: tableBlock.preview_row_count ?? tableBlock.rows?.length ?? 0,
   }));
   const chartDatas = charts.map((chartBlock, index) => ({
     title: chartBlock.title || `图表 ${index + 1}`,
@@ -65,6 +82,7 @@ export const toAnalysisViewModel = (payload, prompt) => {
     series: chartBlock.series ?? [],
     palette: chartBlock.palette ?? DEFAULT_PALETTE,
     xAxisLabel: chartBlock.x_axis_label,
+    xAxisType: chartBlock.x_axis_type,
     yAxisLabel: chartBlock.y_axis_label,
     confidence: chartBlock.confidence,
     reason: chartBlock.reason,
@@ -78,6 +96,19 @@ export const toAnalysisViewModel = (payload, prompt) => {
     prompt,
     processedAt: new Date().toISOString(),
     suggestion: summaries.join("\n\n"),
+    summaryItems: questionResults.flatMap((question) =>
+      question.summaries.map((content) => ({
+        questionId: question.questionId,
+        query: question.query,
+        status: question.status,
+        content,
+      }))
+    ),
+    status: payload.status ?? "success",
+    runId: payload.run_id ?? null,
+    focusQuestionId: payload.focus_question_id ?? null,
+    statusMessages,
+    questionResults,
     metrics,
     fieldResolutions,
     sheetResolutions,

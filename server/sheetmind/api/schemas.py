@@ -33,10 +33,12 @@ class CreateTaskRequest(BaseModel):
 class ParseExcelRequest(BaseModel):
     projectId: str = Field(min_length=1)
     fileName: str = Field(min_length=1)
+    fileId: Optional[str] = None
 
 
 class AnalyzeSelectedFile(BaseModel):
     fileName: str = Field(min_length=1)
+    fileId: Optional[str] = None
     sheets: list[str] = Field(min_length=1)
 
 

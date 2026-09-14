@@ -26,57 +26,60 @@ const TaskListPanel = ({ tasks, activeTaskId, onSelectTask, onRenameTask, onDele
   }, [openMenuId]);
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2 bg-gray-50">
+    <div className="flex-1 space-y-1 overflow-y-auto bg-white px-3 pb-4">
         {sortedTasks.length === 0 ? (
-          <div className="text-center text-gray-500 text-sm py-8">
+          <div className="text-center text-slate-500 text-sm py-8">
             No tasks yet. Create one to get started.
           </div>
         ) : (
           sortedTasks.map((task) => {
             const isActive = task.id === activeTaskId;
             const statusMeta = {
-              draft: { icon: "🟡", label: "Draft" },
-              running: { icon: "⏳", label: "Running" },
-              completed: { icon: "✅", label: "Completed" },
-            }[task.status] || { icon: "🟡", label: "Draft" };
+              draft: { dot: "bg-amber-400", label: "Draft" },
+              running: { dot: "bg-blue-500 animate-pulse", label: "Running" },
+              completed: { dot: "bg-emerald-500", label: "Completed" },
+            }[task.status] || { dot: "bg-amber-400", label: "Draft" };
 
             return (
               <div
                 key={task.id}
-                className={`bg-white rounded border-2 transition-all ${
-                  isActive ? "border-blue-500 shadow-md" : "border-gray-200 hover:border-gray-300 hover:shadow-sm"
+                className={`group relative rounded-md transition-colors ${
+                  isActive ? "bg-blue-50" : "hover:bg-slate-50"
                 }`}
               >
-                <div className="p-3">
-                  <div className="flex items-center justify-between mb-2">
-                    <div
-                      className="flex items-center gap-2 flex-1 min-w-0 cursor-pointer"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (onSelectTask) {
-                          onSelectTask(task.id);
-                        }
-                      }}
-                    >
-                      <span className="text-sm">{statusMeta.icon}</span>
-                      <span className="text-sm font-semibold text-gray-900 truncate">
-                        {task.title || `Task #${task.number}`}
-                      </span>
-                    </div>
-                    <div className="relative flex-shrink-0" ref={(el) => (menuRefs.current[task.id] = el)}>
+                <button
+                  type="button"
+                  onClick={() => onSelectTask?.(task.id)}
+                  aria-current={isActive ? "page" : undefined}
+                  className={`flex min-h-[64px] w-full flex-col justify-center border-l-2 px-3 py-2 pr-11 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500 ${
+                    isActive ? "border-blue-600" : "border-transparent"
+                  }`}
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className={`h-2 w-2 shrink-0 rounded-full ${statusMeta.dot}`} aria-hidden="true" />
+                    <span className="truncate text-sm font-semibold text-slate-900">
+                      {task.title || `Task #${task.number}`}
+                    </span>
+                  </span>
+                  <span className="mt-1 pl-4 text-xs text-slate-500">
+                    {new Date(task.createdAt).toLocaleString()}
+                  </span>
+                  <span className="sr-only">{statusMeta.label}</span>
+                </button>
+                <div className="absolute right-2 top-2.5" ref={(el) => (menuRefs.current[task.id] = el)}>
                       <button
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
                           setOpenMenuId(openMenuId === task.id ? null : task.id);
                         }}
-                        className="p-1 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors mr-2"
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-white hover:text-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                         aria-label="Task options"
                       >
                         <MoreVertical className="w-4 h-4" />
                       </button>
                       {openMenuId === task.id && (
-                        <div className="absolute right-0 mt-1 w-32 bg-white border border-gray-200 rounded-md shadow-lg z-10">
+                        <div className="absolute right-0 top-9 z-10 w-32 rounded-md border border-slate-200 bg-white shadow-lg">
                           <button
                             type="button"
                             onClick={(e) => {
@@ -84,7 +87,7 @@ const TaskListPanel = ({ tasks, activeTaskId, onSelectTask, onRenameTask, onDele
                               setOpenMenuId(null);
                               onRenameTask(task.id);
                             }}
-                            className="w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-100"
+                            className="w-full px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
                           >
                             Rename
                           </button>
@@ -95,27 +98,12 @@ const TaskListPanel = ({ tasks, activeTaskId, onSelectTask, onRenameTask, onDele
                               setOpenMenuId(null);
                               onDeleteTask(task.id);
                             }}
-                            className="w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-gray-100"
+                            className="w-full px-3 py-2 text-left text-sm text-red-600 hover:bg-slate-100"
                           >
                             Delete
                           </button>
                         </div>
                       )}
-                    </div>
-                  </div>
-                  <div
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (onSelectTask) {
-                        onSelectTask(task.id);
-                      }
-                    }}
-                    className="cursor-pointer"
-                  >
-                    <p className="text-xs" style={{ color: "#888" }}>
-                      {new Date(task.createdAt).toLocaleString()}
-                    </p>
-                  </div>
                 </div>
               </div>
             );

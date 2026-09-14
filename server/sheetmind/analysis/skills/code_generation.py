@@ -17,12 +17,15 @@ Returns the generated code as a plain string.
 from __future__ import annotations
 
 import ast
+import json
 import logging
+import re
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 import pandas as pd
 
-from ..context import AnalysisContext
+from ..context import AnalysisContext, QuerySemantics
 from ..models.configs import ModelRole
 from .base import Skill, SkillError
 from .data_profiling import DataProfile
@@ -30,6 +33,28 @@ from .field_resolution import FieldResolver
 from .semantic_typing import SemanticFieldMap
 
 logger = logging.getLogger(__name__)
+
+_MONEY_TERMS = ("花费", "花钱", "费用", "金额", "成本", "cost", "spend", "expense", "amount")
+_MONEY_COLUMN_TERMS = ("金额", "花费", "费用", "成本", "amount", "cost", "expense")
+_CURRENCY_COLUMN_NAMES = {"币别", "币种", "货币", "货币类型", "currency", "currencycode"}
+_CURRENCY_ALIASES = {
+    "CNY": ("人民币", "cny", "rmb"),
+    "USD": ("美元", "usd", "美金"),
+    "EUR": ("欧元", "eur"),
+    "JPY": ("日元", "jpy", "日币"),
+    "GBP": ("英镑", "gbp"),
+    "HKD": ("港币", "港元", "hkd"),
+}
+_CURRENCY_PRIORITY = ("CNY", "USD", "EUR", "JPY", "GBP", "HKD")
+
+
+@dataclass(frozen=True)
+class _CurrencySafetyPolicy:
+    currency_column: str
+    currencies: tuple[str, ...]
+    required_column: str
+    normalized_amount_column: Optional[str] = None
+    explicit_currency: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # System prompt (matches spec §7 + old DataProcessingAgent constraints)
@@ -88,6 +113,7 @@ class CodeGenerationSkill(Skill):
         wants_chart: bool = False,
         is_compound: bool = False,
         required_columns: Optional[list[str]] = None,
+        semantics: Optional[QuerySemantics] = None,
         **kwargs: Any,
     ) -> str:
         """
@@ -118,6 +144,7 @@ class CodeGenerationSkill(Skill):
             wants_chart=wants_chart,
             is_compound=is_compound,
             required_columns=required_columns,
+            semantics=semantics,
             ctx=ctx,
         )
 
@@ -149,6 +176,7 @@ class CodeGenerationSkill(Skill):
         wants_chart: bool,
         is_compound: bool,
         required_columns: Optional[list[str]],
+        semantics: Optional[QuerySemantics],
         ctx: AnalysisContext,
     ) -> str:
         parts = []
@@ -185,6 +213,38 @@ class CodeGenerationSkill(Skill):
                 f"用户查询已解析到这些源数据列，生成代码必须直接引用：{required_columns!r}\n"
                 "不要改用相似但未限定的列名；例如用户问 USD/RMB 时，必须使用对应货币字段。"
             )
+
+        if semantics is not None:
+            parts.append(
+                "【已验证语义计划】\n"
+                + json.dumps(semantics.model_dump(mode="json"), ensure_ascii=False)
+                + "\n必须按该计划中的维度、指标、筛选、排序和 limit 生成 result_df；"
+                "禁止自行更换字段、Sheet 语义或聚合方式。"
+            )
+
+        currency_policy = self._currency_safety_policy(query, df)
+        if currency_policy is not None:
+            currencies = "、".join(currency_policy.currencies)
+            if currency_policy.normalized_amount_column is not None:
+                instruction = (
+                    f"数据包含多个币种（{currencies}）。必须使用完整的统一币种金额列 "
+                    f"{currency_policy.normalized_amount_column!r} 比较，禁止使用原始金额列跨币种求和。"
+                )
+            elif currency_policy.explicit_currency is not None:
+                instruction = (
+                    f"数据包含多个币种（{currencies}）。用户指定了 "
+                    f"{currency_policy.explicit_currency}，必须先用 "
+                    f"{currency_policy.currency_column!r} 筛选该币种，再汇总原始金额；"
+                    "禁止把其他币种计入结果。"
+                )
+            else:
+                instruction = (
+                    f"数据包含多个币种（{currencies}），且没有完整的统一币种金额列。"
+                    "禁止把不同币种的原始金额直接相加；必须先按 "
+                    f"{currency_policy.currency_column!r} 分组，在每个币种内分别计算，"
+                    "并在 result_df 中保留币种列。"
+                )
+            parts.append(f"【币种安全约束】\n{instruction}")
 
         # Compound query hint — instruct LLM to answer each sub-question separately
         # and stack results into one result_df with a '问题' label column
@@ -270,6 +330,166 @@ class CodeGenerationSkill(Skill):
             f"{missing!r}。请让这些精确列名参与筛选、分组、排序或计算，"
             "不能只把列名写在无关变量或输出标签中。"
         )
+
+    @classmethod
+    def validate_currency_safety(
+        cls,
+        code: str,
+        query: str,
+        df: Optional[pd.DataFrame],
+    ) -> Optional[str]:
+        """Reject generated aggregations that ignore a mixed-currency contract."""
+        policy = cls._currency_safety_policy(query, df)
+        if policy is None or df is None:
+            return None
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None
+
+        referenced = cls._result_lineage_columns(
+            tree,
+            {str(column) for column in df.columns},
+        )
+        if policy.required_column in referenced:
+            return None
+        if policy.normalized_amount_column is not None:
+            return (
+                "币种安全约束失败：数据包含多个币种，result_df 必须使用完整的统一币种金额列 "
+                f"{policy.normalized_amount_column!r}，不能直接聚合原始金额。"
+            )
+        if policy.explicit_currency is not None:
+            return (
+                "币种安全约束失败：result_df 的数据流必须使用 "
+                f"{policy.currency_column!r} 筛选用户指定的 {policy.explicit_currency}，"
+                "不能把其他币种计入结果。"
+            )
+        return (
+            "币种安全约束失败：数据包含多个币种且没有完整换算金额，result_df 的数据流必须使用 "
+            f"{policy.currency_column!r} 按币种分别聚合并保留币种，不能跨币种直接求和。"
+        )
+
+    @classmethod
+    def _currency_safety_policy(
+        cls,
+        query: str,
+        df: Optional[pd.DataFrame],
+    ) -> Optional[_CurrencySafetyPolicy]:
+        if df is None or df.empty or not any(term in query.lower() for term in _MONEY_TERMS):
+            return None
+
+        currency_column = next(
+            (
+                str(column)
+                for column in df.columns
+                if cls._normalise_currency_text(column) in _CURRENCY_COLUMN_NAMES
+            ),
+            None,
+        )
+        if currency_column is None:
+            return None
+
+        currency_values = (
+            df[currency_column]
+            .dropna()
+            .astype(str)
+            .str.strip()
+        )
+        currency_values = currency_values[currency_values != ""]
+        currencies = tuple(sorted(currency_values.drop_duplicates().tolist()))
+        if len(currencies) <= 1:
+            return None
+
+        raw_amount_column = next(
+            (
+                str(column)
+                for column in df.columns
+                if any(term in str(column).lower() for term in _MONEY_COLUMN_TERMS)
+                and cls._column_currency_code(str(column)) is None
+            ),
+            None,
+        )
+        required_rows = (
+            pd.to_numeric(df[raw_amount_column], errors="coerce").notna()
+            if raw_amount_column is not None
+            else pd.Series(True, index=df.index)
+        )
+        required_count = int(required_rows.sum())
+        normalized_candidates: list[tuple[int, str, str]] = []
+        for column in df.columns:
+            column_name = str(column)
+            code = cls._column_currency_code(column_name)
+            if code is None or not any(
+                term in column_name.lower() for term in _MONEY_COLUMN_TERMS
+            ):
+                continue
+            populated = pd.to_numeric(
+                df.loc[required_rows, column_name], errors="coerce"
+            ).notna().sum()
+            if int(populated) != required_count:
+                continue
+            normalized_candidates.append(
+                (_CURRENCY_PRIORITY.index(code), column_name, code)
+            )
+
+        explicit_currency = cls._query_currency_code(query)
+        if normalized_candidates:
+            if explicit_currency is not None:
+                matching = [
+                    candidate
+                    for candidate in normalized_candidates
+                    if candidate[2] == explicit_currency
+                ]
+                if matching:
+                    normalized_candidates = matching
+                else:
+                    return _CurrencySafetyPolicy(
+                        currency_column=currency_column,
+                        currencies=currencies,
+                        required_column=currency_column,
+                        explicit_currency=explicit_currency,
+                    )
+            _, normalized_column, _ = min(normalized_candidates)
+            return _CurrencySafetyPolicy(
+                currency_column=currency_column,
+                currencies=currencies,
+                required_column=normalized_column,
+                normalized_amount_column=normalized_column,
+                explicit_currency=explicit_currency,
+            )
+
+        return _CurrencySafetyPolicy(
+            currency_column=currency_column,
+            currencies=currencies,
+            required_column=currency_column,
+            explicit_currency=explicit_currency,
+        )
+
+    @staticmethod
+    def _normalise_currency_text(value: Any) -> str:
+        return re.sub(r"[\s_\-（()）【】\[\].]", "", str(value).lower())
+
+    @classmethod
+    def _column_currency_code(cls, value: str) -> Optional[str]:
+        normalized = cls._normalise_currency_text(value)
+        for code, aliases in _CURRENCY_ALIASES.items():
+            if code.lower() in normalized or any(
+                cls._normalise_currency_text(alias) in normalized
+                for alias in aliases
+            ):
+                return code
+        return None
+
+    @classmethod
+    def _query_currency_code(cls, query: str) -> Optional[str]:
+        normalized = cls._normalise_currency_text(query)
+        for code, aliases in _CURRENCY_ALIASES.items():
+            if code.lower() in normalized or any(
+                cls._normalise_currency_text(alias) in normalized
+                for alias in aliases
+            ):
+                return code
+        return None
 
     @staticmethod
     def _result_lineage_columns(tree: ast.AST, available: set[str]) -> set[str]:

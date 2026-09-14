@@ -14,6 +14,7 @@ from .semantic_typing import SemanticFieldMap
 
 _BAR_KWS = ["柱状图", "柱图", "bar", "柱状", "对比", "比较", "排名", "各个", "各", "每个"]
 _LINE_KWS = ["折线图", "折线", "line", "趋势", "走势", "变化", "trend", "时序", "时间序列"]
+_EXPLICIT_LINE_KWS = ["折线图", "折线", "line"]
 _PIE_KWS = ["饼图", "pie", "占比", "比例", "份额", "percentage", "composition", "构成"]
 _NEGATION_PATTERN = re.compile(r"(?:不是|不用|不要|换掉|替换|remove|not)\s*([^\s，,。.！!？?]{1,20})")
 _IDENTIFIER_NAME_RE = re.compile(r"(?:^|[_\-\s])(id|sku)(?:$|[_\-\s])|编号|编码|订单号|单号|客户id|用户id|tracking|waybill", re.I)
@@ -82,13 +83,21 @@ class ChartPlanningSkill(Skill):
         q_lower = query.lower()
         if any(kw in q_lower for kw in _PIE_KWS):
             return "pie"
-        if any(kw in q_lower for kw in _LINE_KWS):
+        if any(kw in q_lower for kw in _EXPLICIT_LINE_KWS):
             return "line"
+        is_temporal_axis = (
+            pd.api.types.is_datetime64_any_dtype(df[x_col])
+            or bool(
+                field_map
+                and field_map.get(x_col, None)
+                and field_map[x_col].type in {"datetime", "datetime-like"}
+            )
+        )
+        if any(kw in q_lower for kw in _LINE_KWS):
+            return "line" if is_temporal_axis else "bar"
         if any(kw in q_lower for kw in _BAR_KWS):
             return "bar"
-        if field_map and field_map.get(x_col, None) and field_map[x_col].type in {"datetime", "datetime-like"}:
-            return "line"
-        if pd.api.types.is_datetime64_any_dtype(df[x_col]):
+        if is_temporal_axis:
             return "line"
         return "bar"
 
@@ -244,21 +253,6 @@ class ChartPlanningSkill(Skill):
         field_map: Optional[SemanticFieldMap],
     ) -> ChartBlock:
         plot_df = df[[spec.x_col, *spec.y_cols]].copy()
-        if spec.chart_type in {"bar", "pie"} and len(plot_df) > 12:
-            # Keep crowded categorical charts legible and preserve their total in Other.
-            primary = spec.y_cols[0]
-            plot_df = plot_df.assign(_sort_value=pd.to_numeric(plot_df[primary], errors="coerce").fillna(0))
-            top = plot_df.nlargest(10, "_sort_value").drop(columns="_sort_value")
-            rest = plot_df.drop(index=top.index)
-            if not rest.empty:
-                other = {spec.x_col: "Other"}
-                for col in spec.y_cols:
-                    other[col] = pd.to_numeric(rest[col], errors="coerce").sum()
-                plot_df = pd.concat([top, pd.DataFrame([other])], ignore_index=True)
-            else:
-                plot_df = top
-        else:
-            plot_df = plot_df.head(500)
 
         labels = [str(value) for value in plot_df[spec.x_col].tolist()]
         series = [
@@ -278,11 +272,21 @@ class ChartPlanningSkill(Skill):
                 next((qualifier for qualifier in qualifiers if qualifier in {"rmb", "usd", "percent", "quantity"}), ""), ""
             )
         y_axis_label = f"{spec.y_cols[0]} ({unit})" if unit and unit.lower() not in spec.y_cols[0].lower() else spec.y_cols[0]
+        x_axis_type = (
+            field_map[spec.x_col].type
+            if field_map and spec.x_col in field_map
+            else "datetime"
+            if pd.api.types.is_datetime64_any_dtype(plot_df[spec.x_col])
+            else "identifier"
+            if ChartPlanningSkill._is_identifier(spec.x_col, field_map)
+            else "categorical"
+        )
         return ChartBlock(
             chart_type=spec.chart_type,
             labels=labels,
             series=series,
             x_axis_label=spec.x_col,
+            x_axis_type=x_axis_type,
             y_axis_label=y_axis_label,
             confidence=spec.confidence,
             reason=spec.reason,

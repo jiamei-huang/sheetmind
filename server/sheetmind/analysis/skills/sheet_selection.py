@@ -23,6 +23,7 @@ class RankedSheetCandidate:
     columns: List[str]
     score: float
     reason: str
+    file_id: str = ""
 
 
 @dataclass
@@ -44,6 +45,37 @@ class SheetSelectionSkill(Skill):
     name = "sheet_selection"
     description = "Recall sheets by metadata, rank ambiguous candidates, and surface conflicts"
 
+    @staticmethod
+    def catalog(ctx: AnalysisContext) -> List[Dict[str, Any]]:
+        """Recall the source catalog once so planning and binding share one snapshot."""
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        return SheetSelector().list_sheet_metadata(ctx.project_id)
+
+    @classmethod
+    def metadata_within_checked_scope(
+        cls,
+        ctx: AnalysisContext,
+        metadata: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Return metadata that planning is authorized to bind and execute."""
+        if not ctx.requested_sheet_scope:
+            return []
+        scoped: List[Dict[str, Any]] = []
+        for item in metadata:
+            candidate = RankedSheetCandidate(
+                candidate_id=str(item.get("candidateId", "")),
+                file_id=str(item.get("fileId", "")),
+                file_name=str(item.get("fileName", "")),
+                sheet_name=str(item.get("sheetName", "")),
+                columns=[],
+                score=0.0,
+                reason="",
+            )
+            if cls._candidate_is_checked(ctx, candidate):
+                scoped.append(item)
+        return scoped
+
     async def run(
         self,
         ctx: AnalysisContext,
@@ -60,7 +92,7 @@ class SheetSelectionSkill(Skill):
             ) from exc
 
         try:
-            metadata = SheetSelector().list_sheet_metadata(ctx.project_id)
+            metadata = kwargs.get("metadata") or self.catalog(ctx)
         except Exception as exc:
             logger.warning("Sheet metadata recall failed: %s", exc)
             raise SkillError(
@@ -74,22 +106,129 @@ class SheetSelectionSkill(Skill):
         target_fields = [
             str(value) for value in kwargs.get("target_fields", []) if str(value).strip()
         ]
+        source_mode = str(kwargs.get("source_mode") or "single")
         ranked = self._rank_candidates(metadata, query, target_fields)
-        explicit = self._explicit_choice(query, ranked)
-        if explicit:
-            return self._confirmed([explicit], explicit.score, "user explicitly confirmed sheet")
-
         scoped = self._scope_candidates(ctx, ranked)
-        if ctx.requested_sheet_scope and not scoped:
+        scoped_ids = {candidate.candidate_id for candidate in scoped}
+
+        if not ctx.requested_sheet_scope:
+            return SheetSelectionDecision(
+                status="needs_clarification",
+                candidates=ranked[:5],
+                confidence=ranked[0].score,
+                reason="no sheets are checked for analysis",
+            )
+        if not scoped:
             return SheetSelectionDecision(
                 status="scope_conflict",
                 candidates=ranked[:5],
                 confidence=ranked[0].score,
-                reason="the user-selected workbook or sheet is no longer available",
+                reason="the checked workbook or sheet is no longer available",
             )
-        if scoped:
-            return await self._decide_with_scope(ctx, query, ranked, scoped)
-        return await self._decide_without_scope(ctx, query, ranked)
+
+        explicit = self._explicit_choice(query, ranked)
+        if explicit:
+            if explicit.candidate_id not in scoped_ids:
+                return SheetSelectionDecision(
+                    status="scope_conflict",
+                    candidates=[explicit],
+                    confidence=max(explicit.score, 0.98),
+                    reason="the explicitly requested sheet is not checked",
+                )
+            return self._confirmed([explicit], max(explicit.score, 0.98), "user explicitly confirmed sheet")
+
+        file_named = self._file_named_candidates(query, ranked)
+        file_named_inside = [
+            candidate for candidate in file_named
+            if candidate.candidate_id in scoped_ids
+        ]
+        file_named_outside = [
+            candidate for candidate in file_named
+            if candidate.candidate_id not in scoped_ids
+        ]
+        if file_named_outside and not file_named_inside:
+            return SheetSelectionDecision(
+                status="scope_conflict",
+                candidates=file_named_outside[:5],
+                confidence=max(candidate.score for candidate in file_named_outside),
+                reason="the workbook explicitly requested by the user is not checked",
+            )
+
+        preferred_ids = {
+            str(value) for value in kwargs.get("preferred_candidate_ids", []) if str(value)
+        }
+        preferred = [item for item in ranked if item.candidate_id in preferred_ids]
+        if preferred_ids and len(preferred) != len(preferred_ids):
+            return SheetSelectionDecision(
+                status="needs_clarification",
+                candidates=preferred or ranked[:5],
+                reason="the planned source is no longer available",
+            )
+        preferred_outside_scope = [
+            candidate for candidate in preferred
+            if candidate.candidate_id not in scoped_ids
+        ]
+        if preferred_outside_scope:
+            return SheetSelectionDecision(
+                status="scope_conflict",
+                candidates=preferred_outside_scope[:5],
+                confidence=max(candidate.score for candidate in preferred_outside_scope),
+                reason="the semantic plan selected a sheet that is not checked",
+            )
+
+        explicitly_named = self._query_named_candidates(query, ranked)
+        named_inside_scope = [
+            candidate for candidate in explicitly_named
+            if candidate.candidate_id in scoped_ids
+        ]
+        named_outside_scope = [
+            candidate for candidate in explicitly_named
+            if candidate.candidate_id not in scoped_ids
+        ]
+        if named_outside_scope and not named_inside_scope:
+            return SheetSelectionDecision(
+                status="scope_conflict",
+                candidates=named_outside_scope[:5],
+                confidence=max(candidate.score for candidate in named_outside_scope),
+                reason="the sheet explicitly requested by the user is not checked",
+            )
+
+        explicit_multi_source = bool(
+            source_mode in {"union", "join"}
+            and self._requests_multiple_sheets(query)
+        )
+        if len(named_inside_scope) == 1:
+            candidate = named_inside_scope[0]
+            return self._confirmed(
+                [candidate],
+                max(candidate.score, 0.98),
+                "query explicitly names a selected sheet",
+            )
+
+        duplicate_candidates = self._duplicate_source_candidates(scoped)
+        if duplicate_candidates and not explicit_multi_source:
+            return SheetSelectionDecision(
+                status="needs_clarification",
+                candidates=duplicate_candidates[:5],
+                confidence=max(candidate.score for candidate in duplicate_candidates),
+                reason="multiple checked workbook versions contain the same plausible sheet",
+            )
+
+        if preferred_ids:
+            if len(preferred) == 1:
+                return self._confirmed(preferred, 0.99, "source bound by the semantic plan")
+            if explicit_multi_source:
+                return self._confirmed(preferred, 0.98, "explicit multi-source semantic plan")
+            return SheetSelectionDecision(
+                status="needs_clarification",
+                candidates=preferred[:5],
+                confidence=0.98,
+                reason=(
+                    "multiple sources require independent questions or an explicit join; "
+                    "they cannot be concatenated implicitly"
+                ),
+            )
+        return await self._decide_with_scope(ctx, query, ranked, scoped, source_mode)
 
     async def _decide_with_scope(
         self,
@@ -97,7 +236,30 @@ class SheetSelectionSkill(Skill):
         query: str,
         ranked: List[RankedSheetCandidate],
         scoped: List[RankedSheetCandidate],
+        source_mode: str = "single",
     ) -> SheetSelectionDecision:
+        explicitly_named = self._query_named_candidates(query, scoped)
+        if len(explicitly_named) == 1:
+            candidate = explicitly_named[0]
+            return self._confirmed(
+                [candidate],
+                max(candidate.score, 0.98),
+                "query explicitly names a selected sheet",
+            )
+        if len(explicitly_named) > 1:
+            if source_mode in {"union", "join"} and self._requests_multiple_sheets(query):
+                return self._confirmed(
+                    explicitly_named,
+                    0.95,
+                    "query explicitly requests multiple selected sheets",
+                )
+            return SheetSelectionDecision(
+                status="needs_clarification",
+                candidates=explicitly_named[:5],
+                confidence=max(candidate.score for candidate in explicitly_named),
+                reason="query names multiple sheets without a clear combine or comparison request",
+            )
+
         scoped_ids = {candidate.candidate_id for candidate in scoped}
         outside = [candidate for candidate in ranked if candidate.candidate_id not in scoped_ids]
         best_scope = max(scoped, key=lambda item: item.score)
@@ -128,10 +290,9 @@ class SheetSelectionSkill(Skill):
                 and llm_choice[1] >= 0.75
                 else best_outside
             )
-            candidates = self._unique_candidates([conflict_candidate, *scoped])[:5]
             return SheetSelectionDecision(
                 status="scope_conflict",
-                candidates=candidates,
+                candidates=[conflict_candidate],
                 confidence=max(conflict_candidate.score, llm_choice[1] if llm_choice else 0.0),
                 reason=(
                     f"current selection does not match query metadata; "
@@ -151,15 +312,28 @@ class SheetSelectionSkill(Skill):
         if llm_choice and llm_choice[1] >= 0.80:
             return self._confirmed([llm_choice[0]], llm_choice[1], llm_choice[2])
 
-        # Multiple sheets were explicitly selected and no evidence favors one.
-        # Preserve that scope rather than silently discarding part of it.
-        return self._confirmed(scoped, 0.75, "using all user-selected sheets")
+        if source_mode in {"union", "join"} and self._requests_multiple_sheets(query):
+            return self._confirmed(
+                scoped,
+                0.80,
+                "query requests analysis across the selected sheets",
+            )
+
+        # Checkboxes define the candidate pool, not an instruction to concatenate
+        # unrelated tables. Ask when neither metadata nor the model can choose.
+        return SheetSelectionDecision(
+            status="needs_clarification",
+            candidates=sorted(scoped, key=lambda item: (-item.score, item.candidate_id))[:5],
+            confidence=max(best_scope.score, llm_choice[1] if llm_choice else 0.0),
+            reason="multiple selected sheets remain plausible for this question",
+        )
 
     async def _decide_without_scope(
         self,
         ctx: AnalysisContext,
         query: str,
         ranked: List[RankedSheetCandidate],
+        source_mode: str = "single",
     ) -> SheetSelectionDecision:
         if len(ranked) == 1:
             return self._confirmed(ranked, 0.95, "only available sheet")
@@ -244,9 +418,10 @@ class SheetSelectionSkill(Skill):
         normalized_query = cls._normalize(query)
         ranked: List[RankedSheetCandidate] = []
         for raw in metadata:
+            file_id = str(raw.get("fileId", ""))
             file_name = str(raw.get("fileName", ""))
             sheet_name = str(raw.get("sheetName", ""))
-            candidate_id = str(raw.get("candidateId", f"{file_name}::{sheet_name}"))
+            candidate_id = str(raw.get("candidateId", f"{file_id or file_name}::{sheet_name}"))
             columns = [str(column) for column in raw.get("columns", []) if str(column).strip()]
             reasons: List[str] = []
             score = 0.0
@@ -298,6 +473,7 @@ class SheetSelectionSkill(Skill):
             score = min(score + max(0.0, 0.04 - recency_rank * 0.01), 1.0)
             ranked.append(RankedSheetCandidate(
                 candidate_id=candidate_id,
+                file_id=file_id,
                 file_name=file_name,
                 sheet_name=sheet_name,
                 columns=columns,
@@ -312,22 +488,28 @@ class SheetSelectionSkill(Skill):
         ctx: AnalysisContext,
         candidates: List[RankedSheetCandidate],
     ) -> List[RankedSheetCandidate]:
-        requested = ctx.requested_sheet_scope
-        if requested:
-            matches = []
-            for candidate in candidates:
-                for scope in requested:
-                    file_name = str(scope.get("fileName", ""))
-                    sheets = {str(sheet) for sheet in scope.get("sheets", [])}
-                    if file_name and file_name != candidate.file_name:
-                        continue
-                    if sheets and candidate.sheet_name not in sheets:
-                        continue
-                    matches.append(candidate)
-                    break
-            return matches
-        selected_names = set(ctx.selected_sheets)
-        return [candidate for candidate in candidates if candidate.sheet_name in selected_names]
+        return [
+            candidate for candidate in candidates
+            if cls._candidate_is_checked(ctx, candidate)
+        ]
+
+    @staticmethod
+    def _candidate_is_checked(
+        ctx: AnalysisContext,
+        candidate: RankedSheetCandidate,
+    ) -> bool:
+        for scope in ctx.requested_sheet_scope:
+            file_id = str(scope.get("fileId", ""))
+            file_name = str(scope.get("fileName", ""))
+            sheets = {str(sheet) for sheet in scope.get("sheets", [])}
+            if file_id and file_id != candidate.file_id:
+                continue
+            if not file_id and file_name and file_name != candidate.file_name:
+                continue
+            if candidate.sheet_name not in sheets:
+                continue
+            return True
+        return False
 
     @classmethod
     def _explicit_choice(
@@ -349,21 +531,134 @@ class SheetSelectionSkill(Skill):
                 return exact[0]
         return None
 
+    @classmethod
+    def _named_candidates(
+        cls,
+        query: str,
+        candidates: List[RankedSheetCandidate],
+    ) -> List[RankedSheetCandidate]:
+        normalized_query = cls._normalize(query)
+        return [
+            candidate
+            for candidate in candidates
+            if len(cls._normalize(candidate.sheet_name)) >= 2
+            and cls._normalize(candidate.sheet_name) in normalized_query
+        ]
+
+    @classmethod
+    def _file_named_candidates(
+        cls,
+        query: str,
+        candidates: List[RankedSheetCandidate],
+    ) -> List[RankedSheetCandidate]:
+        normalized_query = cls._normalize(query)
+        lower_query = query.lower()
+        matches: List[tuple[int, RankedSheetCandidate]] = []
+        for candidate in candidates:
+            file_name = candidate.file_name.lower()
+            stem = cls._normalize(Path(candidate.file_name).stem)
+            full_name_match = bool(file_name and file_name in lower_query)
+            contextual_stem_match = bool(
+                len(stem) >= 3
+                and stem in normalized_query
+                and any(marker in lower_query for marker in ("文件", "excel", "工作簿", ".xlsx", ".xls"))
+            )
+            if full_name_match or contextual_stem_match:
+                matches.append((len(stem), candidate))
+        if not matches:
+            return []
+        longest = max(length for length, _candidate in matches)
+        return [candidate for length, candidate in matches if length == longest]
+
+    @classmethod
+    def _query_named_candidates(
+        cls,
+        query: str,
+        candidates: List[RankedSheetCandidate],
+    ) -> List[RankedSheetCandidate]:
+        sheet_matches = cls._named_candidates(query, candidates)
+        file_matches = cls._file_named_candidates(query, candidates)
+        if sheet_matches and file_matches:
+            file_ids = {candidate.candidate_id for candidate in file_matches}
+            intersection = [
+                candidate for candidate in sheet_matches
+                if candidate.candidate_id in file_ids
+            ]
+            if intersection:
+                return intersection
+        return file_matches or sheet_matches
+
+    @classmethod
+    def _duplicate_source_candidates(
+        cls,
+        candidates: List[RankedSheetCandidate],
+    ) -> List[RankedSheetCandidate]:
+        if len(candidates) < 2:
+            return []
+        best_score = max(candidate.score for candidate in candidates)
+        plausible = [
+            candidate for candidate in candidates
+            if candidate.score >= max(0.58, best_score - 0.08)
+        ]
+        duplicates: List[RankedSheetCandidate] = []
+        for index, left in enumerate(plausible):
+            left_columns = {cls._normalize(column) for column in left.columns if cls._normalize(column)}
+            for right in plausible[index + 1:]:
+                same_file = bool(
+                    left.file_id and right.file_id and left.file_id == right.file_id
+                ) or (
+                    not left.file_id and not right.file_id and left.file_name == right.file_name
+                )
+                if same_file:
+                    continue
+                right_columns = {cls._normalize(column) for column in right.columns if cls._normalize(column)}
+                union = left_columns | right_columns
+                schema_similarity = len(left_columns & right_columns) / len(union) if union else 0.0
+                same_sheet = cls._normalize(left.sheet_name) == cls._normalize(right.sheet_name)
+                if same_sheet or schema_similarity >= 0.8:
+                    duplicates.extend((left, right))
+        return cls._unique_candidates(
+            sorted(duplicates, key=lambda item: (-item.score, item.candidate_id))
+        )
+
+    @classmethod
+    def _requests_multiple_sheets(cls, query: str) -> bool:
+        normalized = cls._normalize(query)
+        return any(
+            signal in normalized
+            for signal in (
+                "合并", "拼接", "汇总所有", "全部sheet", "所有sheet",
+                "跨sheet", "多个sheet", "两张表", "两个表", "对比", "比较",
+                "左联", "右联", "左连接", "右连接", "内连接", "外连接",
+                "combine", "merge", "join", "allsheets", "acrosssheets",
+            )
+        )
+
     @staticmethod
     def _confirmed(
         candidates: List[RankedSheetCandidate],
         confidence: float,
         reason: str,
     ) -> SheetSelectionDecision:
-        grouped: Dict[str, List[str]] = {}
+        grouped: Dict[tuple[str, str], List[str]] = {}
         for candidate in candidates:
-            grouped.setdefault(candidate.file_name, []).append(candidate.sheet_name)
+            grouped.setdefault(
+                (candidate.file_id, candidate.file_name), []
+            ).append(candidate.sheet_name)
+        selected_files = []
+        for (file_id, file_name), sheets in grouped.items():
+            item = {
+                "fileName": file_name,
+                "sheets": sheets,
+                "confidence": confidence,
+                "reason": reason,
+            }
+            if file_id:
+                item["fileId"] = file_id
+            selected_files.append(item)
         return SheetSelectionDecision(
             status="confirmed",
-            selected_files=[
-                {"fileName": file_name, "sheets": sheets, "confidence": confidence, "reason": reason}
-                for file_name, sheets in grouped.items()
-            ],
+            selected_files=selected_files,
             candidates=candidates,
             confidence=confidence,
             reason=reason,

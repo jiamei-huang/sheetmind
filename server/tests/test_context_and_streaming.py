@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
+import pandas as pd
 
 from sheetmind.analysis.context import (
     AnalysisContext,
@@ -208,6 +209,19 @@ class TestAnalysisContext:
         ctx.add_assistant_turn("r2", r2)
         assert ctx.last_assistant_result() is r2
 
+    def test_last_tabular_result_survives_a_summary_only_turn(self):
+        ctx = make_ctx()
+        table_result = ResultBlocks(blocks=[
+            TableBlock(columns=["店铺", "金额"], rows=[{"店铺": "A", "金额": 10}])
+        ])
+        ctx.add_assistant_turn("table", table_result)
+        ctx.add_assistant_turn(
+            "explanation",
+            ResultBlocks(blocks=[SummaryBlock(content="explanation")]),
+        )
+
+        assert ctx.last_tabular_result() is table_result
+
     def test_conversation_text(self):
         ctx = make_ctx()
         ctx.add_user_turn("show me sales")
@@ -230,6 +244,61 @@ class TestAnalysisContext:
             selected_sheets=["Sheet1"],
         )
         assert ctx.files[0].file_name == "sales.xlsx"
+
+    def test_changing_requested_sheet_scope_invalidates_runtime_data(self):
+        ctx = make_ctx()
+        first_scope = [{"fileName": "a.xlsx", "sheets": ["Sheet1"]}]
+        ctx.set_requested_sheet_scope(first_scope)
+        ctx._active_df = pd.DataFrame({"金额": [1]})
+        ctx._source_df = ctx._active_df
+        ctx._result_df = pd.DataFrame({"金额": [1]})
+        ctx.active_source_scope = ctx.requested_scope_key()
+
+        ctx.set_requested_sheet_scope([
+            {"fileName": "b.xlsx", "sheets": ["Sheet2"]}
+        ])
+
+        assert ctx._active_df is None
+        assert ctx._source_df is None
+        assert ctx._result_df is None
+        assert ctx.source_scope_changed is True
+
+    def test_changing_persisted_sheet_scope_is_detected_without_runtime_data(self):
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{"fileName": "a.xlsx", "sheets": ["Sheet1"]}]
+        ctx.active_source_scope = ctx.requested_scope_key()
+        ctx.active_result = ResultBlocks(blocks=[SummaryBlock(content="old result")])
+
+        restored = AnalysisContext.model_validate_json(ctx.model_dump_json())
+        restored.set_requested_sheet_scope([
+            {"fileName": "b.xlsx", "sheets": ["Sheet2"]}
+        ])
+
+        assert restored._active_df is None
+        assert restored.source_scope_changed is True
+        assert restored.active_result is None
+
+    def test_same_requested_scope_does_not_invalidate_a_narrower_active_source(self):
+        ctx = make_ctx()
+        requested_scope = [{
+            "fileName": "costs.xlsx",
+            "sheets": ["尾程", "仓储"],
+        }]
+        ctx.requested_sheet_scope = requested_scope
+        ctx.active_source_scope = ctx.scope_key([{
+            "fileName": "costs.xlsx",
+            "sheets": ["仓储"],
+        }])
+        ctx.selected_sheets = ["仓储"]
+        ctx._active_df = pd.DataFrame({"平台": ["乐天"]})
+        ctx.active_result = ResultBlocks(blocks=[SummaryBlock(content="乐天最高")])
+
+        ctx.set_requested_sheet_scope(requested_scope)
+
+        assert ctx._active_df is not None
+        assert ctx.active_result is not None
+        assert ctx.source_scope_changed is False
+        assert ctx.selected_sheets == ["仓储"]
 
 
 # ---------------------------------------------------------------------------
@@ -435,3 +504,11 @@ class TestModelRouter:
         monkeypatch.setenv("SHEETMIND_MODEL_ROUTING_ID", "gpt-3.5-turbo")
         router = ModelRouter()
         assert router.config_for(ModelRole.ROUTING).model_id == "gpt-3.5-turbo"
+
+    def test_query_planning_inherits_routing_model_for_legacy_env(self, monkeypatch):
+        monkeypatch.setenv("SHEETMIND_MODEL_ROUTING_ID", "deepseek-chat")
+        monkeypatch.delenv("SHEETMIND_MODEL_QUERY_PLANNING_ID", raising=False)
+
+        router = ModelRouter()
+
+        assert router.config_for(ModelRole.QUERY_PLANNING).model_id == "deepseek-chat"

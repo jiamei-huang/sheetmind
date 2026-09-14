@@ -14,12 +14,10 @@ from sheetmind.database import init_db
 from sheetmind.exceptions import SheetMindException, safe_error_message
 from sheetmind.config import settings
 from sheetmind.logging import configure_logging
-from sheetmind.services.anonymous_sessions import (
-    SESSION_COOKIE_NAME,
-    SESSION_LIFETIME_DAYS,
-)
+from sheetmind.services.anonymous_sessions import SESSION_COOKIE_NAME
 
 from .api.analysis import router as analysis_router
+from .api.anonymous_session import router as session_router
 from .api.conversations import router as conversations_router
 from .api.files import router as files_router
 from .api.projects import router as projects_router
@@ -50,15 +48,24 @@ def create_app() -> FastAPI:
     async def attach_anonymous_session(request: Request, call_next):
         session = anonymous_sessions.resolve(request.cookies.get(SESSION_COOKIE_NAME))
         request.state.anonymous_session_id = session.session_id
+        request.state.anonymous_session_expires_at = session.expires_at
+        request.state.clear_anonymous_session_cookie = False
         response = await call_next(request)
-        response.set_cookie(
-            key=SESSION_COOKIE_NAME,
-            value=session.session_id,
-            max_age=SESSION_LIFETIME_DAYS * 24 * 60 * 60,
-            httponly=True,
-            samesite="lax",
-            secure=settings.session_cookie_secure,
-        )
+        cookie_options = {
+            "key": SESSION_COOKIE_NAME,
+            "httponly": True,
+            "samesite": "lax",
+            "secure": settings.session_cookie_secure,
+        }
+        if request.state.clear_anonymous_session_cookie:
+            response.delete_cookie(**cookie_options)
+        else:
+            response.set_cookie(
+                **cookie_options,
+                value=session.session_id,
+                max_age=anonymous_sessions.lifetime_days * 24 * 60 * 60,
+                expires=session.expires_at,
+            )
         return response
 
     @app.exception_handler(SheetMindException)
@@ -83,6 +90,7 @@ def create_app() -> FastAPI:
         files_router,
         analysis_router,
         conversations_router,
+        session_router,
     ):
         app.include_router(router, prefix="/api")
 

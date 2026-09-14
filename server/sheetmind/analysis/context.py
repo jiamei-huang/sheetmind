@@ -9,6 +9,8 @@ MultiTurnMode    determines whether to use the previous result as input.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from datetime import datetime
 from enum import Enum
@@ -56,23 +58,94 @@ class MultiTurnMode(str, Enum):
     RESET      = "reset"
 
 
+class QueryFilter(BaseModel):
+    """A planner-owned filter before it is bound to a physical column."""
+
+    field: str
+    operator: Literal[
+        "eq", "neq", "contains", "in", "gt", "gte", "lt", "lte", "between"
+    ] = "eq"
+    value: Any = None
+
+
+class QueryMetric(BaseModel):
+    """A requested metric and aggregation in the semantic query contract."""
+
+    field: str
+    aggregation: Literal[
+        "sum", "avg", "min", "max", "count", "count_distinct", "last", "none"
+    ] = "none"
+    alias: Optional[str] = None
+
+
+class QuerySort(BaseModel):
+    """A requested ordering in the semantic query contract."""
+
+    field: str
+    direction: Literal["asc", "desc"] = "desc"
+
+
+class QuerySemantics(BaseModel):
+    """The single semantic interpretation consumed by every downstream stage."""
+
+    source_hints: List[str] = Field(default_factory=list)
+    source_candidate_ids: List[str] = Field(default_factory=list)
+    source_mode: Literal["single", "union", "join", "independent"] = "single"
+    dimensions: List[str] = Field(default_factory=list)
+    metrics: List[QueryMetric] = Field(default_factory=list)
+    filters: List[QueryFilter] = Field(default_factory=list)
+    sort: List[QuerySort] = Field(default_factory=list)
+    limit: Optional[int] = Field(default=None, ge=1, le=100000)
+
+
+class SourceBinding(BaseModel):
+    """Validated physical source selected for one atomic question."""
+
+    candidate_id: str
+    file_id: Optional[str] = None
+    file_name: str
+    sheet_name: str
+    confidence: float = 0.0
+    reason: str = ""
+
+
+class ExecutionReport(BaseModel):
+    """Executor-produced provenance; never reconstructed from presentation text."""
+
+    status: Literal["success", "empty", "failed", "skipped"] = "success"
+    engine: Optional[Literal["rule", "code", "insight"]] = None
+    source_bindings: List[SourceBinding] = Field(default_factory=list)
+    source_rows: Optional[int] = None
+    result_rows: Optional[int] = None
+    fields: List[str] = Field(default_factory=list)
+    operations: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+
 class ExecutionStep(BaseModel):
     """One validated, atomic operation in a query execution plan."""
 
     step_id: str
+    question_id: str = ""
     query: str
     normalized_query: str = ""
     route: RoutingHint
     depends_on: List[str] = Field(default_factory=list)
-    input_source: Literal["source", "previous_result", "step"] = "source"
+    input_source: Literal["source", "active_dataframe", "previous_result", "step"] = "source"
+    scope_from: Optional[str] = None
     operation_intents: List[str] = Field(default_factory=list)
     output_intents: List[str] = Field(default_factory=lambda: ["auto"])
     output_explicit: bool = False
     needs_new_computation: bool = True
     target_fields: List[str] = Field(default_factory=list)
+    semantics: QuerySemantics = Field(default_factory=QuerySemantics)
+    source_bindings: List[SourceBinding] = Field(default_factory=list)
     required_source_columns: List[str] = Field(default_factory=list)
     field_resolutions: List["FieldResolutionRecord"] = Field(default_factory=list)
     confidence: float = 0.0
+    execution_report: Optional[ExecutionReport] = None
 
 
 class ExecutionPlan(BaseModel):
@@ -96,6 +169,15 @@ class ExecutionPlan(BaseModel):
     planner_used: bool = False
     planner_source: Literal["single", "llm", "rule_fallback"] = "single"
     reasoning: str = ""
+
+
+class ResultLineage(BaseModel):
+    """Reusable row-scope facts carried independently from display columns."""
+
+    source_scope: str = ""
+    filters: Dict[str, List[str]] = Field(default_factory=dict)
+    result_filters: Dict[str, List[str]] = Field(default_factory=dict)
+    result_columns: List[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +232,7 @@ class SheetCandidate(BaseModel):
     """One file/sheet candidate offered for an explicit user decision."""
 
     candidate_id: str
+    file_id: Optional[str] = None
     file_name: str
     sheet_name: str
     columns: List[str] = Field(default_factory=list)
@@ -183,6 +266,15 @@ class ColumnMeta(BaseModel):
     decimal_places: Optional[int] = None
 
 
+class CalculationBasis(BaseModel):
+    """Concise, user-visible provenance for a computed table result."""
+
+    source_sheets: List[str] = Field(default_factory=list)
+    fields: List[str] = Field(default_factory=list)
+    operations: List[str] = Field(default_factory=list)
+    summary: str = ""
+
+
 class TableBlock(BaseModel):
     """Tabular data result."""
     kind: Literal["table"] = "table"
@@ -192,6 +284,9 @@ class TableBlock(BaseModel):
     total_rows: Optional[int] = None
     totals: Optional[Dict[str, Optional[float]]] = None
     columns_metadata: Optional[List[ColumnMeta]] = None
+    calculation_basis: Optional[CalculationBasis] = None
+    artifact_id: Optional[str] = None
+    preview_row_count: Optional[int] = None
 
 
 class ChartSeries(BaseModel):
@@ -212,9 +307,41 @@ class ChartBlock(BaseModel):
     series: List[ChartSeries]                   # [{name, values}]
     palette: Optional[List[str]] = None
     x_axis_label: Optional[str] = None
+    x_axis_type: Optional[str] = None
     y_axis_label: Optional[str] = None
     confidence: Optional[float] = None
     reason: Optional[str] = None
+
+
+class StatusBlock(BaseModel):
+    """Typed non-success outcome rendered without pretending it is an insight."""
+
+    kind: Literal["status"] = "status"
+    status: Literal["empty", "failed", "partial", "needs_input"]
+    message: str
+    error_code: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+ResultBlock = Union[
+    SummaryBlock,
+    FieldResolutionBlock,
+    SheetResolutionBlock,
+    MetricBlock,
+    TableBlock,
+    ChartBlock,
+    StatusBlock,
+]
+
+
+class QuestionResult(BaseModel):
+    """All outputs and provenance for exactly one user sub-question."""
+
+    question_id: str
+    query: str
+    status: Literal["success", "empty", "failed", "needs_input", "skipped"]
+    blocks: List[ResultBlock] = Field(default_factory=list)
+    execution_report: Optional[ExecutionReport] = None
 
 
 # ---------------------------------------------------------------------------
@@ -225,19 +352,14 @@ class ResultBlocks(BaseModel):
     """Stable result protocol produced by the analysis runtime."""
 
     type: Literal["result_blocks"] = "result_blocks"
+    run_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    status: Literal[
+        "success", "partial", "empty", "failed", "needs_input"
+    ] = "success"
+    focus_question_id: Optional[str] = None
     output_intents: List[str] = Field(default_factory=lambda: ["auto"])
-    blocks: List[
-        Union[
-            SummaryBlock,
-            FieldResolutionBlock,
-            SheetResolutionBlock,
-            MetricBlock,
-            TableBlock,
-            ChartBlock,
-        ]
-    ] = Field(
-        default_factory=list
-    )
+    questions: List[QuestionResult] = Field(default_factory=list)
+    blocks: List[ResultBlock] = Field(default_factory=list)
 
     @property
     def has_table(self) -> bool:
@@ -268,6 +390,21 @@ class ResultBlocks(BaseModel):
             if self._block_kind(b) == "chart":
                 return b if isinstance(b, ChartBlock) else None
         return None
+
+    def focused_table(self) -> Optional[TableBlock]:
+        if self.focus_question_id:
+            question = next(
+                (
+                    item for item in self.questions
+                    if item.question_id == self.focus_question_id
+                ),
+                None,
+            )
+            if question is not None:
+                for block in question.blocks:
+                    if self._block_kind(block) == "table":
+                        return block if isinstance(block, TableBlock) else None
+        return self.first_table()
 
     def all_summaries(self) -> List[str]:
         texts = []
@@ -316,6 +453,9 @@ class AnalysisContext(BaseModel):
     conversation: List[Turn] = Field(default_factory=list)
     active_result: Optional[ResultBlocks] = None
     execution_plan: Optional[ExecutionPlan] = None
+    active_lineage: Optional[ResultLineage] = None
+    active_source_scope: str = ""
+    source_scope_changed: bool = False
     trace_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
     # Runtime-only, not serialized
@@ -323,6 +463,7 @@ class AnalysisContext(BaseModel):
     _source_df: Any = PrivateAttr(default=None)
     _result_df: Any = PrivateAttr(default=None)
     _load_report: Any = PrivateAttr(default=None)
+    _run_lock: Any = PrivateAttr(default_factory=asyncio.Lock)
 
     # -------------------------------------------------------------------
     # Conversation helpers
@@ -330,6 +471,42 @@ class AnalysisContext(BaseModel):
 
     def add_user_turn(self, query: str) -> None:
         self.conversation.append(Turn(role="user", content=query))
+
+    @staticmethod
+    def scope_key(scope: List[Dict[str, Any]]) -> str:
+        normalized = []
+        for item in scope:
+            entry = {
+                "fileName": str(item.get("fileName", "")),
+                "sheets": sorted(str(sheet) for sheet in item.get("sheets", [])),
+            }
+            if item.get("fileId"):
+                entry["fileId"] = str(item["fileId"])
+            normalized.append(entry)
+        normalized.sort(key=lambda item: (item.get("fileId", ""), item["fileName"], item["sheets"]))
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+    def requested_scope_key(self) -> str:
+        return self.scope_key(self.requested_sheet_scope)
+
+    def set_requested_sheet_scope(self, scope: List[Dict[str, Any]]) -> None:
+        new_scope = [dict(item) for item in scope]
+        new_key = self.scope_key(new_scope)
+        # The requested scope is the user's candidate pool. active_source_scope
+        # is the narrower source selected for the previous question; comparing
+        # those two concepts invalidates valid follow-up state on every request.
+        old_key = self.requested_scope_key()
+        if old_key and old_key != new_key:
+            self._active_df = None
+            self._source_df = None
+            self._result_df = None
+            self.active_result = None
+            self.active_lineage = None
+            self.execution_plan = None
+            self.active_source_scope = ""
+            self.source_scope_changed = True
+            self.selected_sheets = []
+        self.requested_sheet_scope = new_scope
 
     def add_assistant_turn(
         self,
@@ -352,6 +529,15 @@ class AnalysisContext(BaseModel):
         for turn in reversed(self.conversation):
             if turn.role == "assistant" and turn.result is not None:
                 return turn.result
+        return None
+
+    def last_tabular_result(self) -> Optional[ResultBlocks]:
+        """Return the newest result that still carries reusable row data."""
+        for turn in reversed(self.conversation):
+            if turn.role == "assistant" and turn.result is not None and turn.result.has_table:
+                return turn.result
+        if self.active_result is not None and self.active_result.has_table:
+            return self.active_result
         return None
 
     def conversation_text(self, max_turns: int = 10) -> str:

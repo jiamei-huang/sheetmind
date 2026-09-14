@@ -27,8 +27,8 @@ def list_projects(request: Request) -> dict[str, list[ProjectInfo]]:
 
 @router.post("", status_code=201)
 def create_project(request: Request, payload: CreateProjectRequest) -> dict:
-    parsed_files = uploads.parse_files(payload.files)
     try:
+        parsed_files = uploads.parse_files(payload.files)
         result = projects.get_or_create_project(
             payload.projectName,
             payload.files,
@@ -39,7 +39,11 @@ def create_project(request: Request, payload: CreateProjectRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     for info, write in zip(parsed_files, result.files):
-        info.update(fileId=write.file_id, uploadStatus=write.status)
+        info.update(
+            fileId=write.file_id,
+            fileName=write.file_name,
+            uploadStatus=write.status,
+        )
     return {
         "projectId": result.project_id,
         "projectName": payload.projectName.strip(),

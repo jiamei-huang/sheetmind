@@ -43,20 +43,22 @@ export default function FileCard({
   };
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5 space-y-4">
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+    <div className="space-y-3 py-3 first:pt-1 last:pb-1">
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div className="flex-1 space-y-2">
           <div className="flex items-center gap-3">
-            <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-green-50 text-green-600">
+            <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-emerald-50 text-emerald-600">
               <FileSpreadsheet className="w-5 h-5" />
             </span>
             <div>
-              <p className="text-sm font-semibold text-gray-900">{file.name}</p>
-              <p className="text-xs text-gray-500">{selectedSheetsLabel}</p>
+              <p className="truncate text-sm font-semibold text-slate-900" title={file.name}>
+                {file.name}
+              </p>
+              <p className="text-xs text-slate-500">{selectedSheetsLabel}</p>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-4 text-xs text-gray-500">
+          <div className="flex flex-wrap items-center gap-4 text-xs text-slate-500">
             <div className="flex items-center gap-1.5">
               <HardDrive className="w-4 h-4" />
               <span>{file.size}</span>
@@ -72,7 +74,8 @@ export default function FileCard({
           <button
             type="button"
             onClick={handleToggleExpanded}
-            className="inline-flex items-center gap-1 px-4 py-2 text-sm font-medium bg-blue-50 text-blue-700 hover:bg-blue-100 rounded-md border border-blue-200 transition-colors"
+            aria-label={`${isExpanded ? "Hide sheets for" : "Select sheets for"} ${file.name}`}
+            className="sm-control-secondary inline-flex items-center gap-1"
           >
             {isExpanded ? (
               <>
@@ -90,7 +93,7 @@ export default function FileCard({
           <button
             type="button"
             onClick={() => onDelete(file.id)}
-            className="inline-flex items-center justify-center w-10 h-10 rounded-md bg-[#F6F8FB] text-gray-500 hover:bg-red-50 transition-colors hover:text-red-500"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-red-50 hover:text-red-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
             aria-label={`Delete ${file.name}`}
           >
             <Trash2 className="w-4 h-4" />
@@ -103,6 +106,7 @@ export default function FileCard({
           sheets={file.sheets}
           draftSelectedSheets={draftSelectedSheets}
           projectId={file.projectId || projectId} // 优先使用文件对象中的 projectId
+          fileId={file.fileId || file.id}
           fileName={file.name}
           onToggleSheet={(sheetName) => {
             setDraftSelectedSheets((prev) =>

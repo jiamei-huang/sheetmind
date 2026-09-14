@@ -33,6 +33,7 @@ yarn-error.log*
 # SheetMind runtime state
 server/data/
 server/logs/
+logs/
 server/results/
 server/uploads/
 *.db

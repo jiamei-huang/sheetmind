@@ -4,7 +4,10 @@ Excel解析服务层
 """
 import io
 import pandas as pd
+from datetime import date, datetime, time
+from numbers import Real
 from typing import List, Dict, Any, Optional
+from openpyxl.utils.datetime import from_excel
 from sheetmind.database import get_db_connection
 from sheetmind.logging import get_logger
 
@@ -13,6 +16,18 @@ logger = get_logger("excel_service")
 
 class ExcelService:
     """Excel解析服务"""
+
+    def get_file_by_id(self, project_id: str, file_id: str) -> Optional[bytes]:
+        """Return one exact workbook version by its stable identifier."""
+        conn = get_db_connection()
+        try:
+            row = conn.execute(
+                "SELECT file_data FROM files WHERE project_id = ? AND file_id = ?",
+                (project_id, file_id),
+            ).fetchone()
+            return row[0] if row and row[0] else None
+        finally:
+            conn.close()
 
     def get_file_by_name(self, project_id: str, file_name: str) -> Optional[bytes]:
         """
@@ -65,7 +80,12 @@ class ExcelService:
             conn.close()
             logger.debug(f"[ExcelService] ✅ 数据库连接已关闭")
 
-    def parse_excel(self, project_id: str, file_name: str) -> Dict[str, Any]:
+    def parse_excel(
+        self,
+        project_id: str,
+        file_name: str,
+        file_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         解析Excel文件，返回sheet列表、字段和数据预览
         Args:
@@ -75,7 +95,11 @@ class ExcelService:
             包含sheet信息的字典
         """
         # 获取文件数据
-        file_bytes = self.get_file_by_name(project_id, file_name)
+        file_bytes = (
+            self.get_file_by_id(project_id, file_id)
+            if file_id
+            else self.get_file_by_name(project_id, file_name)
+        )
         if not file_bytes:
             raise ValueError(f"File '{file_name}' not found in project '{project_id}'")
 
@@ -85,39 +109,31 @@ class ExcelService:
         try:
             with pd.ExcelFile(io.BytesIO(file_bytes)) as xls:
                 sheet_names = xls.sheet_names
+                workbook_epoch = getattr(xls.book, "epoch", None)
 
                 for sheet_name in sheet_names:
                     try:
-                        # 读取前20行数据，确保读取所有列
-                        # 对于大文件，使用 dtype=object 确保所有列都被读取，不进行类型推断
+                        header_row = self._detect_header_row(file_bytes, sheet_name)
                         try:
-                            # 方法1：使用 dtype=object 读取所有列（推荐，确保所有列都被读取）
                             df = pd.read_excel(
                                 xls,
                                 sheet_name=sheet_name,
+                                header=header_row,
                                 nrows=50,
-                                engine='openpyxl',  # 使用 openpyxl 引擎，对大文件支持更好
-                                dtype=object,  # 使用 object 类型，确保所有列都被读取，不进行类型推断
-                                na_filter=False  # 不进行 NA 值过滤，提高性能
+                                dtype=object,
+                                na_filter=False,
                             )
-                        except Exception as e1:
-                            logger.debug(f"[ExcelService] Warning: Failed to read with openpyxl engine and dtype=object, trying without dtype: {e1}")
-                            try:
-                                # 方法2：不使用 dtype，让 pandas 自动推断
-                                df = pd.read_excel(
-                                    xls,
-                                    sheet_name=sheet_name,
-                                    nrows=50,
-                                    engine='openpyxl'
-                                )
-                            except Exception as e2:
-                                logger.debug(f"[ExcelService] Warning: Failed to read with openpyxl engine, trying default engine: {e2}")
-                                # 方法3：使用默认引擎
-                                df = pd.read_excel(
-                                    xls,
-                                    sheet_name=sheet_name,
-                                    nrows=50
-                                )
+                        except Exception as exc:
+                            logger.debug(
+                                "[ExcelService] dtype-preserving preview read failed; retrying: %s",
+                                exc,
+                            )
+                            df = pd.read_excel(
+                                xls,
+                                sheet_name=sheet_name,
+                                header=header_row,
+                                nrows=50,
+                            )
 
                         # 获取列名（字段），强制转为字符串（避免 pandas 对无表头 Excel 生成 int 列名导致 Pydantic 验证失败）
                         columns = [str(c) for c in df.columns.tolist()]
@@ -126,28 +142,15 @@ class ExcelService:
                         logger.debug(f"[ExcelService] Sheet '{sheet_name}': {len(df)} rows, {len(columns)} columns")
                         logger.debug(f"[ExcelService] Columns: {columns[:10]}..." if len(columns) > 10 else f"[ExcelService] Columns: {columns}")
 
-                        # 将DataFrame转换为字典列表（处理NaN值）
-                        # 注意：columns 已是 List[str]，但 DataFrame 原始列名可能是 int/float，
-                        # 所以用 df.columns（原始）取值，用 str(orig_col) 作为 dict key
                         preview_data = []
-                        for idx, row in df.iterrows():
+                        for _, row in df.iterrows():
                             row_dict = {}
                             for orig_col, str_col in zip(df.columns, columns):
-                                value = row[orig_col]
-                                # 处理NaN、None等特殊值
-                                if pd.isna(value):
-                                    row_dict[str_col] = None
-                                else:
-                                    # 确保值被正确转换（处理各种数据类型）
-                                    if isinstance(value, (int, float)):
-                                        # 如果是数字，保持原样
-                                        row_dict[str_col] = value
-                                    elif isinstance(value, str):
-                                        # 如果是字符串，保持原样
-                                        row_dict[str_col] = value
-                                    else:
-                                        # 其他类型转换为字符串
-                                        row_dict[str_col] = str(value) if value is not None else None
+                                row_dict[str_col] = self._preview_value(
+                                    row[orig_col],
+                                    str_col,
+                                    workbook_epoch,
+                                )
                             preview_data.append(row_dict)
 
                         if preview_data:
@@ -176,9 +179,106 @@ class ExcelService:
             raise ValueError(f"Failed to parse Excel file '{file_name}': {str(e)}")
 
         return {
+            "fileId": file_id,
             "fileName": file_name,
             "sheets": sheets_info
         }
+
+    @staticmethod
+    def _detect_header_row(file_bytes: bytes, sheet_name: str) -> int:
+        """Find a business header below optional title or summary rows."""
+        try:
+            raw = pd.read_excel(
+                io.BytesIO(file_bytes),
+                sheet_name=sheet_name,
+                header=None,
+                nrows=15,
+            )
+        except Exception:
+            return 0
+        if raw.empty:
+            return 0
+
+        keywords = (
+            "月份", "日期", "时间", "平台", "店铺", "产品", "sku", "物流商",
+            "费用", "金额", "币别", "汇率", "数量", "国家", "订单",
+        )
+        total_columns = max(raw.shape[1], 1)
+        for row_index, row in raw.iterrows():
+            values = [value for value in row.tolist() if pd.notna(value) and str(value).strip()]
+            if not values or len(values) / total_columns < 0.4:
+                continue
+            strings = [str(value).strip() for value in values if isinstance(value, str)]
+            if len(strings) / len(values) < 0.5:
+                continue
+            keyword_hits = sum(
+                any(keyword in label.lower() for keyword in keywords)
+                for label in strings
+            )
+            if keyword_hits >= 2 or len(set(strings)) == len(strings):
+                return int(row_index)
+        return 0
+
+    @classmethod
+    def _preview_value(cls, value: Any, column_name: str, workbook_epoch: Any) -> Any:
+        """Serialize previews without exposing Excel date serial numbers."""
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            return None
+        if isinstance(value, (datetime, date, time)):
+            return cls._format_temporal_value(value, column_name)
+        if cls._is_temporal_column(column_name) and isinstance(value, Real) and not isinstance(value, bool):
+            serial = float(value)
+            if 1 <= serial <= 80000:
+                try:
+                    converted = from_excel(serial, epoch=workbook_epoch) if workbook_epoch else from_excel(serial)
+                    return cls._format_temporal_value(converted, column_name)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        if isinstance(value, Real) or isinstance(value, str):
+            return value
+        return str(value)
+
+    @staticmethod
+    def _is_temporal_column(column_name: str) -> bool:
+        normalized = str(column_name).strip().lower()
+        return any(token in normalized for token in ("日期", "时间", "月份", "年月", "date", "month", "time"))
+
+    @staticmethod
+    def _format_temporal_value(value: Any, column_name: str) -> str:
+        normalized = str(column_name).strip().lower()
+        if isinstance(value, time):
+            return value.isoformat(timespec="seconds")
+        if isinstance(value, datetime):
+            if "月份" in normalized or "年月" in normalized or "month" in normalized:
+                return value.strftime("%Y-%m")
+            if value.time() != time.min and ("时间" in normalized or "time" in normalized):
+                return value.isoformat(sep=" ", timespec="seconds")
+            return value.date().isoformat()
+        if isinstance(value, date):
+            if "月份" in normalized or "年月" in normalized or "month" in normalized:
+                return value.strftime("%Y-%m")
+            return value.isoformat()
+        return str(value)
+
+    def delete_file_by_id(self, project_id: str, file_id: str) -> bool:
+        """Delete one exact workbook version without affecting same-name files."""
+        conn = get_db_connection()
+        try:
+            if not conn.execute(
+                "SELECT 1 FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone():
+                raise ValueError(f"Project '{project_id}' not found")
+            cursor = conn.execute(
+                "DELETE FROM files WHERE project_id = ? AND file_id = ?",
+                (project_id, file_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def delete_file(self, project_id: str, file_name: str) -> bool:
         """

@@ -75,15 +75,28 @@ class RuleResultValidator:
             )
 
         result_columns = {str(column) for column in rule_result.result_df.columns}
-        missing_required = [
-            column
-            for column in step.required_source_columns
-            if column not in result_columns
-        ]
-        if missing_required:
-            reasons.append(
-                f"required columns are missing from rule result: {missing_required}"
+        if "aggregate_extreme" in matched:
+            # Field resolution may only identify the grouping dimension; the
+            # deterministic aggregate engine selects its numeric metric itself.
+            # Validate the result shape directly instead of requiring every
+            # source/filter field to survive a groupby projection.
+            numeric_columns = list(
+                rule_result.result_df.select_dtypes(include="number").columns
             )
+            if len(result_columns) < 2 or not numeric_columns:
+                reasons.append(
+                    "aggregate result does not retain both a dimension and metric"
+                )
+        else:
+            missing_required = [
+                column
+                for column in step.required_source_columns
+                if column not in result_columns
+            ]
+            if missing_required:
+                reasons.append(
+                    f"required columns are missing from rule result: {missing_required}"
+                )
 
         non_aggregating = {"filter", "date_filter", "sort", "pass_through", "vague"}
         if (

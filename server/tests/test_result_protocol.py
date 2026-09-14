@@ -54,10 +54,11 @@ def test_analysis_request_accepts_selected_sheet_scope():
     request = AnalyzeRequest(
         taskId="task-1",
         query="汇总销售额",
-        selectedFiles=[{"fileName": "sales.xlsx", "sheets": ["Sheet1"]}],
+        selectedFiles=[{"fileId": "file-1", "fileName": "sales.xlsx", "sheets": ["Sheet1"]}],
     )
 
     assert request.selectedFiles[0].fileName == "sales.xlsx"
+    assert request.selectedFiles[0].fileId == "file-1"
     assert request.selectedFiles[0].sheets == ["Sheet1"]
 
 

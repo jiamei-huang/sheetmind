@@ -34,7 +34,9 @@ from sheetmind.analysis.context import (
     ChartSeries,
     ExecutionStep,
     MultiTurnMode,
+    QuerySemantics,
     ResultBlocks,
+    ResultLineage,
     RoutingHint,
     SummaryBlock,
     TableBlock,
@@ -49,6 +51,7 @@ from sheetmind.analysis.skills.chart_planning import ChartPlanningSkill
 from sheetmind.analysis.skills.code_generation import CodeGenerationSkill
 from sheetmind.analysis.skills.data_profiling import DataProfilingSkill
 from sheetmind.analysis.skills.field_resolution import FieldResolver
+from sheetmind.analysis.skills.insight_writing import InsightWritingSkill
 from sheetmind.analysis.skills.routing_classification import (
     OperationIntent,
     OutputIntent,
@@ -86,10 +89,12 @@ class MockModelProvider:
     def __init__(self, response: str = '{"operation_intents":[],"output_intents":["auto"],"confidence":0.5,"reasoning":"mock"}'):
         self._response = response
         self.calls = 0
+        self.requests = []
 
     async def complete(self, messages, system="", max_tokens=512, temperature=0.0,
                        json_mode=False, **kwargs):
         self.calls += 1
+        self.requests.append({"messages": messages, "system": system})
         return self._response
 
 
@@ -171,7 +176,7 @@ class TestOutputPlanningSkill:
         assert plan.include_chart is False
         assert plan.include_summary is True
 
-    def test_explicit_chart_does_not_force_table(self):
+    def test_explicit_chart_keeps_computed_evidence_table(self):
         plan = run(self.skill.run(
             self.ctx,
             "查看销售额趋势",
@@ -181,7 +186,7 @@ class TestOutputPlanningSkill:
         ))
 
         assert plan.include_chart is True
-        assert plan.include_table is False
+        assert plan.include_table is True
 
     def test_excel_export_keeps_a_table_result_for_export(self):
         plan = run(self.skill.run(
@@ -253,6 +258,27 @@ class TestRoutingClassificationSkill:
         result = run(self.skill.run(ctx, "继续按金额排序"))
         assert result.mode == MultiTurnMode.FOLLOW_UP
 
+    def test_contextual_sku_cost_question_requires_computation(self):
+        ctx = make_ctx(with_active_result=True)
+        result = run(self.skill.run(
+            ctx,
+            "在上述日本海外仓在乐天店铺的物流费用中，哪些易仓SKU物流费用高",
+        ))
+
+        assert result.mode == MultiTurnMode.FOLLOW_UP
+        assert result.hint == RoutingHint.RULE_ENGINE
+        assert result.needs_new_computation is True
+        assert {"which", "extreme"} <= set(result.operation_intent.types)
+        assert "SKU" in result.target_fields
+
+    def test_extreme_then_explain_still_requires_computation(self):
+        ctx = make_ctx(with_active_result=True)
+
+        result = run(self.skill.run(ctx, "哪个易仓SKU物流费用最高，为什么"))
+
+        assert result.hint != RoutingHint.INSIGHT_ONLY
+        assert result.needs_new_computation is True
+
     def test_mode_reset(self):
         ctx = make_ctx(with_active_result=True)
         result = run(self.skill.run(ctx, "重新看全部数据"))
@@ -263,6 +289,23 @@ class TestRoutingClassificationSkill:
         result = run(self.skill.run(ctx, "先筛选2025年数据，再按店铺汇总金额"))
         assert result.mode == MultiTurnMode.NEW_QUERY
         assert result.structure.requires_planning is True
+
+    def test_normalized_period_still_splits_parallel_questions(self):
+        normalized = run(QueryNormalizationSkill(MockRouter()).run(
+            self.ctx,
+            "尾程表哪个物流商花钱最多。哪个店铺物流用的最贵",
+            reference_date=date(2026, 9, 10),
+        ))
+
+        result = run(self.skill.run(
+            self.ctx,
+            "尾程表哪个物流商花钱最多。哪个店铺物流用的最贵",
+            normalized_query=normalized,
+        ))
+
+        assert normalized.normalized_text == "尾程表哪个物流商花钱最多.哪个店铺物流用的最贵"
+        assert result.structure.requires_planning is True
+        assert result.structure.needs_semantic_planning is True
 
     def test_numeric_operator_triggers_code_gen(self):
         result = run(self.skill.run(self.ctx, "金额 > 10000 的订单"))
@@ -493,9 +536,203 @@ class TestQueryPlanningSkill:
         assert len(plan.steps) == 1
         assert router._mock.calls == 0
 
+    def test_complete_looking_question_still_uses_planner_when_history_exists(self):
+        response = """{
+          "mode": "follow_up",
+          "steps": [{
+            "query": "在上一轮范围内按易仓SKU汇总物流费用并取最高项",
+            "depends_on": [],
+            "input_source": "active_dataframe",
+            "needs_new_computation": true
+          }],
+          "reasoning": "当前问题延续上一轮分析范围",
+          "confidence": 0.94
+        }"""
+        router = MockRouter(response)
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx(with_active_result=True)
+
+        routing = run(routing_skill.run(ctx, "哪个易仓SKU物流费用最高"))
+        plan = run(planning_skill.run(
+            ctx,
+            "哪个易仓SKU物流费用最高",
+            routing=routing,
+        ))
+
+        assert plan.source == "llm"
+        assert plan.mode == MultiTurnMode.FOLLOW_UP
+        assert plan.steps[0].input_source == "active_dataframe"
+        assert plan.steps[0].query == "哪个易仓SKU物流费用最高"
+        assert plan.steps[0].route == RoutingHint.RULE_ENGINE
+
+    def test_planner_receives_active_and_previous_result_schema(self):
+        response = """{
+          "mode": "follow_up",
+          "steps": [{
+            "query": "按易仓SKU汇总物流费用",
+            "depends_on": [],
+            "input_source": "active_dataframe",
+            "scope_from": "previous_result",
+            "target_fields": ["易仓SKU", "物流费用"],
+            "needs_new_computation": true
+          }],
+          "confidence": 0.9
+        }"""
+        router = MockRouter(response)
+        planning_skill = QueryPlanningSkill(
+            router,
+            RoutingClassificationSkill(router),
+        )
+        ctx = make_ctx(with_active_result=True)
+        ctx._active_df = pd.DataFrame({
+            "店铺": ["乐天"],
+            "易仓SKU": ["A"],
+            "物流费用": [10.0],
+        })
+        ctx._result_df = pd.DataFrame({"店铺": ["乐天"], "费用金额": [10.0]})
+
+        plan = run(planning_skill.run(ctx, "哪个易仓SKU物流费用最高"))
+
+        prompt = router._mock.requests[0]["messages"][0]["content"]
+        assert '"active_columns": ["店铺", "易仓SKU", "物流费用"]' in prompt
+        assert '"previous_result_columns": ["店铺", "费用金额"]' in prompt
+        assert plan.steps[0].target_fields == ["易仓SKU", "物流费用"]
+        assert plan.steps[0].scope_from == "previous_result"
+        assert router._mock.calls >= 1
+
+    def test_planner_receives_latest_field_clarification_request(self):
+        ctx = make_ctx()
+        ctx.active_result = ResultBlocks.model_validate({
+            "blocks": [{
+                "kind": "field_resolution",
+                "reference": "SKU",
+                "status": "needs_clarification",
+                "confidence": 0.5,
+                "reason": "多个SKU列",
+                "candidates": [
+                    {"column": "易仓SKU", "confidence": 0.8, "reason": "精确业务字段"},
+                    {"column": "平台SKU", "confidence": 0.7, "reason": "另一SKU字段"},
+                ],
+                "message": "请选择SKU列",
+            }]
+        })
+
+        planning_context = QueryPlanningSkill._planning_context(ctx)
+
+        [request] = planning_context["latest_resolution_requests"]
+        assert request["reference"] == "SKU"
+        assert [item["column"] for item in request["candidates"]] == [
+            "易仓SKU", "平台SKU",
+        ]
+
+    def test_planner_cannot_drop_explicit_schema_field_or_filter_value(self):
+        response = """{
+          "mode": "follow_up",
+          "steps": [{
+            "query": "按SKU汇总费用",
+            "depends_on": [],
+            "input_source": "active_dataframe",
+            "needs_new_computation": true
+          }],
+          "confidence": 0.9
+        }"""
+        router = MockRouter(response)
+        planning_skill = QueryPlanningSkill(
+            router,
+            RoutingClassificationSkill(router),
+        )
+        ctx = make_ctx(with_active_result=True)
+        ctx._active_df = pd.DataFrame({
+            "仓库": ["日本海外仓", "美国海外仓"],
+            "店铺": ["乐天", "官网"],
+            "易仓SKU": ["A", "B"],
+            "物流费用": [10.0, 20.0],
+        })
+        query = "日本海外仓的乐天店铺中，按易仓SKU汇总物流费用"
+
+        plan = run(planning_skill.run(ctx, query))
+
+        assert plan.source == "rule_fallback"
+        assert plan.steps[0].query == query
+
+    def test_planner_cannot_invent_date_field_from_persisted_chart_context(self):
+        response = """{
+          "mode": "new",
+          "steps": [{
+            "query": "筛选平台为乐天，按易仓SKU和日期汇总费用金额并绘制趋势图",
+            "depends_on": [],
+            "input_source": "source",
+            "target_fields": ["平台", "易仓SKU", "费用金额", "日期"],
+            "needs_new_computation": true
+          }],
+          "reasoning": "趋势图需要日期字段",
+          "confidence": 0.85
+        }"""
+        router = MockRouter(response)
+        planning_skill = QueryPlanningSkill(
+            router,
+            RoutingClassificationSkill(router),
+        )
+        ctx = make_ctx()
+        previous_df = pd.DataFrame({
+            "易仓SKU": ["ZN0140B", "ZN0139B"],
+            "费用金额": [18828.0, 16620.0],
+        })
+        ctx.add_assistant_turn(
+            "乐天渠道SKU费用汇总。",
+            ResultBlocks(blocks=[TableBlock(
+                columns=["易仓SKU", "费用金额"],
+                rows=previous_df.to_dict("records"),
+            )]),
+        )
+        ctx.add_assistant_turn(
+            "数据查询执行失败。",
+            ResultBlocks(blocks=[SummaryBlock(content="数据查询执行失败。")]),
+        )
+        routing = RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.86,
+            reasoning="chart trend",
+            operation_intent=OperationIntent(types=["trend", "chart_data_prep"]),
+            output_intent=OutputIntent(formats=["chart"], explicit=True),
+            target_fields=["易仓SKU"],
+        )
+        query = "画一个乐天渠道中各易仓sku花费的趋势图"
+
+        plan = run(planning_skill.run(ctx, query, routing=routing))
+
+        assert plan.source == "rule_fallback"
+        assert plan.steps[0].query == query
+        assert "日期" not in plan.steps[0].target_fields
+
+    def test_planner_cannot_disable_an_explicit_computation(self):
+        response = """{
+          "mode": "follow_up",
+          "steps": [{
+            "query": "按易仓SKU汇总物流费用",
+            "depends_on": [],
+            "input_source": "active_dataframe",
+            "needs_new_computation": false
+          }],
+          "confidence": 0.9
+        }"""
+        router = MockRouter(response)
+        planning_skill = QueryPlanningSkill(
+            router,
+            RoutingClassificationSkill(router),
+        )
+        ctx = make_ctx(with_active_result=True)
+
+        plan = run(planning_skill.run(ctx, "按易仓SKU汇总物流费用"))
+
+        assert plan.steps[0].needs_new_computation is True
+
     def test_semantic_structure_detection_can_confirm_one_atomic_step(self):
         query = "请帮我看看不同地区销售表现到底如何，重点关注明显偏离整体水平的地区并解释可能原因"
         response = f'''{{
+          "mode": "new",
           "steps": [{{"query": "{query}", "depends_on": []}}],
           "reasoning": "这是一个围绕地区异常的单一分析问题",
           "confidence": 0.91
@@ -514,9 +751,46 @@ class TestQueryPlanningSkill:
         assert plan.steps[0].query == query
         assert router._mock.calls == 1
 
+    def test_planner_can_override_contextual_query_to_followup_computation(self):
+        response = """{
+          "mode": "follow_up",
+          "steps": [
+            {
+              "query": "按易仓SKU汇总物流费用并按占比降序",
+              "depends_on": [],
+              "input_source": "active_dataframe",
+              "needs_new_computation": true
+            }
+          ],
+          "reasoning": "上述指向上一轮范围，但问题要求继续按SKU计算",
+          "confidence": 0.95
+        }"""
+        router = MockRouter(response)
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx(with_active_result=True)
+        routing = RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.8,
+            reasoning="rule missed follow-up",
+        )
+
+        plan = run(planning_skill.run(
+            ctx,
+            "在上述日本海外仓在乐天店铺的物流费用中，哪些易仓SKU物流费用高",
+            routing=routing,
+        ))
+
+        assert plan.source == "llm"
+        assert plan.mode == MultiTurnMode.FOLLOW_UP
+        assert plan.steps[0].input_source == "active_dataframe"
+        assert plan.steps[0].needs_new_computation is True
+
     def test_semantic_structure_detection_finds_implicit_dependency(self):
         query = "找出销售表现异常的地区，判断这些地区的退货率是否也明显偏高并解释可能原因"
         response = """{
+          "mode": "new",
           "steps": [
             {"query": "找出销售表现异常的地区", "depends_on": []},
             {"query": "判断异常地区的退货率是否明显偏高并解释原因", "depends_on": ["s1"]}
@@ -553,6 +827,28 @@ class TestQueryPlanningSkill:
             RoutingHint.CODE_GEN,
         ]
         assert plan.steps[1].depends_on == ["s1"]
+
+    def test_period_normalized_parallel_questions_fall_back_to_two_steps(self):
+        router = MockRouter('{"unexpected": true}')
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx()
+        normalized = run(QueryNormalizationSkill(router).run(
+            ctx,
+            "尾程表哪个物流商花钱最多。哪个店铺物流用的最贵",
+            reference_date=date(2026, 9, 10),
+        ))
+        query = normalized.normalized_text
+
+        routing = run(routing_skill.run(ctx, query, normalized_query=normalized))
+        plan = run(planning_skill.run(ctx, query, routing=routing))
+
+        assert plan.source == "rule_fallback"
+        assert [step.query for step in plan.steps] == [
+            "尾程表哪个物流商花钱最多",
+            "哪个店铺物流用的最贵",
+        ]
+        assert [step.depends_on for step in plan.steps] == [[], []]
 
     def test_llm_plan_cannot_drop_qualified_field(self):
         response = """{
@@ -670,6 +966,201 @@ class TestRuleEngineTool:
         assert result.iloc[0]["费用金额"] == pytest.approx(1281015.0)
         assert "速卖通" not in result.columns
 
+    @pytest.mark.parametrize(
+        "query,group_column,expected_name",
+        [
+            ("尾程表哪个物流商花钱最多", "物流商", "A物流"),
+            ("哪个店铺物流费用最贵", "店铺", "乐天"),
+        ],
+    )
+    def test_cost_extreme_prefers_fee_amount_over_quantity(
+        self,
+        query,
+        group_column,
+        expected_name,
+    ):
+        df = pd.DataFrame({
+            "店铺": ["乐天", "乐天", "官网"],
+            "物流商": ["A物流", "A物流", "B物流"],
+            "费用金额": [100.0, 200.0, 250.0],
+            "数量": [1, 1, 999],
+            "店铺.1": ["store-a", "store-a", "store-b"],
+        })
+        field_map = run(SemanticTypingSkill(MockRouter()).run(
+            self.ctx,
+            query,
+            df=df,
+        ))
+
+        result = self.tool.run(
+            self.ctx,
+            query=query,
+            df=df,
+            field_map=field_map,
+            required_columns=[group_column],
+        )
+
+        assert list(result.columns) == [group_column, "费用金额"]
+        assert result.iloc[0][group_column] == expected_name
+
+    def test_sheet_name_in_query_is_not_treated_as_a_row_filter_value(self):
+        df = pd.DataFrame({
+            "物流商": ["顺丰", "日本海外仓"],
+            "费用类型": ["尾程", "仓储"],
+            "费用金额": [49862.72, 2569359.2],
+        })
+
+        result = self.tool.run(
+            self.ctx,
+            query="尾程表哪个物流商花钱最多",
+            df=df,
+        )
+
+        assert result.to_dict("records") == [{
+            "物流商": "日本海外仓",
+            "费用金额": 2569359.2,
+        }]
+
+    def test_storage_sheet_extreme_does_not_mix_currencies_or_filter_to_one_fee_label(self):
+        self.ctx.selected_sheets = ["仓储"]
+        df = pd.DataFrame({
+            "平台": ["乐天", "日本官网", "美国官网", "德国官网", "英国官网"],
+            "费用类型": ["仓储费", "系统商品仓储费", "仓租费用", "仓储", "仓储"],
+            "费用金额": [259640.0, 204777.0, 5000.0, 4000.0, 3000.0],
+            "币别": ["日元", "日元", "美元", "欧元", "英镑"],
+        })
+
+        result = self.tool.run(
+            self.ctx,
+            query="哪个平台的仓储费花费最多",
+            df=df,
+        )
+
+        assert list(result.columns) == ["币别", "平台", "费用金额"]
+        assert result.to_dict("records") == [
+            {"币别": "日元", "平台": "乐天", "费用金额": 259640.0},
+            {"币别": "欧元", "平台": "德国官网", "费用金额": 4000.0},
+            {"币别": "美元", "平台": "美国官网", "费用金额": 5000.0},
+            {"币别": "英镑", "平台": "英国官网", "费用金额": 3000.0},
+        ]
+
+    def test_explicit_currency_filters_before_finding_the_platform_winner(self):
+        self.ctx.selected_sheets = ["仓储"]
+        df = pd.DataFrame({
+            "平台": ["乐天", "美国官网", "美国亚马逊"],
+            "费用类型": ["仓储费", "仓储", "仓租费用"],
+            "费用金额": [259640.0, 5000.0, 7000.0],
+            "币别": ["日元", "美元", "美元"],
+        })
+
+        result = self.tool.run(
+            self.ctx,
+            query="哪个平台的美元仓储费花费最多",
+            df=df,
+        )
+
+        assert result.to_dict("records") == [{
+            "平台": "美国亚马逊",
+            "费用金额": 7000.0,
+        }]
+
+    def test_storage_fee_wording_does_not_treat_numeric_month_as_amount(self):
+        self.ctx.selected_sheets = ["仓储"]
+        df = pd.DataFrame({
+            "月份": [202612, 202612],
+            "平台": ["乐天", "美国官网"],
+            "费用金额": [259640.0, 5000.0],
+        })
+
+        result = self.tool.run(
+            self.ctx,
+            query="仓储费哪个平台花的最多",
+            df=df,
+        )
+
+        assert result.to_dict("records") == [{
+            "平台": "乐天",
+            "费用金额": 259640.0,
+        }]
+
+    def test_mixed_currency_extreme_prefers_complete_normalized_amount_column(self):
+        self.ctx.selected_sheets = ["仓储"]
+        df = pd.DataFrame({
+            "平台": ["乐天", "美国官网"],
+            "费用类型": ["仓储费", "仓租费用"],
+            "费用金额": [259640.0, 5000.0],
+            "币别": ["日元", "美元"],
+            "人民币金额": [12500.0, 35000.0],
+        })
+
+        result = self.tool.run(
+            self.ctx,
+            query="哪个平台的仓储费花费最多",
+            df=df,
+        )
+
+        assert result.to_dict("records") == [{
+            "平台": "美国官网",
+            "人民币金额": 35000.0,
+        }]
+
+    def test_explicit_fee_type_reference_still_filters_inside_selected_sheet(self):
+        self.ctx.selected_sheets = ["仓储"]
+        df = pd.DataFrame({
+            "平台": ["乐天", "美国官网"],
+            "费用类型": ["仓储费", "仓租费用"],
+            "费用金额": [100.0, 500.0],
+        })
+
+        result = self.tool.run(
+            self.ctx,
+            query="费用类型为仓储费时，哪个平台花费最多",
+            df=df,
+        )
+
+        assert result.to_dict("records") == [{
+            "平台": "乐天",
+            "费用金额": 100.0,
+        }]
+
+    def test_contextual_sku_cost_share_filters_then_groups_by_sku(self):
+        df = pd.DataFrame({
+            "仓库": ["日本海外仓", "日本海外仓", "日本海外仓", "美国海外仓"],
+            "店铺": ["乐天", "乐天", "乐天", "乐天"],
+            "易仓SKU": ["A", "B", "A", "B"],
+            "物流费用": [10.0, 40.0, 30.0, 90.0],
+        })
+        query = "在上述日本海外仓在乐天店铺的物流费用中，哪个易仓sku花费占比最高"
+        field_map = run(SemanticTypingSkill(MockRouter()).run(self.ctx, query, df=df))
+
+        result = self.tool.run(
+            self.ctx,
+            query=query,
+            df=df,
+            field_map=field_map,
+            required_columns=["店铺", "易仓SKU", "物流费用"],
+        )
+
+        assert list(result.columns) == ["易仓SKU", "物流费用", "物流费用占比"]
+        assert result.iloc[0]["易仓SKU"] == "A"
+        assert result.iloc[0]["物流费用"] == pytest.approx(40.0)
+        assert result.iloc[0]["物流费用占比"] == pytest.approx(0.5)
+        assert len(result) == 1
+
+    def test_singular_average_extreme_uses_mean_and_returns_only_winner(self):
+        df = pd.DataFrame({
+            "店铺": ["A", "A", "B", "B"],
+            "物流费用": [0.0, 100.0, 60.0, 60.0],
+        })
+
+        result = self.tool.run(
+            self.ctx,
+            query="哪个店铺平均物流费用最高",
+            df=df,
+        )
+
+        assert result.to_dict("records") == [{"店铺": "B", "物流费用": 60.0}]
+
     def test_filter_by_value_without_column_name(self):
         df = pd.DataFrame({
             "平台": ["速卖通", "美国官网", "美国官网", "乐天"],
@@ -783,6 +1274,36 @@ class TestRuleEngineTool:
 # ---------------------------------------------------------------------------
 
 class TestRuleResultValidator:
+    def test_accepts_aggregate_with_dimension_and_metric_when_only_dimension_was_resolved(self):
+        from sheetmind.analysis.tools.rule_engine import RuleResult
+        from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
+
+        source = pd.DataFrame({
+            "物流商": ["A物流", "B物流"],
+            "费用金额": [100.0, 80.0],
+        })
+        step = ExecutionStep(
+            step_id="s1",
+            query="哪个物流商花钱最多",
+            route=RoutingHint.RULE_ENGINE,
+            operation_intents=["which", "extreme"],
+            required_source_columns=["物流商"],
+        )
+        rule_result = RuleResult(
+            result_df=pd.DataFrame({"物流商": ["A物流"], "费用金额": [100.0]}),
+            matched_rules=["aggregate_extreme"],
+            selected_columns=["物流商", "费用金额"],
+            confidence=0.95,
+        )
+
+        decision = RuleResultValidator().validate(
+            step=step,
+            source_df=source,
+            rule_result=rule_result,
+        )
+
+        assert decision.valid is True
+
     def test_date_validation_uses_the_resolved_required_date_column(self):
         from sheetmind.analysis.tools.rule_engine import RuleResult
         from sheetmind.analysis.validators.rule_result_validator import RuleResultValidator
@@ -1108,6 +1629,55 @@ class TestChartPlanningSkill:
         assert result is not None
         assert result.chart_type == "line"
 
+    def test_non_temporal_trend_defaults_to_bar_chart(self):
+        df = self._make_df(
+            易仓SKU=["A", "B", "C"],
+            费用金额=[100, 200, 150],
+        )
+
+        result = run(self.skill.run(
+            self.ctx,
+            "画各易仓SKU花费趋势图",
+            result_df=df,
+            required_columns=["易仓SKU", "费用金额"],
+        ))
+
+        assert result is not None
+        assert result.chart_type == "bar"
+
+    def test_explicit_line_chart_is_respected_for_non_temporal_axis(self):
+        df = self._make_df(
+            易仓SKU=["A", "B", "C"],
+            费用金额=[100, 200, 150],
+        )
+
+        result = run(self.skill.run(
+            self.ctx,
+            "按易仓SKU画费用折线图",
+            result_df=df,
+            required_columns=["易仓SKU", "费用金额"],
+        ))
+
+        assert result is not None
+        assert result.chart_type == "line"
+
+    def test_chart_block_keeps_all_categories_for_frontend_display_controls(self):
+        df = self._make_df(
+            易仓SKU=[f"SKU-{index:02d}" for index in range(20)],
+            费用金额=list(range(20)),
+        )
+
+        result = run(self.skill.run(
+            self.ctx,
+            "按易仓SKU画费用柱状图",
+            result_df=df,
+            required_columns=["易仓SKU", "费用金额"],
+        ))
+
+        assert result is not None
+        assert len(result.labels) == 20
+        assert "Other" not in result.labels
+
     def test_returns_chart_block(self):
         df = self._make_df(区域=["A", "B", "C"], 金额=[10, 20, 30])
         result = run(self.skill.run(self.ctx, "柱图", result_df=df))
@@ -1157,6 +1727,7 @@ class TestChartPlanningSkill:
 
         assert result is not None
         assert result.x_axis_label == "店铺"
+        assert result.x_axis_type == "categorical"
         assert [series.name for series in result.series] == ["金额（RMB）"]
 
 
@@ -1189,6 +1760,70 @@ class TestDataProfilingSkill:
         df = pd.DataFrame()
         result = run(self.skill.run(self.ctx, "test", df=df))
         assert isinstance(result, str)  # should not crash
+
+
+# ---------------------------------------------------------------------------
+# InsightWritingSkill
+# ---------------------------------------------------------------------------
+
+class TestInsightWritingSkill:
+    def test_processing_prompt_for_partitioned_currencies_forbids_a_global_winner(self):
+        result = pd.DataFrame({
+            "币别": ["日元", "美元"],
+            "平台": ["乐天", "美国官网"],
+            "费用金额": [259640.0, 5000.0],
+        })
+
+        prompt = InsightWritingSkill._processing_prompt(
+            "哪个平台花费最多",
+            result,
+            None,
+        )
+
+        assert "逐币种回答" in prompt
+        assert "全局最高" in prompt
+
+    def test_multi_result_prompt_contains_every_question_and_computed_result(self):
+        router = MockRouter("已逐项回答。")
+        skill = InsightWritingSkill(router)
+        result_sets = [
+            ("哪个物流商花费最多", pd.DataFrame({
+                "物流商": ["A物流"], "费用金额": [2569359.2],
+            })),
+            ("哪个店铺物流费用最贵", pd.DataFrame({
+                "店铺": ["乐天"], "费用金额": [1281000.3],
+            })),
+        ]
+
+        run(skill.run(
+            make_ctx(),
+            "请同时回答前面两个问题",
+            scenario="multi_result",
+            result_sets=result_sets,
+        ))
+
+        prompt = router._mock.requests[0]["messages"][0]["content"]
+        assert "必须逐项回答全部2个子问题" in prompt
+        assert "哪个物流商花费最多" in prompt
+        assert "A物流" in prompt
+        assert "哪个店铺物流费用最贵" in prompt
+        assert "乐天" in prompt
+
+    def test_multi_result_fallback_also_answers_every_result(self):
+        result_sets = [
+            ("物流商问题", pd.DataFrame({"物流商": ["A物流"], "费用": [30.0]})),
+            ("店铺问题", pd.DataFrame({"店铺": ["乐天"], "费用": [20.0]})),
+        ]
+
+        summary = InsightWritingSkill._fallback_summary(
+            "multi_result",
+            None,
+            None,
+            result_sets=result_sets,
+        )
+
+        assert "1. 物流商问题：物流商=A物流，费用=30.0" in summary
+        assert "2. 店铺问题：店铺=乐天，费用=20.0" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -1341,6 +1976,77 @@ class TestPythonExecutorTool:
         result_df, error = self.executor.run(self.ctx, code=code, df=self.df)
         assert result_df is None
         assert error is not None
+
+
+# ---------------------------------------------------------------------------
+# CodeGenerationSkill — semantic execution contracts
+# ---------------------------------------------------------------------------
+
+class TestCodeGenerationSkill:
+    def test_mixed_currency_prompt_requires_partitioned_aggregation(self):
+        router = MockRouter("result_df = df")
+        skill = CodeGenerationSkill(router)
+        df = pd.DataFrame({
+            "平台": ["乐天", "美国官网"],
+            "费用金额": [1000.0, 500.0],
+            "币别": ["日元", "美元"],
+        })
+
+        run(skill.run(make_ctx(), "哪个平台花费最多", df=df))
+
+        prompt = router._mock.requests[0]["messages"][0]["content"]
+        assert "禁止把不同币种的原始金额直接相加" in prompt
+        assert "按 '币别' 分组" in prompt
+
+    def test_mixed_currency_contract_rejects_raw_cross_currency_sum(self):
+        df = pd.DataFrame({
+            "平台": ["乐天", "美国官网"],
+            "费用金额": [1000.0, 500.0],
+            "币别": ["日元", "美元"],
+        })
+        code = "result_df = df.groupby('平台', as_index=False)['费用金额'].sum()"
+
+        error = CodeGenerationSkill.validate_currency_safety(
+            code,
+            "哪个平台花费最多",
+            df,
+        )
+
+        assert error is not None
+        assert "币别" in error
+
+    def test_mixed_currency_contract_accepts_currency_partition(self):
+        df = pd.DataFrame({
+            "平台": ["乐天", "美国官网"],
+            "费用金额": [1000.0, 500.0],
+            "币别": ["日元", "美元"],
+        })
+        code = "result_df = df.groupby(['币别', '平台'], as_index=False)['费用金额'].sum()"
+
+        error = CodeGenerationSkill.validate_currency_safety(
+            code,
+            "哪个平台花费最多",
+            df,
+        )
+
+        assert error is None
+
+    def test_mixed_currency_contract_requires_complete_normalized_amount_when_available(self):
+        df = pd.DataFrame({
+            "平台": ["乐天", "美国官网"],
+            "费用金额": [1000.0, 500.0],
+            "币别": ["日元", "美元"],
+            "人民币金额": [50.0, 3500.0],
+        })
+        unsafe = "result_df = df.groupby('平台', as_index=False)['费用金额'].sum()"
+        safe = "result_df = df.groupby('平台', as_index=False)['人民币金额'].sum()"
+
+        assert CodeGenerationSkill.validate_currency_safety(
+            unsafe, "哪个平台花费最多", df
+        ) is not None
+        assert CodeGenerationSkill.validate_currency_safety(
+            safe, "哪个平台花费最多", df
+        ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1498,6 +2204,32 @@ class TestRepairLoop:
         assert "金额（USD）" in code
         assert self.mock_executor.run.call_count == 1
 
+    def test_mixed_currency_code_is_repaired_before_execution(self):
+        self.df = pd.DataFrame({
+            "平台": ["乐天", "美国官网"],
+            "费用金额": [1000.0, 500.0],
+            "币别": ["日元", "美元"],
+        })
+        self.mock_code_gen.run = AsyncMock(side_effect=[
+            "result_df = df.groupby('平台', as_index=False)['费用金额'].sum()",
+            "result_df = df.groupby(['币别', '平台'], as_index=False)['费用金额'].sum()",
+        ])
+        safe_result = self.df.groupby(
+            ["币别", "平台"], as_index=False
+        )["费用金额"].sum()
+        self.mock_executor.run = MagicMock(return_value=(safe_result, None))
+
+        result_df, code, repairs = run(self.loop.run(
+            self.ctx,
+            "哪个平台花费最多",
+            self.df,
+        ))
+
+        assert result_df is not None
+        assert repairs == 1
+        assert "币别" in code
+        assert self.mock_executor.run.call_count == 1
+
     def test_required_column_in_dead_assignment_does_not_satisfy_contract(self):
         code = """unused = df['金额（USD）']
 result_df = pd.DataFrame({'total': [df['金额'].sum()]})"""
@@ -1596,6 +2328,141 @@ class TestBuildTableBlock:
 # ---------------------------------------------------------------------------
 
 class TestSheetMindAgentPipeline:
+    def test_data_query_does_not_silently_become_insight_when_sheet_selection_fails(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        routing = RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.9,
+            reasoning="data query",
+        )
+        plan = QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                query="按易仓SKU汇总物流费用",
+                route=RoutingHint.CODE_GEN,
+                input_source="source",
+                target_fields=["易仓SKU", "物流费用"],
+            )],
+            mode=MultiTurnMode.NEW_QUERY,
+        )
+        agent.routing_skill.run = AsyncMock(return_value=routing)
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.sheet_skill.run = AsyncMock(side_effect=RuntimeError("sheet lookup failed"))
+        agent.insight_skill.run = AsyncMock(
+            side_effect=AssertionError("must not answer a data query without data")
+        )
+
+        result = run(agent.run(ctx, "按易仓SKU汇总物流费用"))
+
+        assert result.status == "failed"
+        assert result.questions[0].execution_report.error_code == "source_selection_failed"
+
+    def test_each_independent_question_binds_and_executes_its_own_sheet(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        ctx.active_source_scope = ctx.scope_key([
+            {"fileName": "costs.xlsx", "sheets": ["尾程"]},
+        ])
+        ctx._active_df = pd.DataFrame({"物流商": ["旧结果"], "费用金额": [1.0]})
+        plan = QueryPlan(
+            steps=[
+                ExecutionStep(
+                    step_id="s1",
+                    question_id="q1",
+                    query="尾程表哪个物流商花钱最多",
+                    route=RoutingHint.CODE_GEN,
+                    target_fields=["物流商", "费用金额"],
+                    semantics=QuerySemantics(
+                        source_candidate_ids=["costs.xlsx::尾程"],
+                        dimensions=["物流商"],
+                    ),
+                ),
+                ExecutionStep(
+                    step_id="s2",
+                    question_id="q2",
+                    query="哪个平台仓储费最高",
+                    route=RoutingHint.CODE_GEN,
+                    input_source="active_dataframe",
+                    target_fields=["平台", "仓储费"],
+                    semantics=QuerySemantics(
+                        source_candidate_ids=["costs.xlsx::仓储"],
+                        dimensions=["平台"],
+                    ),
+                ),
+            ],
+            is_multi_step=True,
+            source="llm",
+            mode=MultiTurnMode.NEW_QUERY,
+        )
+        metadata = [
+            {
+                "candidateId": "costs.xlsx::尾程",
+                "fileName": "costs.xlsx",
+                "sheetName": "尾程",
+                "columns": ["物流商", "费用金额"],
+            },
+            {
+                "candidateId": "costs.xlsx::仓储",
+                "fileName": "costs.xlsx",
+                "sheetName": "仓储",
+                "columns": ["平台", "仓储费"],
+            },
+        ]
+
+        async def select_sheet(*args, **kwargs):
+            candidate_id = kwargs["preferred_candidate_ids"][0]
+            sheet_name = candidate_id.split("::", 1)[1]
+            return [{"fileName": "costs.xlsx", "sheets": [sheet_name]}]
+
+        def load_sheet(*args, **kwargs):
+            sheet_name = kwargs["selected_files"][0]["sheets"][0]
+            if sheet_name == "尾程":
+                return pd.DataFrame({"物流商": ["日本海外仓"], "费用金额": [300.0]})
+            return pd.DataFrame({"平台": ["亚马逊"], "仓储费": [999.0]})
+
+        async def execute(*args, **kwargs):
+            return kwargs["df"].copy(), "result_df = df.copy()", 0
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.95,
+            reasoning="two questions",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.sheet_skill.catalog = MagicMock(return_value=metadata)
+        agent.sheet_skill.run = AsyncMock(side_effect=select_sheet)
+        agent.df_loader.run = MagicMock(side_effect=load_sheet)
+        agent.semantic_skill.run = AsyncMock(return_value={})
+        agent.profiling_skill.run = AsyncMock(return_value="profile")
+        agent.repair_loop.run = AsyncMock(side_effect=execute)
+        agent.insight_skill.run = AsyncMock(side_effect=[
+            "日本海外仓尾程费用最高。",
+            "亚马逊仓储费最高。",
+        ])
+        agent.artifact_store = MagicMock()
+        agent.artifact_store.save.side_effect = ["artifact-1", "artifact-2"]
+
+        result = run(agent.run(
+            ctx,
+            "尾程表哪个物流商花钱最多。哪个平台仓储费最高",
+        ))
+
+        assert result.status == "success"
+        assert [question.question_id for question in result.questions] == ["q1", "q2"]
+        assert result.questions[0].blocks[1].rows[0]["物流商"] == "日本海外仓"
+        assert result.questions[1].blocks[1].rows[0]["平台"] == "亚马逊"
+        assert result.questions[0].execution_report.source_bindings[0].sheet_name == "尾程"
+        assert result.questions[1].execution_report.source_bindings[0].sheet_name == "仓储"
+        assert agent.insight_skill.run.await_count == 2
+        assert agent.repair_loop.run.call_args_list[1].kwargs["semantics"].dimensions == ["平台"]
+
     def test_ambiguous_field_stops_before_execution_and_returns_choices(self):
         from sheetmind.analysis.agent import SheetMindAgent
 
@@ -1727,7 +2594,7 @@ class TestSheetMindAgentPipeline:
         assert result.has_chart is False
         assert ctx.execution_plan.output_intents == ["export_excel"]
 
-    def test_chart_output_intent_does_not_force_table_block(self):
+    def test_chart_output_intent_keeps_computed_evidence_table(self):
         from sheetmind.analysis.agent import SheetMindAgent
 
         agent = SheetMindAgent(MockRouter())
@@ -1755,7 +2622,8 @@ class TestSheetMindAgentPipeline:
 
         assert result.output_intents == ["chart"]
         assert result.has_chart is True
-        assert result.has_table is False
+        assert result.has_table is True
+        assert result.first_table().calculation_basis is not None
 
     def test_executes_each_planned_step_from_its_dependency_result(self):
         from sheetmind.analysis.agent import SheetMindAgent
@@ -1812,6 +2680,526 @@ class TestSheetMindAgentPipeline:
         assert ctx.execution_plan is not None
         assert len(ctx.execution_plan.steps) == 4
 
+    def test_planner_followup_uses_active_dataframe_instead_of_previous_result_table(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({
+            "店铺.1": ["genhigh(rakuten_genhigh)", "genhigh(rakuten_genhigh)", "官网"],
+            "易仓SKU": ["A", "B", "A"],
+            "物流费用": [10.0, 40.0, 99.0],
+        })
+        previous_table = TableBlock(
+            columns=["店铺.1", "费用金额"],
+            rows=[{"店铺.1": "genhigh(rakuten_genhigh)", "费用金额": 50.0}],
+        )
+        ctx.active_result = ResultBlocks(blocks=[previous_table])
+        ctx._active_df = source_df
+        plan = QueryPlan(
+            steps=[
+                ExecutionStep(
+                    step_id="s1",
+                    query="按易仓SKU汇总物流费用",
+                    route=RoutingHint.CODE_GEN,
+                    input_source="previous_result",
+                    target_fields=["SKU", "费用"],
+                )
+            ],
+            source="llm",
+            mode=MultiTurnMode.FOLLOW_UP,
+            confidence=0.95,
+        )
+        seen_inputs = []
+
+        async def execute_code(*args, **kwargs):
+            input_df = kwargs["df"]
+            seen_inputs.append(input_df.copy())
+            grouped = input_df.groupby("易仓SKU", as_index=False)["物流费用"].sum()
+            return grouped, "result_df = grouped", 0
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.8,
+            reasoning="rule missed follow-up",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock(side_effect=execute_code)
+        agent.insight_skill.run = AsyncMock(return_value="A和B已按物流费用汇总。")
+
+        result = run(agent.run(
+            ctx,
+            "在上述日本海外仓在乐天店铺的物流费用中，哪些易仓SKU物流费用高",
+        ))
+
+        agent.df_loader.run.assert_not_called()
+        assert list(seen_inputs[0].columns) == ["店铺.1", "易仓SKU", "物流费用"]
+        assert seen_inputs[0]["店铺.1"].unique().tolist() == ["genhigh(rakuten_genhigh)"]
+        assert "尾程费用" not in seen_inputs[0].columns
+        assert result.first_table().rows == [
+            {"易仓SKU": "A", "物流费用": 10.0},
+            {"易仓SKU": "B", "物流费用": 40.0},
+        ]
+
+    def test_followup_does_not_treat_another_sku_column_as_the_requested_sku(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({
+            "平台SKU": ["P1", "P2"],
+            "易仓SKU": ["A", "B"],
+            "物流费用": [10.0, 40.0],
+        })
+        previous_table = TableBlock(
+            columns=["平台SKU", "费用金额"],
+            rows=[{"平台SKU": "P2", "费用金额": 40.0}],
+        )
+        ctx.active_result = ResultBlocks(blocks=[previous_table])
+        ctx._active_df = source_df
+        plan = QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                query="按易仓SKU汇总物流费用",
+                route=RoutingHint.CODE_GEN,
+                input_source="previous_result",
+                target_fields=["SKU", "费用"],
+            )],
+            source="llm",
+            mode=MultiTurnMode.FOLLOW_UP,
+        )
+        seen_inputs = []
+
+        async def execute_code(*args, **kwargs):
+            seen_inputs.append(kwargs["df"].copy())
+            result = kwargs["df"].groupby("易仓SKU", as_index=False)["物流费用"].sum()
+            return result, "result_df = grouped", 0
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.8,
+            reasoning="test",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock(side_effect=execute_code)
+        agent.insight_skill.run = AsyncMock(return_value="done")
+
+        result = run(agent.run(ctx, "哪个易仓SKU物流费用最高"))
+
+        assert list(seen_inputs[0].columns) == ["平台SKU", "易仓SKU", "物流费用"]
+        assert result.first_table().columns == ["易仓SKU", "物流费用"]
+
+    def test_dependent_drilldown_rehydrates_detail_rows_from_source(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({
+            "店铺": ["A", "A", "B"],
+            "易仓SKU": ["S1", "S2", "S3"],
+            "物流费用": [10.0, 30.0, 20.0],
+        })
+        plan = QueryPlan(
+            steps=[
+                ExecutionStep(
+                    step_id="s1",
+                    query="找出物流费用最高的店铺",
+                    route=RoutingHint.CODE_GEN,
+                    input_source="source",
+                    target_fields=["店铺", "费用"],
+                ),
+                ExecutionStep(
+                    step_id="s2",
+                    query="在该店铺中按易仓SKU汇总物流费用",
+                    route=RoutingHint.CODE_GEN,
+                    depends_on=["s1"],
+                    input_source="step",
+                    target_fields=["SKU", "费用"],
+                ),
+            ],
+            source="llm",
+            mode=MultiTurnMode.NEW_QUERY,
+        )
+        seen_inputs = []
+
+        async def execute_code(*args, **kwargs):
+            input_df = kwargs["df"].copy()
+            seen_inputs.append(input_df)
+            if len(seen_inputs) == 1:
+                return pd.DataFrame({"店铺": ["A"], "物流费用": [40.0]}), "step1", 0
+            grouped = input_df.groupby("易仓SKU", as_index=False)["物流费用"].sum()
+            return grouped, "step2", 0
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.8,
+            reasoning="test",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.sheet_skill.run = AsyncMock(return_value=[{"fileName": "x.xlsx", "sheets": ["Sheet1"]}])
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock(side_effect=execute_code)
+        agent.insight_skill.run = AsyncMock(return_value="done")
+
+        result = run(agent.run(ctx, "先找出物流费用最高的店铺，再看该店铺哪个易仓SKU最高"))
+
+        assert seen_inputs[1].to_dict("records") == [
+            {"店铺": "A", "易仓SKU": "S1", "物流费用": 10.0},
+            {"店铺": "A", "易仓SKU": "S2", "物流费用": 30.0},
+        ]
+        assert result.first_table().columns == ["易仓SKU", "物流费用"]
+
+    def test_valid_aggregate_may_drop_filter_columns_without_codegen_fallback(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({
+            "店铺": ["乐天", "乐天", "官网"],
+            "易仓SKU": ["A", "B", "C"],
+            "物流费用": [10.0, 40.0, 99.0],
+        })
+        plan = QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                query="在乐天店铺中哪个易仓SKU物流费用最高",
+                route=RoutingHint.RULE_ENGINE,
+                input_source="source",
+                operation_intents=["which", "extreme"],
+                target_fields=["店铺", "易仓SKU", "物流费用"],
+            )],
+            mode=MultiTurnMode.NEW_QUERY,
+        )
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.RULE_ENGINE,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.9,
+            reasoning="test",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.sheet_skill.run = AsyncMock(return_value=[{"fileName": "x.xlsx", "sheets": ["Sheet1"]}])
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock()
+        agent.insight_skill.run = AsyncMock(return_value="done")
+
+        result = run(agent.run(ctx, "在乐天店铺中哪个易仓SKU物流费用最高"))
+
+        agent.repair_loop.run.assert_not_awaited()
+        assert result.first_table().rows == [{"易仓SKU": "B", "物流费用": 40.0}]
+
+    def test_changed_sheet_scope_forces_reset_instead_of_reusing_previous_scope(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        ctx.active_result = ResultBlocks(blocks=[
+            TableBlock(columns=["店铺", "费用"], rows=[{"店铺": "旧店铺", "费用": 99.0}])
+        ])
+        ctx.source_scope_changed = True
+        new_source = pd.DataFrame({"店铺": ["新店铺"], "费用": [10.0]})
+        plan = QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                query="按费用排序",
+                route=RoutingHint.RULE_ENGINE,
+                input_source="active_dataframe",
+                scope_from="previous_result",
+                operation_intents=["sort"],
+                target_fields=["费用"],
+            )],
+            mode=MultiTurnMode.FOLLOW_UP,
+        )
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.RULE_ENGINE,
+            mode=MultiTurnMode.FOLLOW_UP,
+            confidence=0.9,
+            reasoning="test",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.sheet_skill.run = AsyncMock(return_value=[{"fileName": "new.xlsx", "sheets": ["Sheet2"]}])
+        agent.df_loader.run = MagicMock(return_value=new_source)
+        agent.insight_skill.run = AsyncMock(return_value="done")
+
+        result = run(agent.run(ctx, "按费用排序"))
+
+        assert agent.df_loader.run.call_args.kwargs["multiturn_mode"] == MultiTurnMode.RESET
+        assert result.first_table().rows == [{"店铺": "新店铺", "费用": 10.0}]
+        assert ctx.source_scope_changed is False
+
+    def test_explicit_new_sheet_in_followup_reselects_instead_of_reusing_active_dataframe(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{
+            "fileName": "costs.xlsx",
+            "sheets": ["尾程", "仓储"],
+        }]
+        ctx.active_source_scope = ctx.scope_key([{
+            "fileName": "costs.xlsx",
+            "sheets": ["尾程"],
+        }])
+        ctx.selected_sheets = ["尾程"]
+        ctx._active_df = pd.DataFrame({
+            "物流商": ["日本海外仓"],
+            "费用金额": [300.0],
+        })
+        ctx.active_result = ResultBlocks(blocks=[
+            TableBlock(
+                columns=["物流商", "费用金额"],
+                rows=[{"物流商": "日本海外仓", "费用金额": 300.0}],
+            )
+        ])
+        storage_df = pd.DataFrame({
+            "平台": ["亚马逊", "乐天"],
+            "费用金额": [999.0, 300.0],
+        })
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.RULE_ENGINE,
+            mode=MultiTurnMode.FOLLOW_UP,
+            confidence=0.9,
+            reasoning="model treated the complete question as a follow-up",
+        ))
+        planning_modes = []
+        planned = QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                question_id="q1",
+                query="仓储费哪个平台花的最多",
+                route=RoutingHint.RULE_ENGINE,
+                input_source="active_dataframe",
+                operation_intents=["which", "extreme"],
+                target_fields=["平台", "费用金额"],
+                semantics=QuerySemantics(
+                    source_candidate_ids=["costs.xlsx::仓储"],
+                    dimensions=["平台"],
+                ),
+            )],
+            source="llm",
+            mode=MultiTurnMode.FOLLOW_UP,
+        )
+
+        async def capture_source_switch(*args, **kwargs):
+            planning_modes.append(kwargs["routing"].mode)
+            return planned
+
+        agent.planning_skill.run = AsyncMock(side_effect=capture_source_switch)
+        agent.sheet_skill.catalog = MagicMock(return_value=[
+            {
+                "candidateId": "costs.xlsx::尾程",
+                "fileName": "costs.xlsx",
+                "sheetName": "尾程",
+                "columns": ["物流商", "费用金额"],
+            },
+            {
+                "candidateId": "costs.xlsx::仓储",
+                "fileName": "costs.xlsx",
+                "sheetName": "仓储",
+                "columns": ["平台", "费用金额"],
+            },
+        ])
+        agent.sheet_skill.run = AsyncMock(return_value=[{
+            "fileName": "costs.xlsx",
+            "sheets": ["仓储"],
+        }])
+        agent.df_loader.run = MagicMock(return_value=storage_df)
+        agent.insight_skill.run = AsyncMock(return_value="亚马逊最高")
+
+        result = run(agent.run(ctx, "仓储费哪个平台花的最多"))
+
+        agent.sheet_skill.run.assert_awaited_once()
+        assert planning_modes == [MultiTurnMode.FOLLOW_UP]
+        assert agent.df_loader.run.call_args.kwargs["multiturn_mode"] == MultiTurnMode.RESET
+        assert result.first_table().rows == [{
+            "平台": "亚马逊",
+            "费用金额": 999.0,
+        }]
+
+    def test_followup_reapplies_persisted_filter_lineage_to_detail_rows(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({
+            "仓库": ["日本海外仓", "日本海外仓", "美国海外仓"],
+            "店铺": ["乐天", "官网", "乐天"],
+            "易仓SKU": ["A", "B", "C"],
+            "物流费用": [10.0, 20.0, 99.0],
+        })
+        ctx._active_df = source_df
+        ctx.active_result = ResultBlocks(blocks=[
+            TableBlock(columns=["易仓SKU", "物流费用"], rows=[
+                {"易仓SKU": "A", "物流费用": 10.0}
+            ])
+        ])
+        ctx.active_lineage = ResultLineage(filters={
+            "仓库": ["日本海外仓"],
+            "店铺": ["乐天"],
+        })
+        plan = QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                query="在上一轮范围内按易仓SKU汇总物流费用",
+                route=RoutingHint.CODE_GEN,
+                input_source="active_dataframe",
+                scope_from="previous_result",
+                target_fields=["易仓SKU", "物流费用"],
+            )],
+            mode=MultiTurnMode.FOLLOW_UP,
+        )
+        seen_inputs = []
+
+        async def execute_code(*args, **kwargs):
+            seen_inputs.append(kwargs["df"].copy())
+            return kwargs["df"][["易仓SKU", "物流费用"]], "result_df = ...", 0
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.FOLLOW_UP,
+            confidence=0.9,
+            reasoning="test",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock(side_effect=execute_code)
+        agent.insight_skill.run = AsyncMock(return_value="done")
+
+        run(agent.run(ctx, "哪个易仓SKU物流费用最高"))
+
+        assert seen_inputs[0].to_dict("records") == [{
+            "仓库": "日本海外仓",
+            "店铺": "乐天",
+            "易仓SKU": "A",
+            "物流费用": 10.0,
+        }]
+
+    def test_followup_promotes_consumed_result_entities_into_lineage_filters(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx()
+        source_df = pd.DataFrame({
+            "仓库": ["日本海外仓", "日本海外仓", "日本海外仓"],
+            "物流商": ["A物流", "A物流", "B物流"],
+            "易仓SKU": ["S1", "S2", "S3"],
+            "物流费用": [10.0, 20.0, 99.0],
+        })
+        ctx._active_df = source_df
+        ctx.active_result = ResultBlocks(blocks=[
+            TableBlock(columns=["物流商", "物流费用"], rows=[
+                {"物流商": "A物流", "物流费用": 30.0}
+            ])
+        ])
+        ctx.active_lineage = ResultLineage(
+            filters={"仓库": ["日本海外仓"]},
+            result_filters={"物流商": ["A物流"]},
+        )
+        plan = QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                query="这个物流商里面按易仓SKU汇总物流费用",
+                route=RoutingHint.CODE_GEN,
+                input_source="active_dataframe",
+                scope_from="previous_result",
+                target_fields=["易仓SKU", "物流费用"],
+            )],
+            mode=MultiTurnMode.FOLLOW_UP,
+        )
+
+        async def execute_code(*args, **kwargs):
+            result = kwargs["df"].groupby("易仓SKU", as_index=False)["物流费用"].sum()
+            return result, "result_df = ...", 0
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.FOLLOW_UP,
+            confidence=0.9,
+            reasoning="test",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock(side_effect=execute_code)
+        agent.insight_skill.run = AsyncMock(return_value="done")
+
+        run(agent.run(ctx, "这个物流商里面哪个易仓SKU物流费用最高"))
+
+        assert ctx.active_lineage.filters == {
+            "仓库": ["日本海外仓"],
+            "物流商": ["A物流"],
+        }
+
+    def test_missing_previous_result_entities_do_not_broaden_to_all_source_rows(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        source_df = pd.DataFrame({"店铺": ["A", "B"], "物流费用": [10.0, 20.0]})
+        previous_df = pd.DataFrame({"店铺": ["已删除店铺"], "物流费用": [99.0]})
+
+        scoped = SheetMindAgent._apply_previous_result_scope(source_df, previous_df)
+
+        assert scoped.empty
+
+    def test_field_correction_keeps_prior_filters_but_drops_wrong_result_entities(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        source_df = pd.DataFrame({
+            "仓库": ["日本海外仓", "日本海外仓", "美国海外仓"],
+            "店铺": ["乐天", "乐天", "乐天"],
+            "平台SKU": ["P1", "P2", "P2"],
+            "易仓SKU": ["A", "B", "C"],
+            "物流费用": [10.0, 20.0, 99.0],
+        })
+        ctx = make_ctx()
+        ctx._active_df = source_df
+        ctx.active_result = ResultBlocks(blocks=[
+            TableBlock(columns=["平台SKU", "物流费用"], rows=[
+                {"平台SKU": "P2", "物流费用": 20.0}
+            ])
+        ])
+        ctx.active_lineage = ResultLineage(
+            filters={"仓库": ["日本海外仓"], "店铺": ["乐天"]},
+            result_filters={"平台SKU": ["P2"]},
+        )
+        agent = SheetMindAgent(MockRouter())
+        plan = QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                query="改成按易仓SKU汇总物流费用",
+                route=RoutingHint.CODE_GEN,
+                input_source="active_dataframe",
+                scope_from="previous_filters",
+                target_fields=["易仓SKU", "物流费用"],
+            )],
+            mode=MultiTurnMode.FOLLOW_UP,
+        )
+        seen_inputs = []
+
+        async def execute_code(*args, **kwargs):
+            seen_inputs.append(kwargs["df"].copy())
+            return kwargs["df"][["易仓SKU", "物流费用"]], "result_df = ...", 0
+
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.FOLLOW_UP,
+            confidence=0.9,
+            reasoning="test",
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=plan)
+        agent.df_loader.run = MagicMock(return_value=source_df)
+        agent.repair_loop.run = AsyncMock(side_effect=execute_code)
+        agent.insight_skill.run = AsyncMock(return_value="done")
+
+        run(agent.run(ctx, "用错列了，应该用易仓SKU"))
+
+        assert seen_inputs[0]["易仓SKU"].tolist() == ["A", "B"]
+
     def test_returns_each_independent_terminal_result(self):
         from sheetmind.analysis.agent import SheetMindAgent
 
@@ -1839,7 +3227,13 @@ class TestSheetMindAgentPipeline:
         agent.planning_skill.run = AsyncMock(return_value=plan)
         agent.sheet_skill.run = AsyncMock(return_value=[{"fileName": "sales.xlsx", "sheets": ["Sheet1"]}])
         agent.df_loader.run = MagicMock(return_value=source_df)
-        agent.insight_skill.run = AsyncMock(return_value="已分别完成筛选和排序。")
+        seen_insight = {}
+
+        async def capture_insight(*args, **kwargs):
+            seen_insight.update(kwargs)
+            return "已分别完成筛选和排序。"
+
+        agent.insight_skill.run = AsyncMock(side_effect=capture_insight)
 
         result = run(agent.run(ctx, "筛选2025年数据，同时按金额降序排序"))
 
@@ -1848,6 +3242,14 @@ class TestSheetMindAgentPipeline:
         assert [table.title for table in tables] == ["筛选2025年数据", "按金额降序排序"]
         assert len(tables[0].rows) == 2
         assert tables[1].rows[0]["金额"] == 999
+        assert tables[0].calculation_basis is not None
+        assert tables[0].calculation_basis.source_sheets == ["sales.xlsx / Sheet1"]
+        assert "日期" in tables[0].calculation_basis.fields
+        assert seen_insight["scenario"] == "processing"
+        assert agent.insight_skill.run.await_count == 2
+        assert [question.query for question in result.questions] == [
+            "筛选2025年数据", "按金额降序排序",
+        ]
 
     def test_insight_only_loads_dataframe_for_insight_without_table_output(self):
         from sheetmind.analysis.agent import SheetMindAgent
@@ -1965,11 +3367,161 @@ class TestSheetMindAgentPipeline:
         assert hint == RoutingHint.CODE_GEN
         assert mode == MultiTurnMode.FOLLOW_UP
         assert result.has_chart
-        assert not result.has_table
+        assert result.has_table
+        assert result.first_table().calculation_basis is not None
+        assert "复用上一轮结果" in result.first_table().calculation_basis.operations
         assert agent.df_loader.run.call_count == 0
         assert agent.repair_loop.run.await_count == 0
-        assert agent.chart_skill.run.call_args.kwargs["result_df"] is previous_df
-        assert all(getattr(block, "kind", "") != "table" for block in result.blocks)
+
+    def test_chart_reuses_compatible_previous_result_when_planner_misclassifies_new(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+        from sheetmind.analysis.tracing.trace import Trace
+
+        agent = SheetMindAgent(MockRouter())
+        ctx = make_ctx(with_active_result=True)
+        previous_df = pd.DataFrame({
+            "易仓SKU": ["ZN0140B", "ZN0139B", "ZN0138B"],
+            "费用金额": [18828.0, 16620.0, 15200.0],
+        })
+        previous_result = ResultBlocks(blocks=[
+            TableBlock(
+                columns=["易仓SKU", "费用金额"],
+                rows=previous_df.to_dict("records"),
+            ),
+        ])
+        ctx.add_assistant_turn("乐天渠道SKU费用汇总。", previous_result)
+        ctx.add_assistant_turn(
+            "数据查询执行失败。",
+            ResultBlocks(blocks=[SummaryBlock(content="数据查询执行失败。")]),
+        )
+        ctx.active_lineage = ResultLineage(
+            filters={"平台": ["乐天"]},
+            result_columns=["易仓SKU", "费用金额"],
+        )
+
+        chart = ChartBlock(
+            chart_type="line",
+            labels=["ZN0140B", "ZN0139B", "ZN0138B"],
+            series=[ChartSeries(
+                name="费用金额",
+                values=[18828.0, 16620.0, 15200.0],
+            )],
+            x_axis_label="易仓SKU",
+            y_axis_label="费用金额",
+        )
+        agent.routing_skill.run = AsyncMock(return_value=RoutingResult(
+            hint=RoutingHint.CODE_GEN,
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.86,
+            reasoning="chart trend",
+            operation_intent=OperationIntent(types=["trend", "chart_data_prep"]),
+            output_intent=OutputIntent(formats=["chart"], explicit=True),
+            target_fields=["易仓SKU"],
+        ))
+        agent.planning_skill.run = AsyncMock(return_value=QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                query="画一个乐天渠道中各易仓SKU花费的趋势图",
+                route=RoutingHint.CODE_GEN,
+                input_source="source",
+                operation_intents=["trend", "chart_data_prep"],
+                output_intents=["chart"],
+                output_explicit=True,
+                target_fields=["易仓SKU"],
+                needs_new_computation=True,
+            )],
+            source="rule_fallback",
+            mode=MultiTurnMode.NEW_QUERY,
+            confidence=0.9,
+        ))
+        agent.df_loader.run = MagicMock(
+            side_effect=AssertionError("should not load source data")
+        )
+        agent.sheet_skill.run = AsyncMock(
+            side_effect=AssertionError("should not select a source sheet")
+        )
+        agent.repair_loop.run = AsyncMock(
+            side_effect=AssertionError("should not codegen")
+        )
+        agent.semantic_skill.run = AsyncMock(return_value={})
+        agent.chart_skill.run = AsyncMock(return_value=chart)
+        agent.insight_skill.run = AsyncMock(return_value="乐天渠道各易仓SKU费用趋势如下。")
+
+        result, hint, mode = run(agent._run_pipeline(
+            ctx,
+            "画一个乐天渠道中各易仓sku花费的趋势图",
+            Trace(),
+            None,
+        ))
+
+        assert hint == RoutingHint.CODE_GEN
+        assert mode == MultiTurnMode.FOLLOW_UP
+        assert result.has_chart
+        assert result.has_table
+        assert agent.sheet_skill.run.await_count == 0
+        assert agent.df_loader.run.call_count == 0
+        assert agent.repair_loop.run.await_count == 0
+        pd.testing.assert_frame_equal(
+            agent.chart_skill.run.call_args.kwargs["result_df"],
+            previous_df,
+        )
+        assert result.first_table().calculation_basis is not None
+
+    @pytest.mark.parametrize(
+        ("query", "target_fields", "operation_intents"),
+        [
+            (
+                "画亚马逊渠道中各易仓SKU花费的趋势图",
+                ["易仓SKU", "费用金额"],
+                ["trend", "chart_data_prep"],
+            ),
+            (
+                "画乐天渠道中各易仓SKU每月花费趋势图",
+                ["平台", "易仓SKU", "月份", "费用金额"],
+                ["trend", "chart_data_prep"],
+            ),
+            (
+                "重新汇总乐天渠道中各易仓SKU花费并画图",
+                ["平台", "易仓SKU", "费用金额"],
+                ["aggregation", "chart_data_prep"],
+            ),
+        ],
+    )
+    def test_chart_does_not_reuse_previous_result_for_new_scope_or_computation(
+        self,
+        query,
+        target_fields,
+        operation_intents,
+    ):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        ctx = make_ctx(with_active_result=True)
+        previous_df = pd.DataFrame({
+            "易仓SKU": ["ZN0140B", "ZN0139B"],
+            "费用金额": [18828.0, 16620.0],
+        })
+        ctx.active_lineage = ResultLineage(filters={"平台": ["乐天"]})
+        plan = QueryPlan(
+            steps=[ExecutionStep(
+                step_id="s1",
+                query=query,
+                route=RoutingHint.CODE_GEN,
+                input_source="source",
+                operation_intents=operation_intents,
+                output_intents=["chart"],
+                target_fields=target_fields,
+            )],
+            mode=MultiTurnMode.NEW_QUERY,
+        )
+
+        assert not SheetMindAgent._can_reuse_previous_result_for_chart(
+            ctx=ctx,
+            query=query,
+            plan=plan,
+            previous_result_df=previous_df,
+            wants_chart=True,
+            explicit_source_switch=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1977,6 +3529,134 @@ class TestSheetMindAgentPipeline:
 # ---------------------------------------------------------------------------
 
 class TestDataSourceSelection:
+    def test_explicit_sheet_name_wins_inside_a_multi_sheet_user_scope(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [
+            {
+                "candidateId": "costs.xlsx::尾程",
+                "fileName": "costs.xlsx",
+                "sheetName": "尾程",
+                "columns": ["平台", "店铺", "物流商", "费用金额"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+            {
+                "candidateId": "costs.xlsx::仓储",
+                "fileName": "costs.xlsx",
+                "sheetName": "仓储",
+                "columns": ["平台", "店铺", "物流商", "费用金额", "币别"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+        ]
+        monkeypatch.setattr(
+            SheetSelector,
+            "list_sheet_metadata",
+            lambda self, project_id: metadata,
+        )
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{
+            "fileName": "costs.xlsx",
+            "sheets": ["尾程", "仓储"],
+        }]
+
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            ctx,
+            "尾程表哪个物流商花钱最多，哪个店铺物流费最贵",
+            target_fields=["物流商", "店铺", "费用金额"],
+        ))
+
+        assert decision.status == "confirmed"
+        assert decision.selected_files == [{
+            "fileName": "costs.xlsx",
+            "sheets": ["尾程"],
+            "confidence": decision.confidence,
+            "reason": "query explicitly names a selected sheet",
+        }]
+
+    def test_explicit_sheet_name_outside_checked_scope_requires_reselection(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [
+            {
+                "candidateId": "costs.xlsx::尾程",
+                "fileName": "costs.xlsx",
+                "sheetName": "尾程",
+                "columns": ["物流商", "费用金额"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+            {
+                "candidateId": "costs.xlsx::仓储",
+                "fileName": "costs.xlsx",
+                "sheetName": "仓储",
+                "columns": ["平台", "费用金额"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+        ]
+        monkeypatch.setattr(
+            SheetSelector,
+            "list_sheet_metadata",
+            lambda self, project_id: metadata,
+        )
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{"fileName": "costs.xlsx", "sheets": ["尾程"]}]
+        ctx.selected_sheets = ["尾程"]
+
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            ctx,
+            "仓储费哪个平台花的最多",
+            target_fields=["平台", "费用金额"],
+        ))
+
+        assert decision.status == "scope_conflict"
+        assert decision.selected_files == []
+        assert decision.candidates[0].sheet_name == "仓储"
+
+    def test_ambiguous_question_does_not_silently_merge_selected_sheets(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [
+            {
+                "candidateId": "costs.xlsx::尾程",
+                "fileName": "costs.xlsx",
+                "sheetName": "尾程",
+                "columns": ["平台", "费用金额"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+            {
+                "candidateId": "costs.xlsx::仓储",
+                "fileName": "costs.xlsx",
+                "sheetName": "仓储",
+                "columns": ["平台", "费用金额"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+        ]
+        monkeypatch.setattr(
+            SheetSelector,
+            "list_sheet_metadata",
+            lambda self, project_id: metadata,
+        )
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{
+            "fileName": "costs.xlsx",
+            "sheets": ["尾程", "仓储"],
+        }]
+
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            ctx,
+            "哪个平台费用最高",
+            target_fields=["平台", "费用金额"],
+        ))
+
+        assert decision.status == "needs_clarification"
+        assert decision.selected_files == []
+        assert {item.sheet_name for item in decision.candidates} == {"尾程", "仓储"}
+
     def test_sheet_selector_prefers_query_matched_sheet(self):
         from sheetmind.services.sheet_selection import SheetSelector
 
@@ -2049,7 +3729,7 @@ class TestDataSourceSelection:
         assert decision.candidates[0].sheet_name == "Sheet2"
         assert decision.selected_files == []
 
-    def test_sheet_selection_accepts_explicit_candidate_after_conflict(self, monkeypatch):
+    def test_sheet_selection_requires_candidate_to_be_checked_after_conflict(self, monkeypatch):
         from sheetmind.services.sheet_selection import SheetSelector
 
         metadata = [{
@@ -2073,6 +3753,15 @@ class TestDataSourceSelection:
             "使用文件“sales.xlsx”的工作表“Sheet2”继续：汇总人民币金额",
         ))
 
+        assert decision.status == "scope_conflict"
+        assert decision.selected_files == []
+
+        ctx.requested_sheet_scope = [{"fileName": "sales.xlsx", "sheets": ["Sheet2"]}]
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            ctx,
+            "使用文件“sales.xlsx”的工作表“Sheet2”继续：汇总人民币金额",
+        ))
+
         assert decision.status == "confirmed"
         assert decision.selected_files == [{
             "fileName": "sales.xlsx",
@@ -2080,6 +3769,181 @@ class TestDataSourceSelection:
             "confidence": decision.confidence,
             "reason": "user explicitly confirmed sheet",
         }]
+
+    def test_planned_source_cannot_escape_checked_scope(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [
+            {
+                "candidateId": "old::仓储",
+                "fileId": "old",
+                "fileName": "汇总.xlsx",
+                "sheetName": "仓储",
+                "columns": ["平台", "仓储费"],
+                "sampleValues": [],
+                "recencyRank": 1,
+            },
+            {
+                "candidateId": "new::仓储",
+                "fileId": "new",
+                "fileName": "汇总 (1).xlsx",
+                "sheetName": "仓储",
+                "columns": ["平台", "仓储费"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+        ]
+        monkeypatch.setattr(
+            SheetSelector,
+            "list_sheet_metadata",
+            lambda self, project_id: metadata,
+        )
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{
+            "fileId": "old",
+            "fileName": "汇总.xlsx",
+            "sheets": ["仓储"],
+        }]
+
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            ctx,
+            "哪个平台仓储费最高",
+            target_fields=["平台", "仓储费"],
+            preferred_candidate_ids=["new::仓储"],
+        ))
+
+        assert decision.status == "scope_conflict"
+        assert decision.selected_files == []
+        assert [candidate.candidate_id for candidate in decision.candidates] == ["new::仓储"]
+
+    def test_planner_catalog_contains_only_checked_sheets(self):
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{
+            "fileId": "old",
+            "fileName": "汇总.xlsx",
+            "sheets": ["尾程"],
+        }]
+        metadata = [
+            {"candidateId": "old::尾程", "fileId": "old", "fileName": "汇总.xlsx", "sheetName": "尾程"},
+            {"candidateId": "old::仓储", "fileId": "old", "fileName": "汇总.xlsx", "sheetName": "仓储"},
+            {"candidateId": "new::尾程", "fileId": "new", "fileName": "汇总 (1).xlsx", "sheetName": "尾程"},
+        ]
+
+        scoped = SheetSelectionSkill.metadata_within_checked_scope(ctx, metadata)
+
+        assert [item["candidateId"] for item in scoped] == ["old::尾程"]
+
+    def test_duplicate_checked_workbooks_require_file_clarification(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [
+            {
+                "candidateId": "old::仓储",
+                "fileId": "old",
+                "fileName": "12月尾程仓储汇总.xlsx",
+                "sheetName": "仓储",
+                "columns": ["月份", "平台", "仓储费"],
+                "sampleValues": [],
+                "recencyRank": 1,
+            },
+            {
+                "candidateId": "new::仓储",
+                "fileId": "new",
+                "fileName": "12月尾程仓储汇总 (1).xlsx",
+                "sheetName": "仓储",
+                "columns": ["月份", "平台", "仓储费"],
+                "sampleValues": [],
+                "recencyRank": 0,
+            },
+        ]
+        monkeypatch.setattr(
+            SheetSelector,
+            "list_sheet_metadata",
+            lambda self, project_id: metadata,
+        )
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [
+            {"fileId": "old", "fileName": "12月尾程仓储汇总.xlsx", "sheets": ["仓储"]},
+            {"fileId": "new", "fileName": "12月尾程仓储汇总 (1).xlsx", "sheets": ["仓储"]},
+        ]
+
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            ctx,
+            "哪个平台仓储费最高",
+            target_fields=["平台", "仓储费"],
+        ))
+
+        assert decision.status == "needs_clarification"
+        assert decision.selected_files == []
+        assert {candidate.file_id for candidate in decision.candidates} == {"old", "new"}
+
+    def test_explicit_checked_workbook_resolves_duplicate_versions(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [
+            {"candidateId": "old::仓储", "fileId": "old", "fileName": "汇总.xlsx", "sheetName": "仓储", "columns": ["平台", "仓储费"], "sampleValues": [], "recencyRank": 1},
+            {"candidateId": "new::仓储", "fileId": "new", "fileName": "汇总 (1).xlsx", "sheetName": "仓储", "columns": ["平台", "仓储费"], "sampleValues": [], "recencyRank": 0},
+        ]
+        monkeypatch.setattr(SheetSelector, "list_sheet_metadata", lambda self, project_id: metadata)
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [
+            {"fileId": "old", "fileName": "汇总.xlsx", "sheets": ["仓储"]},
+            {"fileId": "new", "fileName": "汇总 (1).xlsx", "sheets": ["仓储"]},
+        ]
+
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            ctx,
+            "用汇总 (1).xlsx 的仓储表回答哪个平台仓储费最高",
+            target_fields=["平台", "仓储费"],
+        ))
+
+        assert decision.status == "confirmed"
+        assert decision.selected_files[0]["fileId"] == "new"
+
+    def test_explicit_join_can_bind_multiple_checked_sources(self, monkeypatch):
+        from sheetmind.services.sheet_selection import SheetSelector
+
+        metadata = [
+            {"candidateId": "orders::订单", "fileId": "orders", "fileName": "订单.xlsx", "sheetName": "订单", "columns": ["SKU", "销量"], "sampleValues": [], "recencyRank": 0},
+            {"candidateId": "costs::费用", "fileId": "costs", "fileName": "费用.xlsx", "sheetName": "费用", "columns": ["SKU", "物流费"], "sampleValues": [], "recencyRank": 0},
+        ]
+        monkeypatch.setattr(SheetSelector, "list_sheet_metadata", lambda self, project_id: metadata)
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [
+            {"fileId": "orders", "fileName": "订单.xlsx", "sheets": ["订单"]},
+            {"fileId": "costs", "fileName": "费用.xlsx", "sheets": ["费用"]},
+        ]
+
+        decision = run(SheetSelectionSkill(MockRouter()).run(
+            ctx,
+            "把订单表和费用表按SKU左联",
+            source_mode="join",
+            preferred_candidate_ids=["orders::订单", "costs::费用"],
+        ))
+
+        assert decision.status == "confirmed"
+        assert {item["fileId"] for item in decision.selected_files} == {"orders", "costs"}
+
+    def test_dataframe_loader_rejects_unchecked_source_before_reading(self):
+        from sheetmind.analysis.tools.base import ToolError
+        from sheetmind.analysis.tools.dataframe_loader import DataframeLoaderTool
+
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{
+            "fileId": "checked",
+            "fileName": "汇总.xlsx",
+            "sheets": ["尾程"],
+        }]
+
+        with pytest.raises(ToolError, match="未勾选"):
+            DataframeLoaderTool().run(
+                ctx,
+                selected_files=[{
+                    "fileId": "unchecked",
+                    "fileName": "汇总 (1).xlsx",
+                    "sheets": ["仓储"],
+                }],
+            )
 
     def test_sheet_selection_asks_when_ranking_remains_uncertain(self, monkeypatch):
         from sheetmind.services.sheet_selection import SheetSelector
@@ -2256,6 +4120,23 @@ class TestDataSourceSelection:
 # ---------------------------------------------------------------------------
 
 class TestEnhancementAcceptance:
+    def test_exact_base_field_does_not_also_resolve_pandas_duplicate_suffix(self):
+        skill = SemanticTypingSkill(MockRouter())
+        df = pd.DataFrame({
+            "店铺": ["乐天"],
+            "店铺.1": ["genhigh(rakuten_genhigh)"],
+            "费用金额": [100.0],
+        })
+        field_map = run(skill.run(make_ctx(), "哪个店铺物流费用最贵", df=df))
+
+        decisions = FieldResolver().decide_all(
+            "哪个店铺物流费用最贵",
+            field_map,
+            mentions=["店铺"],
+        )
+
+        assert [decision.selected.column for decision in decisions] == ["店铺"]
+
     def test_field_resolver_requires_clarification_for_tied_metric_variants(self):
         skill = SemanticTypingSkill(MockRouter())
         df = pd.DataFrame({"金额": [10], "金额（RMB）": [70], "金额（USD）": [5]})

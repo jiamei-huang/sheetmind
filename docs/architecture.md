@@ -9,12 +9,12 @@ Browser (React)
     -> project, file, task, and conversation services
     -> SheetMindAgent
       -> deterministic query normalization
-      -> hybrid structure detection and dependency-aware query planning
+      -> semantic planning (questions, sources, fields, operations)
       -> operation/output intent extraction and deterministic route decision
-      -> hybrid sheet selection and semantic field typing
-      -> dataframe tools and guarded Python execution
+      -> per-question sheet binding and semantic field typing
+      -> dataframe tools, guarded Python execution, and semantic validation
       -> output planning, chart, and insight skills
-      -> ResultBlocks
+      -> QuestionResult + full-data artifact + ResultBlocks
 ```
 
 ## Repository modules
@@ -54,7 +54,7 @@ Intent handling is split into six decisions:
 3. **Intent Signal Extraction** independently collects raw operation and output signals. Operation terms describe work such as filtering, aggregation, trend calculation, and anomaly detection. Output terms describe presentation such as a table, chart, insight, or Excel export. Neither vocabulary names an execution engine.
 4. **Derived Intent Rules** combine raw signals and resolve ambiguous wording before routing. For example, display plus trend derives a chart request, while explain plus trend derives an insight request and suppresses chart creation. These rules are deterministic and covered by regression tests.
 5. **Route Decision** uses only `OperationIntent`. Computation operations select `CODE_GEN`; filter/sort/pass-through operations select `RULE_ENGINE`; explanation without new computation selects `INSIGHT_ONLY`. A low-confidence atomic query may ask the routing model for additional operation and output intents, but the model cannot directly select or override the route.
-6. **Output Planning** runs after execution planning and uses `OutputIntent` to decide which result blocks to assemble. For example, an explicit chart request may return a chart and summary without a redundant table, while Excel export preserves tabular output.
+6. **Output Planning** runs after execution planning and uses `OutputIntent` to decide which result blocks to assemble. Every successful calculation retains its evidence table; a chart or narrative is an additional presentation of that computed result rather than a replacement for it.
 
 This keeps explicit simple queries on a zero-model fast path while using semantic understanding where a mistaken structural guess would be costly. Every planned atomic step crosses the same signal-extraction and route-decision interface.
 
@@ -106,9 +106,9 @@ The routing result exposes both intent objects and execution metadata for downst
 - `uses_previous_result`: whether the turn is a follow-up that refers to prior results.
 - `target_fields`: best-effort field mentions before semantic typing runs.
 
-`QueryPlanningSkill` returns one or more ordered `ExecutionStep` records containing original and normalized query text, a route, dependency IDs, input source, operation intents, output intents, fields, and confidence. Dependencies may only reference prior steps, and planning output is rejected if it drops currency qualifiers or numeric constraints. Invalid model output falls back to deterministic clause splitting.
+`QueryPlanningSkill` returns one or more ordered `ExecutionStep` records containing a stable `question_id`, original and normalized query text, dependencies, input source, route, and a typed `QuerySemantics` contract. That contract names candidate source IDs, source mode, dimensions, metrics, filters, sort order, and limit. Candidate IDs and fields are validated against the recalled workbook catalog; planning output is rejected if it invents a source or field, drops currency qualifiers, or loses numeric constraints. Invalid model output falls back to deterministic clause splitting.
 
-`SheetMindAgent` stores the resulting `ExecutionPlan` in runtime context and trace. Dependent steps consume the declared prior result; independent steps consume the original source and may produce multiple named result blocks. Semantic typing, profiling, field resolution, code-generation field contracts, and executor validation are applied to every computational step.
+`SheetMindAgent` stores the resulting `ExecutionPlan` in runtime context and trace. Each independent question binds and loads its own validated source, so a task may move from a 尾程 question to a 仓储 question without creating a new task. Dependent steps consume the declared prior result. Multiple sources are never concatenated implicitly: an explicit union requires identical schemas, while independent questions remain independent. Semantic typing, profiling, field resolution, code-generation field contracts, and executor validation are applied to every computational step.
 
 ## Semantic data contract
 
@@ -137,13 +137,15 @@ Candidates are compared only within the same canonical field concept and semanti
 
 `SheetSelectionSkill` recalls every current workbook/sheet using lightweight metadata: file name, sheet name, detected headers, representative values, and recency. Exact names, planned target fields, qualified metric names, and sample-value matches produce deterministic candidate scores. Clear matches stay on the rule path; ambiguous candidates are sent to the configured sheet-selection model, which may only rank supplied candidate IDs. A model response that invents a source or remains below the confidence threshold is rejected.
 
-The browser sends its current file/sheet scope with every analysis request. The scope is respected when it matches the query. If metadata indicates that the requested fields exist in a different sheet, execution stops with a `scope_conflict` result instead of silently switching or running against the wrong sheet. Multiple unresolved candidates produce `needs_clarification`. Selecting a candidate creates an explicit follow-up query that authorizes that exact workbook and sheet.
+The browser sends its current checked file/sheet scope with every analysis request. This scope is a hard authorization boundary, not merely a ranking hint: planning may inspect unselected metadata to identify a likely mismatch, but neither source binding nor dataframe loading may read an unchecked Sheet. If metadata indicates that the requested fields exist elsewhere, execution stops with `scope_conflict` and asks the user to check that source first. Mentioning an unchecked file or Sheet in query text never authorizes it.
+
+When two checked workbook versions contain the same plausible Sheet or materially similar schemas, the runtime returns `needs_clarification` instead of preferring the newest upload. The user must keep the intended source checked or name the checked workbook and Sheet explicitly. Multiple checked sources are combined only when the query explicitly requests a supported multi-source operation; ordinary multi-selection never implies concatenation.
 
 ## Execution and presentation safeguards
 
 `DataframeLoaderTool` can emit a load report with sources, detected headers, cleanup counts, and warnings. `RuleEngineTool` receives the resolved field contract directly and emits a structured rule report to the agent. `RuleResultValidator` checks operation coverage, required qualified columns, pass-through equivalence, row-count constraints, sort order, and requested date periods before the result is accepted. A rejected rule result changes the step and top-level execution route to `CODE_GEN`, then enters `RepairLoop`.
 
-`RepairLoop` wraps `CodeGenerationSkill` and `PythonExecutorTool`. It permits the initial attempt plus at most two repairs, with a 120-second repair budget. It stops early when generated code repeats, generation/execution/field-contract errors repeat, or executor safety policy rejects the code. Before execution, the field contract traces dataframe dependencies backward from `result_df`; a required column must participate in the result data flow through selection, filtering, grouping, sorting, or computation. A column name appearing only in an unused variable or output label does not satisfy the contract.
+`RepairLoop` wraps `CodeGenerationSkill` and `PythonExecutorTool`. It permits the initial attempt plus at most two repairs, with a 120-second repair budget. It stops early when generated code repeats, generation/execution/field-contract errors repeat, or executor safety policy rejects the code. Code generation receives the same typed semantic plan used by source and field binding. Before execution, the field contract traces dataframe dependencies backward from `result_df`; a required column must participate in the result data flow through selection, filtering, grouping, sorting, or computation. A shared execution-contract validator then checks deterministic and generated outputs against limits, metrics, ordering, and structural bounds.
 
 `ChartPlanningSkill` uses semantic metadata and the requesting step's resolved field contract to choose axes. Contract dimensions, identifiers, and dates are preferred for X; contract numeric metrics constrain Y when those columns are present in the computed result. It supports period labels as time axes, limits crowded categorical charts with `Other`, and records a confidence and reason. `ResultValidator` enforces frontend table/chart caps and drops an invalid chart while retaining valid table and summary blocks.
 
@@ -156,21 +158,39 @@ Every completed analysis returns:
 ```json
 {
   "type": "result_blocks",
+  "run_id": "uuid",
+  "status": "success",
+  "focus_question_id": "q1",
   "output_intents": ["table", "chart"],
+  "questions": [
+    {
+      "question_id": "q1",
+      "query": "Show sales by region",
+      "status": "success",
+      "execution_report": {
+        "source_bindings": [{"file_name": "sales.xlsx", "sheet_name": "Sheet1"}],
+        "source_rows": 2000,
+        "result_rows": 8,
+        "fields": ["region", "sales"],
+        "operations": ["aggregation", "sort"]
+      },
+      "blocks": []
+    }
+  ],
   "blocks": [
     { "kind": "metric", "label": "Revenue", "value": 1280000, "unit": "CNY" },
-    { "kind": "table", "columns": ["region", "sales"], "rows": [] },
+    { "kind": "table", "columns": ["region", "sales"], "rows": [], "artifact_id": "uuid" },
     { "kind": "chart", "chart_type": "bar", "labels": [], "series": [] },
     { "kind": "summary", "content": "Key findings" }
   ]
 }
 ```
 
-Blocks may be combined. `output_intents` records the requested presentation contract; the web application uses it for result classification and uses the actual block kinds to render available panels.
+`questions` is authoritative for per-question status, provenance, and conclusions. `focus_question_id` identifies the result used by an unqualified next-turn reference and survives refresh. The flat `blocks` list remains a presentation compatibility view. Empty, failed, and clarification outcomes use typed status/resolution blocks and are never presented as successful insights. Table rows are a bounded browser preview; `artifact_id` points to the complete computed dataframe used by follow-ups and Excel export.
 
 ## State
 
-- SQLite stores projects, uploaded workbooks, tasks, and conversation messages.
-- `ContextStore` keeps active multi-turn analysis context in process memory.
-- `TraceStore` keeps execution traces in process memory.
+- SQLite stores anonymous sessions, projects, uploaded workbooks, tasks, conversations, serialized analysis context, full-result artifacts, and execution traces.
+- `ContextStore` keeps hot multi-turn dataframes in memory and restores serializable context after a process restart. Full prior result data is rehydrated from its artifact rather than from the 1,000-row UI preview.
+- Conversation user/assistant messages share a `run_id`, so refresh restoration cannot pair concurrent or interrupted turns incorrectly.
 - `server/data` and `server/logs` are runtime-only directories.

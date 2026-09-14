@@ -44,18 +44,21 @@ class SheetSelector:
         # 解析每个文件的sheet信息
         logger.debug(f"[SheetSelector] Step 2: 解析文件 Sheet 信息...")
         file_sheets_info = []
-        for file_idx, file_name in enumerate(files):
+        for file_idx, file_ref in enumerate(files):
+            file_id = file_ref["fileId"]
+            file_name = file_ref["fileName"]
             logger.debug(f"[SheetSelector]   处理文件 {file_idx+1}/{len(files)}: {file_name}")
             try:
                 # 获取文件的sheet列表
                 logger.debug(f"[SheetSelector]     获取文件字节...")
-                file_bytes = self.excel_service.get_file_by_name(project_id, file_name)
+                file_bytes = self.excel_service.get_file_by_id(project_id, file_id)
                 if file_bytes:
                     logger.debug(f"[SheetSelector]     解析 Excel Sheet 列表...")
                     with pd.ExcelFile(io.BytesIO(file_bytes)) as xls:
                         sheet_names = xls.sheet_names
                         logger.debug(f"[SheetSelector]     ✅ 找到 {len(sheet_names)} 个 Sheet: {sheet_names[:5]}{'...' if len(sheet_names) > 5 else ''}")
                         file_sheets_info.append({
+                            "fileId": file_id,
                             "fileName": file_name,
                             "sheets": sheet_names,
                             "allSheets": sheet_names
@@ -85,9 +88,11 @@ class SheetSelector:
     def list_sheet_metadata(self, project_id: str) -> List[Dict[str, Any]]:
         """Return lightweight, query-independent metadata for every current sheet."""
         candidates: List[Dict[str, Any]] = []
-        for recency_rank, file_name in enumerate(self._get_project_files(project_id)):
+        for recency_rank, file_ref in enumerate(self._get_project_files(project_id)):
+            file_id = file_ref["fileId"]
+            file_name = file_ref["fileName"]
             try:
-                file_bytes = self.excel_service.get_file_by_name(project_id, file_name)
+                file_bytes = self.excel_service.get_file_by_id(project_id, file_id)
                 if not file_bytes:
                     continue
                 with pd.ExcelFile(io.BytesIO(file_bytes)) as xls:
@@ -97,7 +102,8 @@ class SheetSelector:
                             sheet_name,
                         )
                         candidates.append({
-                            "candidateId": f"{file_name}::{sheet_name}",
+                            "candidateId": f"{file_id}::{sheet_name}",
+                            "fileId": file_id,
                             "fileName": file_name,
                             "sheetName": sheet_name,
                             "columns": metadata["columns"],
@@ -173,10 +179,9 @@ class SheetSelector:
                 best_score = score
         return best_index
 
-    def _get_project_files(self, project_id: str) -> List[str]:
+    def _get_project_files(self, project_id: str) -> List[Dict[str, str]]:
         """
-        获取项目下的文件名
-        返回每个文件名的最新版本，并按上传时间排序。
+        获取项目下的全部文件版本，并按上传时间排序。
         """
         import time
         logger.debug(f"[SheetSelector] _get_project_files: project_id={project_id}")
@@ -185,24 +190,24 @@ class SheetSelector:
         cursor = conn.cursor()
 
         try:
-            # 按创建时间排序，优先选择最近的文件
-            # 获取所有文件，但按最新上传时间排序（避免加载很旧的历史文件）
             cursor.execute(
-                """SELECT DISTINCT file_name, MAX(created_at) as latest_created_at
+                """SELECT file_id, file_name
                    FROM files
                    WHERE project_id = ?
-                   GROUP BY file_name
-                   ORDER BY latest_created_at DESC""",
+                   ORDER BY created_at DESC, file_id DESC""",
                 (project_id,)
             )
             rows = cursor.fetchall()
 
-            file_names = [row[0] for row in rows]
-            logger.debug(f"[SheetSelector] 找到 {len(file_names)} 个文件（按时间排序，最新的在前）")
-            for idx, file_name in enumerate(file_names):
-                logger.debug(f"[SheetSelector]   {idx+1}. {file_name}")
+            file_refs = [
+                {"fileId": str(row[0]), "fileName": str(row[1])}
+                for row in rows
+            ]
+            logger.debug(f"[SheetSelector] 找到 {len(file_refs)} 个文件（按时间排序，最新的在前）")
+            for idx, file_ref in enumerate(file_refs):
+                logger.debug(f"[SheetSelector]   {idx+1}. {file_ref['fileName']} ({file_ref['fileId']})")
 
-            return file_names
+            return file_refs
         finally:
             conn.close()
 
@@ -219,6 +224,7 @@ class SheetSelector:
             file_info = file_sheets_info[0]
             sheets = self._select_relevant_sheets(file_info["sheets"], query)
             return [{
+                "fileId": file_info.get("fileId"),
                 "fileName": file_info["fileName"],
                 "sheets": sheets
             }]
@@ -232,6 +238,7 @@ class SheetSelector:
             if self._should_include_file(file_name_lower, query_lower):
                 sheets = self._select_relevant_sheets(file_info["sheets"], query)
                 selected.append({
+                    "fileId": file_info.get("fileId"),
                     "fileName": file_info["fileName"],
                     "sheets": sheets
                 })
@@ -240,6 +247,7 @@ class SheetSelector:
         if not selected and file_sheets_info:
             sheets = self._select_relevant_sheets(file_sheets_info[0]["sheets"], query)
             selected.append({
+                "fileId": file_sheets_info[0].get("fileId"),
                 "fileName": file_sheets_info[0]["fileName"],
                 "sheets": sheets
             })

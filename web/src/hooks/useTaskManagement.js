@@ -6,7 +6,12 @@ import {
   getProjectTasks,
   renameTask as renameTaskApi,
 } from "../api/tasks";
+import {
+  conversationHistoryToResults,
+  getTaskConversation,
+} from "../api/conversations.js";
 import { createTask as createLocalTask, deduplicateTasks, PAGE_SIZE_OPTIONS } from "../constants/task";
+import { DEFAULT_CHART_DISPLAY_LIMIT } from "../constants/chart";
 import { isValidBackendProjectId } from "../utils/validation";
 
 
@@ -34,6 +39,7 @@ const toFrontendTask = (task, projectId) => ({
   parentTaskId: null,
   selectedChartType: "bar",
   isChartDataView: false,
+  chartDisplayLimit: DEFAULT_CHART_DISPLAY_LIMIT,
 });
 
 
@@ -111,12 +117,28 @@ export const useTaskManagement = (activeProjectId, projectsReady, suppressTaskRe
     getProjectTasks(activeProjectId)
       .then(async (items) => {
         const source = items.length ? items : [await createTaskApi(activeProjectId)];
+        const histories = await Promise.all(
+          source.map(async (item) => {
+            try {
+              return await getTaskConversation(item.taskId);
+            } catch {
+              return [];
+            }
+          })
+        );
         if (cancelled) return;
         const previous = tasksByProject[activeProjectId] ?? [];
         const previousById = new Map(previous.map((task) => [task.id, task]));
-        const loaded = source.map((item) => {
+        const loaded = source.map((item, index) => {
           const task = toFrontendTask(item, activeProjectId);
-          return { ...task, ...(previousById.get(task.id) ?? {}), projectId: activeProjectId };
+          const prior = previousById.get(task.id);
+          const restoredResults = conversationHistoryToResults(histories[index]);
+          return {
+            ...task,
+            ...(prior ?? {}),
+            results: prior?.results?.length ? prior.results : restoredResults,
+            projectId: activeProjectId,
+          };
         });
         setTasksByProject((current) => ({ ...current, [activeProjectId]: loaded }));
         const remembered = localStorage.getItem(lastTaskKey(activeProjectId));

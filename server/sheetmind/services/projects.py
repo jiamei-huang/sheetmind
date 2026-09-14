@@ -6,6 +6,7 @@ import base64
 import hashlib
 import sqlite3
 import uuid
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -33,6 +34,9 @@ class ProjectWriteResult:
 
 
 class ProjectService:
+    def __init__(self, claim_legacy_projects: bool = False) -> None:
+        self._claim_legacy_projects_enabled = claim_legacy_projects
+
     def create_project(
         self,
         project_name: str,
@@ -126,31 +130,9 @@ class ProjectService:
             except Exception as exc:
                 raise ValueError(f"Invalid base64 data for '{item.fileName}'") from exc
             digest = hashlib.sha256(payload).hexdigest()
-            existing = conn.execute(
-                """
-                SELECT file_id, content_sha256, file_data
-                FROM files
-                WHERE project_id = ? AND file_name = ?
-                ORDER BY created_at DESC, file_id DESC
-                LIMIT 1
-                """,
-                (project_id, item.fileName),
-            ).fetchone()
-            if existing:
-                existing_digest = existing[1] or hashlib.sha256(existing[2]).hexdigest()
-                if existing_digest == digest:
-                    results.append(FileWriteResult(existing[0], item.fileName, "reused"))
-                    continue
-                conn.execute(
-                    """
-                    UPDATE files
-                    SET file_data = ?, content_sha256 = ?, created_at = ?
-                    WHERE file_id = ?
-                    """,
-                    (payload, digest, datetime.now(), existing[0]),
-                )
-                results.append(FileWriteResult(existing[0], item.fileName, "replaced"))
-                continue
+            file_name = ProjectService._available_file_name(
+                conn, project_id, item.fileName
+            )
 
             file_id = str(uuid.uuid4())
             conn.execute(
@@ -159,10 +141,37 @@ class ProjectService:
                     (file_id, project_id, file_name, file_data, content_sha256, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (file_id, project_id, item.fileName, payload, digest, datetime.now()),
+                (file_id, project_id, file_name, payload, digest, datetime.now()),
             )
-            results.append(FileWriteResult(file_id, item.fileName, "created"))
+            results.append(FileWriteResult(file_id, file_name, "created"))
         return results
+
+    @staticmethod
+    def _available_file_name(
+        conn: sqlite3.Connection,
+        project_id: str,
+        requested_name: str,
+    ) -> str:
+        """Use desktop-style numeric suffixes so every upload remains visible."""
+        existing_names = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT file_name FROM files WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        }
+        if requested_name not in existing_names:
+            return requested_name
+
+        path = Path(requested_name)
+        suffix = path.suffix
+        stem = requested_name[:-len(suffix)] if suffix else requested_name
+        version = 1
+        while True:
+            candidate = f"{stem} ({version}){suffix}"
+            if candidate not in existing_names:
+                return candidate
+            version += 1
 
     def get_project(
         self,
@@ -188,7 +197,7 @@ class ProjectService:
 
     def list_projects(self, session_id: str | None = None) -> list[Project]:
         with transaction() as conn:
-            if session_id is not None:
+            if session_id is not None and self._claim_legacy_projects_enabled:
                 self._claim_legacy_projects(conn, session_id)
             query = "SELECT project_id, project_name, created_at, session_id FROM projects"
             params: tuple[Any, ...] = ()

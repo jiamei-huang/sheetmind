@@ -11,6 +11,7 @@ one analysis query.  It:
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -18,27 +19,34 @@ import pandas as pd
 
 from .context import (
     AnalysisContext,
+    CalculationBasis,
     ChartBlock,
     ColumnMeta,
     ExecutionPlan,
     ExecutionStep,
+    ExecutionReport,
     FieldCandidate,
     FieldResolutionBlock,
     FieldResolutionRecord,
     MultiTurnMode,
+    QuestionResult,
     ResultBlocks,
+    ResultLineage,
     RoutingHint,
     SheetCandidate,
     SheetResolutionBlock,
+    SourceBinding,
+    StatusBlock,
     SummaryBlock,
     TableBlock,
 )
 from .harness.repair_loop import RepairLoop
+from .artifacts import get_artifact_store
 from .models.router import ModelRouter
 from .skills.chart_planning import ChartPlanningSkill
 from .skills.code_generation import CodeGenerationSkill
 from .skills.data_profiling import DataProfilingSkill
-from .skills.field_resolution import FieldResolver
+from .skills.field_resolution import FieldResolver, normalise_field_text
 from .skills.insight_writing import InsightWritingSkill
 from .skills.output_planning import OutputPlanningSkill
 from .skills.query_planning import QueryPlan, QueryPlanningSkill
@@ -55,6 +63,7 @@ from .tools.data_type_normalizer import DataTypeNormalizationTool
 from .tools.python_executor import PythonExecutorTool
 from .tools.rule_engine import RuleEngineTool
 from .tracing.storage import get_trace_store
+from .tracing.current import bind_trace, reset_trace
 from .tracing.trace import (
     EVT_ERROR,
     EVT_RESULT_ASSEMBLED,
@@ -64,6 +73,7 @@ from .tracing.trace import (
 )
 from .validators.result_validator import validate_result
 from .validators.rule_result_validator import RuleResultValidator
+from .validators.execution_contract_validator import ExecutionContractValidator
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +96,7 @@ class SheetMindAgent:
     def __init__(self, model_router: Optional[ModelRouter] = None) -> None:
         self.router = model_router or ModelRouter()
         self.trace_store = get_trace_store()
+        self.artifact_store = get_artifact_store()
 
         # Instantiate all skills and tools once (reusable, stateless)
         self.normalization_skill = QueryNormalizationSkill(self.router)
@@ -106,6 +117,7 @@ class SheetMindAgent:
         self.rule_engine = RuleEngineTool()
         self.executor = PythonExecutorTool()
         self.rule_result_validator = RuleResultValidator()
+        self.execution_contract_validator = ExecutionContractValidator()
 
         self.repair_loop = RepairLoop(self.code_gen_skill, self.executor)
 
@@ -118,6 +130,7 @@ class SheetMindAgent:
         ctx: AnalysisContext,
         query: str,
         emitter: Optional[StreamEmitter] = None,
+        run_id: Optional[str] = None,
     ) -> ResultBlocks:
         """
         Run one analysis turn.
@@ -136,6 +149,7 @@ class SheetMindAgent:
             task_id=ctx.task_id,
             query=query,
         )
+        trace_token = bind_trace(trace)
 
         try:
             if emitter:
@@ -144,6 +158,8 @@ class SheetMindAgent:
             result, routing_hint, multiturn_mode = await self._run_pipeline(
                 ctx, query, trace, emitter
             )
+            if run_id:
+                result.run_id = run_id
 
             trace.add_event(
                 EVT_RESULT_ASSEMBLED,
@@ -180,6 +196,8 @@ class SheetMindAgent:
                 await emitter.emit_error()
 
             raise
+        finally:
+            reset_trace(trace_token)
 
     # ------------------------------------------------------------------
     # Analysis pipeline
@@ -209,11 +227,24 @@ class SheetMindAgent:
             await emitter.emit_progress("正在理解您的问题...", step_id="routing")
 
         normalized_query = await self.normalization_skill.run(ctx, query)
+        try:
+            sheet_catalog = self.sheet_skill.catalog(ctx)
+        except Exception as exc:
+            logger.warning("[Pipeline] source catalog unavailable: %s", exc)
+            sheet_catalog = []
+        planning_sheet_catalog = self.sheet_skill.metadata_within_checked_scope(
+            ctx,
+            sheet_catalog,
+        )
         routing = await self.routing_skill.run(
             ctx, query, normalized_query=normalized_query
         )
         hint: RoutingHint = routing.hint
         mode: MultiTurnMode = routing.mode
+        if ctx.source_scope_changed:
+            mode = MultiTurnMode.RESET
+            routing.mode = MultiTurnMode.RESET
+        explicit_source_switch = False
         wants_chart = (
             hint != RoutingHint.INSIGHT_ONLY
             and routing.output_intent.wants_chart
@@ -222,6 +253,7 @@ class SheetMindAgent:
         previous_result_df = self._previous_result_dataframe(ctx)
         if (
             mode == MultiTurnMode.FOLLOW_UP
+            and len(sheet_catalog) <= 1
             and not routing.structure.needs_semantic_planning
             and wants_chart
             and self._query_targets_previous_result(query)
@@ -246,7 +278,65 @@ class SheetMindAgent:
 
         if routing.structure.needs_semantic_planning and emitter:
             await emitter.emit_progress("正在识别问题结构...", step_id="query_planning")
-        query_plan = await self.planning_skill.run(ctx, query, routing=routing)
+        query_plan = await self.planning_skill.run(
+            ctx,
+            query,
+            routing=routing,
+            sheet_catalog=planning_sheet_catalog,
+            force_semantic_planning=len(planning_sheet_catalog) > 1,
+        )
+        self._assign_question_ids(query_plan)
+        active_candidate_ids = self._candidate_ids_from_scope(ctx.active_source_scope)
+        planned_candidate_sets = [
+            set(step.semantics.source_candidate_ids)
+            for step in query_plan.steps
+            if not step.depends_on and step.semantics.source_candidate_ids
+        ]
+        explicit_source_switch = bool(
+            active_candidate_ids
+            and any(candidates != active_candidate_ids for candidates in planned_candidate_sets)
+        )
+        mode = query_plan.mode or mode
+        if ctx.source_scope_changed or explicit_source_switch:
+            mode = MultiTurnMode.RESET
+            query_plan.mode = MultiTurnMode.RESET
+            for step in query_plan.steps:
+                if not step.depends_on:
+                    step.input_source = "source"
+                    step.scope_from = None
+
+        if self._can_reuse_previous_result_for_chart(
+            ctx=ctx,
+            query=query,
+            plan=query_plan,
+            previous_result_df=previous_result_df,
+            wants_chart=wants_chart,
+            explicit_source_switch=explicit_source_switch,
+        ):
+            mode = MultiTurnMode.FOLLOW_UP
+            query_plan.mode = MultiTurnMode.FOLLOW_UP
+            query_plan.reasoning = (
+                f"{query_plan.reasoning} Reused the compatible previous tabular result "
+                "for chart presentation."
+            ).strip()
+            for step in query_plan.steps:
+                step.input_source = "previous_result"
+                step.scope_from = None
+                step.needs_new_computation = False
+
+            execution_plan = self._build_execution_plan(query_plan, routing)
+            ctx.execution_plan = execution_plan
+            hint = execution_plan.route
+            self._trace_execution_plan(trace, execution_plan, routing)
+            return await self._run_previous_result_chart(
+                ctx=ctx,
+                query=query,
+                previous_result_df=previous_result_df,
+                hint=hint,
+                mode=mode,
+                emitter=emitter,
+            )
+
         execution_plan = self._build_execution_plan(query_plan, routing)
         ctx.execution_plan = execution_plan
         hint = execution_plan.route
@@ -260,133 +350,114 @@ class SheetMindAgent:
         )
 
         # ----------------------------------------------------------------
-        # 2. Sheet selection
+        # 2-3. Bind and load a source independently for every root question.
         # ----------------------------------------------------------------
-        selected_files: List[Dict[str, Any]] = []
-        df: Optional[pd.DataFrame] = None
-        can_reuse_followup_df = mode == MultiTurnMode.FOLLOW_UP and ctx._active_df is not None
-        should_try_load_data = (
-            any(step.needs_new_computation for step in query_plan.steps)
-            or can_reuse_followup_df
-            or ctx.active_result is None
+        source_dfs, source_resolution = await self._bind_step_sources(
+            ctx=ctx,
+            plan=query_plan,
+            mode=mode,
+            sheet_catalog=sheet_catalog,
+            emitter=emitter,
         )
-
-        if should_try_load_data and not can_reuse_followup_df:
-            if emitter:
-                await emitter.emit_progress("正在选择数据文件...", step_id="sheet_selection")
-
-            try:
-                selection = await self.sheet_skill.run(
-                    ctx,
-                    normalized_query.normalized_text,
-                    target_fields=execution_plan.target_fields,
-                )
-                if isinstance(selection, SheetSelectionDecision):
-                    if selection.needs_user_input:
-                        sheet_block = self._sheet_resolution_block(ctx, selection)
-                        return ResultBlocks(
-                            output_intents=execution_plan.output_intents,
-                            blocks=[sheet_block],
-                        ), hint, mode
-                    selected_files = selection.selected_files
-                else:
-                    # Compatibility for tests and custom adapters that still
-                    # implement the historical list-returning interface.
-                    selected_files = selection
-                ctx.selected_sheets = [
-                    sheet
-                    for item in selected_files
-                    for sheet in item.get("sheets", [])
-                ]
-                execution_plan.target_sheets = list(ctx.selected_sheets)
-            except Exception as exc:
-                logger.warning("[Pipeline] sheet selection failed: %s", exc)
-                # Text-only questions can still be answered from conversation if
-                # data selection is unavailable. Data/code paths should surface
-                # the selection error because they cannot execute without rows.
-                if hint == RoutingHint.INSIGHT_ONLY:
-                    selected_files = []
-                elif not ctx.files:
-                    hint = RoutingHint.INSIGHT_ONLY
-                    for step in query_plan.steps:
-                        step.route = RoutingHint.INSIGHT_ONLY
-                        step.needs_new_computation = False
-                    execution_plan.route = RoutingHint.INSIGHT_ONLY
-                    execution_plan.needs_new_computation = False
-                else:
-                    raise
-
-        # ----------------------------------------------------------------
-        # 3. DataFrame loading
-        # ----------------------------------------------------------------
-        if should_try_load_data and (selected_files or can_reuse_followup_df):
-            if emitter:
-                await emitter.emit_progress("正在加载数据...", step_id="data_loading")
-
-            df = self.df_loader.run(
-                ctx,
-                selected_files=selected_files,
-                multiturn_mode=mode,
+        if source_resolution is not None:
+            sheet_block = self._sheet_resolution_block(ctx, source_resolution)
+            question = QuestionResult(
+                question_id="q1",
+                query=query,
+                status="needs_input",
+                blocks=[sheet_block],
             )
+            return ResultBlocks(
+                status="needs_input",
+                focus_question_id="q1",
+                output_intents=execution_plan.output_intents,
+                questions=[question],
+                blocks=[sheet_block],
+            ), hint, mode
+        df = next(iter(source_dfs.values()), None)
 
         # ----------------------------------------------------------------
         # 4. Execute validated plan steps in dependency order
         # ----------------------------------------------------------------
-        result_df, visible_results, step_outputs, execution_failed = await self._execute_plan_steps(
+        result_df, visible_results, step_outputs, failed_steps = await self._execute_plan_steps(
             ctx=ctx,
             plan=query_plan,
             source_df=df,
+            source_dfs=source_dfs,
             previous_result_df=previous_result_df,
             execution_plan=execution_plan,
             trace=trace,
             emitter=emitter,
         )
         hint = execution_plan.route
-        if execution_failed:
+        if failed_steps and not visible_results:
             clarification_blocks = self._field_resolution_blocks(
                 execution_plan.field_resolutions,
                 status="needs_clarification",
             )
             if clarification_blocks:
+                questions = [
+                    QuestionResult(
+                        question_id=step.question_id or step.step_id,
+                        query=step.query,
+                        status="needs_input",
+                        blocks=clarification_blocks,
+                        execution_report=step.execution_report,
+                    )
+                    for step in query_plan.steps
+                    if step.step_id in failed_steps
+                ]
                 clarification_result = ResultBlocks(
+                    status="needs_input",
+                    focus_question_id=questions[-1].question_id if questions else None,
                     output_intents=execution_plan.output_intents,
+                    questions=questions,
                     blocks=clarification_blocks,
                 )
                 return validate_result(clarification_result), hint, mode
-            error_msg = (
-                "数据查询执行失败，请尝试换一种方式描述您的问题，"
-                "或检查列名是否正确。"
-            )
+            error_msg = "数据查询执行失败。系统已记录失败阶段和数据来源，请检查计算详情后重试。"
             logger.warning("[Pipeline] planned execution failed for task=%s", ctx.task_id)
+            status_block = StatusBlock(
+                status="failed",
+                message=error_msg,
+                error_code="execution_failed",
+                details={"steps": failed_steps},
+            )
+            questions = [
+                QuestionResult(
+                    question_id=step.question_id or step.step_id,
+                    query=step.query,
+                    status="failed",
+                    blocks=[status_block],
+                    execution_report=step.execution_report,
+                )
+                for step in query_plan.steps
+                if step.step_id in failed_steps
+            ]
             return ResultBlocks(
+                status="failed",
+                focus_question_id=questions[-1].question_id if questions else None,
                 output_intents=execution_plan.output_intents,
-                blocks=[SummaryBlock(content=error_msg)],
+                questions=questions,
+                blocks=[status_block],
             ), hint, mode
 
-        output_plan = await self.output_planning_skill.run(
-            ctx,
-            query,
-            output_intents=execution_plan.output_intents,
-            route=hint,
-            has_computation=execution_plan.needs_new_computation,
-        )
-
         # ----------------------------------------------------------------
-        # 5. Chart planning for the result requested by each chart step
+        # 5. Build charts against the result owned by each atomic question.
         # ----------------------------------------------------------------
-        chart_blocks: List[ChartBlock] = []
-        chart_requests = (
-            [step for step in query_plan.steps if "chart" in step.output_intents]
-            if output_plan.include_chart
-            else []
-        )
-        if output_plan.include_chart and not chart_requests and query_plan.steps:
-            chart_requests = [query_plan.steps[-1]]
-
-        for step in chart_requests[:3]:
+        chart_blocks_by_question: Dict[str, List[ChartBlock]] = {}
+        chart_requests = [
+            step for step in query_plan.steps if "chart" in step.output_intents
+        ]
+        for step in chart_requests:
             chart_df = step_outputs.get(step.step_id)
             if chart_df is None:
-                chart_df = result_df
+                same_question = [
+                    frame
+                    for visible_step, frame in visible_results
+                    if visible_step.question_id == step.question_id
+                ]
+                chart_df = same_question[-1] if same_question else result_df
             if chart_df is None or chart_df.empty:
                 continue
             if emitter:
@@ -402,84 +473,175 @@ class SheetMindAgent:
             )
             if chart is not None:
                 chart.title = step.query
-                chart_blocks.append(chart)
-
-        chart_block = chart_blocks[0] if chart_blocks else None
+                chart_blocks_by_question.setdefault(step.question_id, []).append(chart)
 
         # ----------------------------------------------------------------
-        # 8. Insight writing
+        # 6-7. Assemble a self-contained result for every sub-question.
         # ----------------------------------------------------------------
         if emitter:
             await emitter.emit_progress("正在生成分析洞察...", step_id="insight_writing")
 
-        last_step_is_insight = bool(
-            query_plan.steps and query_plan.steps[-1].route == RoutingHint.INSIGHT_ONLY
-        )
-        if hint == RoutingHint.INSIGHT_ONLY or last_step_is_insight:
-            scenario = "insight_only"
-        elif chart_block is not None:
-            scenario = "chart"
-        else:
-            scenario = "processing"
-
-        table_blocks: List[TableBlock] = []
-        for step, step_df in visible_results:
-            step_output_plan = await self.output_planning_skill.run(
-                ctx,
-                step.query,
-                output_intents=step.output_intents,
-                route=step.route,
-                has_computation=step.needs_new_computation,
-            )
-            if not step_output_plan.include_table:
-                continue
-            table = self._build_table_block(step_df)
-            if table is not None:
-                if len(visible_results) > 1:
-                    table.title = step.query
-                table_blocks.append(table)
-        table_block = table_blocks[-1] if table_blocks else None
-
-        insight_df = result_df
-        if insight_df is None and hint == RoutingHint.INSIGHT_ONLY:
-            if df is not None:
-                insight_df = df
-            elif ctx._result_df is not None:
-                insight_df = ctx._result_df
-            else:
-                insight_df = ctx._active_df
-
-        summary_text = await self.insight_skill.run(
-            ctx,
-            query,
-            scenario=scenario,
-            result_df=insight_df,
-            chart_block=chart_block,
-            table_block=table_block,
-        )
-
-        # ----------------------------------------------------------------
-        # 9. Assemble ResultBlocks
-        # ----------------------------------------------------------------
+        question_ids = list(dict.fromkeys(
+            step.question_id or step.step_id for step in query_plan.steps
+        ))
+        questions: List[QuestionResult] = []
         blocks: List[Any] = []
-
-        blocks.extend(self._field_resolution_blocks(
+        assumed_blocks = self._field_resolution_blocks(
             execution_plan.field_resolutions,
             status="assumed",
-        ))
+        )
 
-        # Summary follows any field-assumption notice.
-        if summary_text and output_plan.include_summary:
-            blocks.append(SummaryBlock(content=summary_text))
+        for question_id in question_ids:
+            question_steps = [
+                step for step in query_plan.steps
+                if (step.question_id or step.step_id) == question_id
+            ]
+            terminal_step = question_steps[-1]
+            visible_for_question = [
+                (step, frame)
+                for step, frame in visible_results
+                if (step.question_id or step.step_id) == question_id
+            ]
+            evidence_step, question_df = (
+                visible_for_question[-1]
+                if visible_for_question
+                else (terminal_step, step_outputs.get(terminal_step.step_id))
+            )
+            if question_df is None and terminal_step.route == RoutingHint.INSIGHT_ONLY:
+                if terminal_step.input_source == "previous_result":
+                    question_df = previous_result_df
+                else:
+                    for candidate_df in (
+                        source_dfs.get(question_steps[0].step_id),
+                        ctx._result_df,
+                        ctx._active_df,
+                    ):
+                        if candidate_df is not None:
+                            question_df = candidate_df
+                            break
 
-        # Tables from independent terminal branches, or the final sequential step.
-        blocks.extend(table_blocks)
+            question_failed = any(step.step_id in failed_steps for step in question_steps)
+            if question_failed:
+                status_block = StatusBlock(
+                    status="failed",
+                    message="该问题执行失败，其他问题的可用结果仍已保留。",
+                    error_code=(terminal_step.execution_report.error_code if terminal_step.execution_report else "execution_failed"),
+                    details={"step_ids": [step.step_id for step in question_steps]},
+                )
+                question_blocks: List[Any] = []
+                if question_df is not None and not question_df.empty:
+                    artifact_id = self.artifact_store.save(
+                        ctx.task_id,
+                        question_id,
+                        question_df,
+                    )
+                    partial_table = self._build_table_block(
+                        question_df,
+                        artifact_id=artifact_id,
+                    )
+                    if partial_table is not None:
+                        partial_table.title = f"{evidence_step.query}（中间结果）"
+                        partial_table.calculation_basis = self._build_calculation_basis(
+                            ctx,
+                            evidence_step,
+                            question_df,
+                        )
+                        question_blocks.append(partial_table)
+                question_blocks.append(status_block)
+                question_status = "failed"
+            elif question_df is None or question_df.empty:
+                status_block = StatusBlock(
+                    status="empty",
+                    message="本次查询没有匹配到数据。请检查筛选条件、币种或数据来源。",
+                    error_code="empty_result",
+                    details={
+                        "source_rows": terminal_step.execution_report.source_rows
+                        if terminal_step.execution_report else None,
+                    },
+                )
+                question_blocks = [status_block]
+                question_status = "empty"
+            else:
+                question_output_intents = list(dict.fromkeys(
+                    output_intent
+                    for question_step in question_steps
+                    for output_intent in question_step.output_intents
+                ))
+                question_has_computation = any(
+                    question_step.needs_new_computation
+                    and question_step.route != RoutingHint.INSIGHT_ONLY
+                    for question_step in question_steps
+                )
+                step_output_plan = await self.output_planning_skill.run(
+                    ctx,
+                    terminal_step.query,
+                    output_intents=question_output_intents,
+                    route=evidence_step.route,
+                    has_computation=question_has_computation,
+                )
+                question_blocks = []
+                table_block: Optional[TableBlock] = None
+                if step_output_plan.include_table:
+                    artifact_id = self.artifact_store.save(
+                        ctx.task_id,
+                        question_id,
+                        question_df,
+                    )
+                    table_block = self._build_table_block(
+                        question_df,
+                        artifact_id=artifact_id,
+                    )
+                    if table_block is not None:
+                        table_block.title = evidence_step.query
+                        table_block.calculation_basis = self._build_calculation_basis(
+                            ctx,
+                            evidence_step,
+                            question_df,
+                        )
 
-        blocks.extend(chart_blocks)
+                question_charts = chart_blocks_by_question.get(question_id, [])
+                scenario = (
+                    "insight_only"
+                    if terminal_step.route == RoutingHint.INSIGHT_ONLY
+                    else "chart" if question_charts else "processing"
+                )
+                summary_text = await self.insight_skill.run(
+                    ctx,
+                    terminal_step.query,
+                    scenario=scenario,
+                    result_df=question_df,
+                    chart_block=question_charts[0] if question_charts else None,
+                    table_block=table_block,
+                )
+                if summary_text and step_output_plan.include_summary:
+                    question_blocks.append(SummaryBlock(content=summary_text))
+                if table_block is not None:
+                    question_blocks.append(table_block)
+                question_blocks.extend(question_charts)
+                question_status = "success"
 
+            questions.append(QuestionResult(
+                question_id=question_id,
+                query=terminal_step.query,
+                status=question_status,
+                blocks=question_blocks,
+                execution_report=terminal_step.execution_report or evidence_step.execution_report,
+            ))
+            blocks.extend(question_blocks)
+
+        statuses = {question.status for question in questions}
+        overall_status = (
+            "success" if statuses == {"success"}
+            else "empty" if statuses <= {"empty"}
+            else "failed" if statuses <= {"failed", "skipped"}
+            else "partial"
+        )
         result = ResultBlocks(
+            status=overall_status,
+            focus_question_id=questions[-1].question_id if questions else None,
             output_intents=execution_plan.output_intents,
-            blocks=blocks,
+            questions=questions,
+            blocks=[*assumed_blocks, *blocks],
         )
 
         if emitter:
@@ -488,11 +650,220 @@ class SheetMindAgent:
 
         return result, hint, mode
 
+    async def _bind_step_sources(
+        self,
+        *,
+        ctx: AnalysisContext,
+        plan: QueryPlan,
+        mode: MultiTurnMode,
+        sheet_catalog: List[Dict[str, Any]],
+        emitter: Optional[StreamEmitter],
+    ) -> tuple[Dict[str, pd.DataFrame], Optional[SheetSelectionDecision]]:
+        """Resolve one physical source per independent root question."""
+        source_dfs: Dict[str, pd.DataFrame] = {}
+        root_steps = [step for step in plan.steps if not step.depends_on]
+
+        for step in root_steps:
+            needs_rows = step.needs_new_computation or (
+                step.route == RoutingHint.INSIGHT_ONLY and ctx.active_result is None
+            )
+            if not needs_rows:
+                continue
+
+            planned_sources = set(step.semantics.source_candidate_ids)
+            active_sources = self._candidate_ids_from_scope(ctx.active_source_scope)
+            can_reuse_active_source = (
+                not planned_sources or planned_sources == active_sources
+            )
+            if (
+                step.input_source in {"active_dataframe", "previous_result"}
+                and step.needs_new_computation
+                and ctx._active_df is not None
+                and can_reuse_active_source
+            ):
+                source_dfs[step.step_id] = ctx._active_df
+                step.source_bindings = self._bindings_from_scope(ctx.active_source_scope)
+                continue
+            if step.input_source == "previous_result" and not step.needs_new_computation:
+                continue
+
+            selected_files: List[Dict[str, Any]] = []
+            if (
+                step.input_source == "active_dataframe"
+                and ctx.active_source_scope
+                and not step.semantics.source_candidate_ids
+            ):
+                try:
+                    parsed = json.loads(ctx.active_source_scope)
+                    if isinstance(parsed, list):
+                        selected_files = parsed
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    selected_files = []
+
+            if not selected_files:
+                if emitter:
+                    await emitter.emit_progress(
+                        f"正在为“{step.query[:24]}”选择数据源...",
+                        step_id="sheet_selection",
+                    )
+                try:
+                    selection = await self.sheet_skill.run(
+                        ctx,
+                        step.normalized_query or step.query,
+                        target_fields=step.target_fields,
+                        metadata=sheet_catalog,
+                        preferred_candidate_ids=step.semantics.source_candidate_ids,
+                        source_mode=step.semantics.source_mode,
+                    )
+                except Exception as exc:
+                    step.execution_report = ExecutionReport(
+                        status="failed",
+                        engine=step.route.value,
+                        error_code="source_selection_failed",
+                        error_message=str(exc),
+                    )
+                    continue
+                if isinstance(selection, SheetSelectionDecision):
+                    if selection.needs_user_input:
+                        return source_dfs, selection
+                    selected_files = selection.selected_files
+                    selected_candidates = {
+                        candidate.candidate_id: candidate for candidate in selection.candidates
+                    }
+                    step.source_bindings = [
+                        SourceBinding(
+                            candidate_id=f"{item.get('fileId') or item.get('fileName', '')}::{sheet}",
+                            file_id=str(item.get("fileId", "")) or None,
+                            file_name=str(item.get("fileName", "")),
+                            sheet_name=str(sheet),
+                            confidence=float(item.get("confidence", selection.confidence)),
+                            reason=str(item.get("reason", selection.reason)),
+                        )
+                        for item in selected_files
+                        for sheet in item.get("sheets", [])
+                        if f"{item.get('fileId') or item.get('fileName', '')}::{sheet}" in selected_candidates
+                        or not selected_candidates
+                    ]
+                else:
+                    selected_files = selection
+
+            if not step.source_bindings:
+                step.source_bindings = [
+                    SourceBinding(
+                        candidate_id=f"{item.get('fileId') or item.get('fileName', '')}::{sheet}",
+                        file_id=str(item.get("fileId", "")) or None,
+                        file_name=str(item.get("fileName", "")),
+                        sheet_name=str(sheet),
+                        confidence=float(item.get("confidence", 1.0)),
+                        reason=str(item.get("reason", "validated source scope")),
+                    )
+                    for item in selected_files
+                    for sheet in item.get("sheets", [])
+                ]
+
+            try:
+                if emitter:
+                    await emitter.emit_progress("正在加载数据...", step_id="data_loading")
+                load_report = self.df_loader.run(
+                    ctx,
+                    selected_files=selected_files,
+                    multiturn_mode=(
+                        MultiTurnMode.RESET
+                        if mode == MultiTurnMode.RESET
+                        else MultiTurnMode.NEW_QUERY
+                    ),
+                    merge_strategy=step.semantics.source_mode,
+                    update_context=False,
+                    return_report=True,
+                )
+                loaded_df = (
+                    load_report
+                    if isinstance(load_report, pd.DataFrame)
+                    else load_report.df
+                )
+                warnings = (
+                    []
+                    if isinstance(load_report, pd.DataFrame)
+                    else list(load_report.warnings)
+                )
+                source_dfs[step.step_id] = loaded_df
+                step.execution_report = ExecutionReport(
+                    status="success",
+                    engine=step.route.value,
+                    source_bindings=step.source_bindings,
+                    source_rows=len(loaded_df),
+                    warnings=warnings,
+                )
+            except Exception as exc:
+                step.execution_report = ExecutionReport(
+                    status="failed",
+                    engine=step.route.value,
+                    source_bindings=step.source_bindings,
+                    error_code="data_loading_failed",
+                    error_message=str(exc),
+                )
+
+        return source_dfs, None
+
+    @staticmethod
+    def _candidate_ids_from_scope(raw_scope: str) -> set[str]:
+        return {
+            binding.candidate_id
+            for binding in SheetMindAgent._bindings_from_scope(raw_scope)
+        }
+
+    @staticmethod
+    def _assign_question_ids(plan: QueryPlan) -> None:
+        """Normalize externally supplied plans into stable question groups."""
+        used = {step.question_id for step in plan.steps if step.question_id}
+        question_by_step: Dict[str, str] = {}
+        counter = 0
+
+        def next_question_id() -> str:
+            nonlocal counter
+            while True:
+                counter += 1
+                candidate = f"q{counter}"
+                if candidate not in used:
+                    used.add(candidate)
+                    return candidate
+
+        for step in plan.steps:
+            if step.question_id:
+                question_id = step.question_id
+            elif step.depends_on:
+                question_id = question_by_step.get(step.depends_on[0]) or next_question_id()
+            else:
+                question_id = next_question_id()
+            step.question_id = question_id
+            question_by_step[step.step_id] = question_id
+
+    @staticmethod
+    def _bindings_from_scope(raw_scope: str) -> List[SourceBinding]:
+        try:
+            scope = json.loads(raw_scope) if raw_scope else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        return [
+            SourceBinding(
+                candidate_id=f"{item.get('fileId') or item.get('fileName', '')}::{sheet}",
+                file_id=str(item.get("fileId", "")) or None,
+                file_name=str(item.get("fileName", "")),
+                sheet_name=str(sheet),
+                confidence=1.0,
+                reason="reused previous validated source",
+            )
+            for item in scope
+            if isinstance(item, dict)
+            for sheet in item.get("sheets", [])
+        ]
+
     async def _execute_plan_steps(
         self,
         ctx: AnalysisContext,
         plan: QueryPlan,
         source_df: Optional[pd.DataFrame],
+        source_dfs: Dict[str, pd.DataFrame],
         previous_result_df: Optional[pd.DataFrame],
         execution_plan: ExecutionPlan,
         trace: Trace,
@@ -501,29 +872,77 @@ class SheetMindAgent:
         Optional[pd.DataFrame],
         List[tuple[ExecutionStep, pd.DataFrame]],
         Dict[str, pd.DataFrame],
-        bool,
+        List[str],
     ]:
         """Execute an already validated plan; dependencies may only point backward."""
         outputs: Dict[str, pd.DataFrame] = {}
+        output_scopes: Dict[str, Dict[str, List[str]]] = {}
         computed: List[tuple[ExecutionStep, pd.DataFrame]] = []
+        failed_steps: List[str] = []
+        source_by_step: Dict[str, Optional[pd.DataFrame]] = {}
         required_columns: List[str] = []
+        previous_scope = (
+            dict(ctx.active_lineage.filters)
+            if ctx.active_lineage is not None
+            else {}
+        )
+        previous_result_scope = (
+            dict(ctx.active_lineage.result_filters)
+            if ctx.active_lineage is not None
+            else {}
+        )
 
         for index, step in enumerate(plan.steps, start=1):
             step_query = step.normalized_query or step.query
+            if step.depends_on and not step.source_bindings:
+                dependency_step = next(
+                    (item for item in plan.steps if item.step_id == step.depends_on[0]),
+                    None,
+                )
+                if dependency_step is not None:
+                    step.source_bindings = list(dependency_step.source_bindings)
+            if step.depends_on and any(dependency in failed_steps for dependency in step.depends_on):
+                failed_steps.append(step.step_id)
+                step.execution_report = ExecutionReport(
+                    status="skipped",
+                    engine=step.route.value,
+                    source_bindings=step.source_bindings,
+                    error_code="dependency_failed",
+                    error_message="A prerequisite analysis step failed.",
+                )
+                continue
+            step_source_df = (source_dfs or {}).get(step.step_id)
+            if step.depends_on:
+                step_source_df = source_by_step.get(step.depends_on[0], step_source_df)
+            if step_source_df is None:
+                step_source_df = source_df
             input_df = self._step_input_dataframe(
                 step,
                 outputs=outputs,
-                source_df=source_df,
+                source_df=step_source_df,
                 previous_result_df=previous_result_df,
+                previous_scope_filters=previous_scope,
+                previous_result_filters=previous_result_scope,
+                output_scopes=output_scopes,
             )
             if input_df is None:
                 if step.needs_new_computation:
                     logger.warning("[Pipeline] no input dataframe for step=%s", step.step_id)
-                    return None, [], outputs, True
+                    failed_steps.append(step.step_id)
+                    if step.execution_report is None:
+                        step.execution_report = ExecutionReport(
+                            status="failed",
+                            engine=step.route.value,
+                            source_bindings=step.source_bindings,
+                            error_code="missing_input",
+                            error_message="No dataframe was available for this question.",
+                        )
+                    continue
                 continue
 
             if not step.needs_new_computation or step.route == RoutingHint.INSIGHT_ONLY:
                 outputs[step.step_id] = input_df
+                source_by_step[step.step_id] = step_source_df
                 continue
 
             if emitter:
@@ -535,6 +954,17 @@ class SheetMindAgent:
             if input_df.empty:
                 outputs[step.step_id] = input_df.copy()
                 computed.append((step, outputs[step.step_id]))
+                source_by_step[step.step_id] = step_source_df
+                step.execution_report = (step.execution_report or ExecutionReport()).model_copy(
+                    update={
+                        "status": "empty",
+                        "engine": step.route.value,
+                        "source_bindings": step.source_bindings,
+                        "source_rows": 0,
+                        "result_rows": 0,
+                        "operations": list(step.operation_intents),
+                    }
+                )
                 continue
 
             if emitter:
@@ -559,7 +989,17 @@ class SheetMindAgent:
             execution_plan.required_source_columns = list(required_columns)
 
             if any(record.status == "needs_clarification" for record in step.field_resolutions):
-                return None, [], outputs, True
+                failed_steps.append(step.step_id)
+                step.execution_report = ExecutionReport(
+                    status="failed",
+                    engine=step.route.value,
+                    source_bindings=step.source_bindings,
+                    source_rows=len(input_df),
+                    fields=step.required_source_columns,
+                    error_code="field_clarification_required",
+                    error_message="One or more fields require confirmation.",
+                )
+                continue
 
             normalized_types = self.type_normalizer.run(
                 ctx,
@@ -584,6 +1024,7 @@ class SheetMindAgent:
             )
 
             result: Optional[pd.DataFrame] = None
+            executed_operations = list(step.operation_intents)
             if step.route == RoutingHint.RULE_ENGINE:
                 try:
                     rule_result = self.rule_engine.run(
@@ -601,6 +1042,7 @@ class SheetMindAgent:
                     )
                     if validation.valid:
                         result = rule_result.result_df
+                        executed_operations = list(rule_result.matched_rules)
                     elif validation.fallback_to_codegen:
                         logger.warning(
                             "[Pipeline] rule result rejected for step=%s: %s",
@@ -639,15 +1081,108 @@ class SheetMindAgent:
                     wants_chart="chart" in step.output_intents,
                     is_compound=False,
                     required_columns=step.required_source_columns,
+                    semantics=step.semantics,
                     trace=trace,
                     emit_progress=emit_fn,
                 )
 
             if result is None:
-                return None, [], outputs, True
+                failed_steps.append(step.step_id)
+                step.execution_report = ExecutionReport(
+                    status="failed",
+                    engine=step.route.value,
+                    source_bindings=step.source_bindings,
+                    source_rows=len(input_df),
+                    fields=step.required_source_columns,
+                    operations=list(step.operation_intents),
+                    error_code="execution_failed",
+                    error_message="The selected executor could not produce a valid result.",
+                )
+                continue
+
+            contract = self.execution_contract_validator.validate(
+                step=step,
+                source_df=input_df,
+                result_df=result,
+            )
+            if not contract.valid:
+                failed_steps.append(step.step_id)
+                step.execution_report = ExecutionReport(
+                    status="failed",
+                    engine=step.route.value,
+                    source_bindings=step.source_bindings,
+                    source_rows=len(input_df),
+                    result_rows=len(result),
+                    fields=step.required_source_columns,
+                    operations=executed_operations,
+                    error_code="semantic_contract_failed",
+                    error_message="; ".join(contract.reasons),
+                )
+                continue
 
             outputs[step.step_id] = result
+            source_by_step[step.step_id] = step_source_df
+            inherited_scope: Dict[str, List[str]] = {}
+            if step.scope_from == "previous_result":
+                inherited_scope = self._merge_scope_filters(
+                    previous_scope,
+                    previous_result_scope,
+                )
+            elif step.scope_from == "previous_filters":
+                inherited_scope = previous_scope
+            elif step.depends_on:
+                inherited_scope = output_scopes.get(step.depends_on[0], {})
+            scope_filters = self._merge_scope_filters(
+                inherited_scope,
+                self._extract_mentioned_scope_filters(step_query, input_df),
+            )
+            result_filters = self._scope_filters_from_result(result)
+            output_scopes[step.step_id] = self._merge_scope_filters(
+                scope_filters,
+                result_filters,
+            )
+            ctx.active_lineage = ResultLineage(
+                source_scope=(
+                    AnalysisContext.scope_key([
+                        {
+                            **({"fileId": binding.file_id} if binding.file_id else {}),
+                            "fileName": binding.file_name,
+                            "sheets": [binding.sheet_name],
+                        }
+                        for binding in step.source_bindings
+                    ])
+                    if step.source_bindings
+                    else ctx.active_source_scope or ctx.requested_scope_key()
+                ),
+                filters=scope_filters,
+                result_filters=result_filters,
+                result_columns=[str(column) for column in result.columns],
+            )
             computed.append((step, result))
+            step.execution_report = (step.execution_report or ExecutionReport()).model_copy(
+                update={
+                    "status": "empty" if result.empty else "success",
+                    "engine": step.route.value,
+                    "source_bindings": step.source_bindings,
+                    "source_rows": len(input_df),
+                    "result_rows": len(result),
+                    "fields": list(step.required_source_columns),
+                    "operations": executed_operations,
+                }
+            )
+            if step.source_bindings:
+                selected_scope = [
+                    {
+                        **({"fileId": binding.file_id} if binding.file_id else {}),
+                        "fileName": binding.file_name,
+                        "sheets": [binding.sheet_name],
+                    }
+                    for binding in step.source_bindings
+                ]
+                ctx.active_source_scope = AnalysisContext.scope_key(selected_scope)
+                ctx.selected_sheets = [binding.sheet_name for binding in step.source_bindings]
+                ctx._source_df = step_source_df
+                ctx.source_scope_changed = False
             self._remember_result_dataframe(ctx, input_df=input_df, result_df=result)
 
         execution_plan.required_source_columns = required_columns
@@ -659,7 +1194,7 @@ class SheetMindAgent:
         }
         visible = [item for item in computed if item[0].step_id not in consumed_by_computation]
         final_result = computed[-1][1] if computed else None
-        return final_result, visible, outputs, False
+        return final_result, visible, outputs, failed_steps
 
     @staticmethod
     def _step_input_dataframe(
@@ -667,14 +1202,236 @@ class SheetMindAgent:
         outputs: Dict[str, pd.DataFrame],
         source_df: Optional[pd.DataFrame],
         previous_result_df: Optional[pd.DataFrame],
+        previous_scope_filters: Optional[Dict[str, List[str]]] = None,
+        previous_result_filters: Optional[Dict[str, List[str]]] = None,
+        output_scopes: Optional[Dict[str, Dict[str, List[str]]]] = None,
     ) -> Optional[pd.DataFrame]:
         if len(step.depends_on) > 1:
             return None
         if step.depends_on:
-            return outputs.get(step.depends_on[0])
+            dependency_df = outputs.get(step.depends_on[0])
+            if (
+                dependency_df is not None
+                and step.needs_new_computation
+                and source_df is not None
+                and SheetMindAgent._requires_detail_rows(step, source_df, dependency_df)
+            ):
+                dependency_scope = (output_scopes or {}).get(step.depends_on[0], {})
+                if dependency_scope:
+                    return SheetMindAgent._apply_scope_filters(
+                        source_df,
+                        dependency_scope,
+                    )
+                return SheetMindAgent._apply_previous_result_scope(
+                    source_df,
+                    dependency_df,
+                )
+            return dependency_df
+        if step.input_source == "active_dataframe":
+            if step.scope_from in {"previous_result", "previous_filters"}:
+                persisted_scope = dict(previous_scope_filters or {})
+                if step.scope_from == "previous_result":
+                    persisted_scope = SheetMindAgent._merge_scope_filters(
+                        persisted_scope,
+                        previous_result_filters or {},
+                    )
+                if persisted_scope:
+                    return SheetMindAgent._apply_scope_filters(
+                        source_df,
+                        persisted_scope,
+                    ) if source_df is not None else previous_result_df
+                if previous_result_df is None:
+                    return source_df
+                return SheetMindAgent._apply_previous_result_scope(
+                    source_df,
+                    previous_result_df,
+                ) if source_df is not None else previous_result_df
+            return source_df
         if step.input_source == "previous_result" and previous_result_df is not None:
+            if (
+                step.needs_new_computation
+                and source_df is not None
+                and SheetMindAgent._requires_detail_rows(
+                    step,
+                    source_df,
+                    previous_result_df,
+                )
+            ):
+                persisted_scope = SheetMindAgent._merge_scope_filters(
+                    previous_scope_filters or {},
+                    previous_result_filters or {},
+                )
+                if persisted_scope:
+                    return SheetMindAgent._apply_scope_filters(
+                        source_df,
+                        persisted_scope,
+                    )
+                return SheetMindAgent._apply_previous_result_scope(
+                    source_df,
+                    previous_result_df,
+                )
             return previous_result_df
         return source_df
+
+    @staticmethod
+    def _apply_previous_result_scope(
+        source_df: pd.DataFrame,
+        previous_result_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Use categorical values from the previous result as filters on source_df."""
+        if source_df.empty or previous_result_df.empty:
+            return source_df
+
+        scoped = source_df
+        source_lookup: Dict[str, List[str]] = {}
+        for column in source_df.columns:
+            source_lookup.setdefault(
+                SheetMindAgent._scope_column_key(str(column)), []
+            ).append(str(column))
+        for prev_column in previous_result_df.columns:
+            values = previous_result_df[prev_column].dropna().astype(str).unique().tolist()
+            if not values or len(values) > 50:
+                continue
+            if pd.api.types.is_numeric_dtype(previous_result_df[prev_column]):
+                continue
+
+            key = SheetMindAgent._scope_column_key(str(prev_column))
+            source_column = str(prev_column) if str(prev_column) in source_df.columns else None
+            if source_column is None:
+                exact_candidates = source_lookup.get(key, [])
+                if len(exact_candidates) == 1:
+                    source_column = exact_candidates[0]
+            if source_column is None:
+                fuzzy_candidates = [
+                    candidate
+                    for source_key, candidates in source_lookup.items()
+                    if key and (key in source_key or source_key in key)
+                    for candidate in candidates
+                ]
+                if len(fuzzy_candidates) == 1:
+                    source_column = fuzzy_candidates[0]
+            if source_column is None:
+                continue
+
+            mask = scoped[source_column].astype(str).isin(values)
+            scoped = scoped[mask]
+
+        return scoped
+
+    @staticmethod
+    def _apply_scope_filters(
+        source_df: pd.DataFrame,
+        filters: Dict[str, List[str]],
+    ) -> pd.DataFrame:
+        """Apply persisted lineage predicates using exact, unambiguous columns."""
+        scoped = source_df
+        normalized_columns: Dict[str, List[str]] = {}
+        for column in source_df.columns:
+            normalized_columns.setdefault(
+                normalise_field_text(str(column)), []
+            ).append(str(column))
+
+        for requested_column, values in filters.items():
+            source_column = requested_column if requested_column in source_df.columns else None
+            if source_column is None:
+                candidates = normalized_columns.get(
+                    normalise_field_text(requested_column), []
+                )
+                if len(candidates) == 1:
+                    source_column = candidates[0]
+            if source_column is None or not values:
+                continue
+            allowed = {str(value) for value in values}
+            scoped = scoped[scoped[source_column].astype(str).isin(allowed)]
+        return scoped
+
+    @staticmethod
+    def _extract_mentioned_scope_filters(
+        query: str,
+        df: pd.DataFrame,
+    ) -> Dict[str, List[str]]:
+        filters: Dict[str, List[str]] = {}
+        for column in df.columns:
+            if pd.api.types.is_numeric_dtype(df[column]):
+                continue
+            matches = [
+                value
+                for value in df[column].dropna().astype(str).drop_duplicates().head(1000)
+                if len(value.strip()) >= 2 and value.strip() in query
+            ]
+            if matches:
+                filters[str(column)] = matches
+        return filters
+
+    @staticmethod
+    def _scope_filters_from_result(df: pd.DataFrame) -> Dict[str, List[str]]:
+        if df.empty or len(df) > 50:
+            return {}
+        return {
+            str(column): df[column].dropna().astype(str).drop_duplicates().tolist()
+            for column in df.columns
+            if not pd.api.types.is_numeric_dtype(df[column])
+            and not df[column].dropna().empty
+        }
+
+    @staticmethod
+    def _merge_scope_filters(
+        *groups: Dict[str, List[str]],
+    ) -> Dict[str, List[str]]:
+        merged: Dict[str, List[str]] = {}
+        for group in groups:
+            for column, values in group.items():
+                merged[str(column)] = list(dict.fromkeys(str(value) for value in values))
+        return merged
+
+    @staticmethod
+    def _scope_column_key(column: str) -> str:
+        return normalise_field_text(str(column))
+
+    @staticmethod
+    def _requires_detail_rows(
+        step: ExecutionStep,
+        source_df: pd.DataFrame,
+        candidate_df: pd.DataFrame,
+    ) -> bool:
+        """Whether a computation needs source rows absent from an aggregate."""
+        query_text = normalise_field_text(step.query)
+        source_columns = [str(column) for column in source_df.columns]
+        candidate_columns = [str(column) for column in candidate_df.columns]
+
+        explicitly_requested = [
+            column
+            for column in source_columns
+            if len(normalise_field_text(column)) >= 2
+            and normalise_field_text(column) in query_text
+        ]
+        if any(column not in candidate_columns for column in explicitly_requested):
+            return True
+
+        return (
+            SheetMindAgent._targets_present(source_df, step.target_fields)
+            and not SheetMindAgent._targets_present(candidate_df, step.target_fields)
+        )
+
+    @staticmethod
+    def _targets_present(df: pd.DataFrame, target_fields: List[str]) -> bool:
+        """Return True when all requested semantic targets appear in df columns."""
+        targets = [
+            normalise_field_text(field)
+            for field in target_fields
+            if normalise_field_text(field)
+        ]
+        if not targets:
+            return True
+        columns = [
+            normalise_field_text(str(column))
+            for column in df.columns
+            if normalise_field_text(str(column))
+        ]
+        return all(
+            any(target == column or target in column or column in target for column in columns)
+            for target in targets
+        )
 
     @staticmethod
     def _build_execution_plan(
@@ -712,7 +1469,7 @@ class SheetMindAgent:
 
         return ExecutionPlan(
             route=primary_route,
-            mode=routing.mode,
+            mode=plan.mode or routing.mode,
             original_query=(
                 routing.normalized_query.original_text
                 if routing.normalized_query is not None
@@ -731,8 +1488,11 @@ class SheetMindAgent:
             ),
             needs_new_computation=any(step.needs_new_computation for step in plan.steps),
             uses_previous_result=(
-                routing.mode == MultiTurnMode.FOLLOW_UP
-                or any(step.input_source == "previous_result" for step in plan.steps)
+                (plan.mode or routing.mode) == MultiTurnMode.FOLLOW_UP
+                or any(
+                    step.input_source in {"active_dataframe", "previous_result"}
+                    for step in plan.steps
+                )
             ),
             target_fields=target_fields,
             confidence=plan.confidence,
@@ -844,14 +1604,24 @@ class SheetMindAgent:
             for scope in ctx.requested_sheet_scope
             for sheet in scope.get("sheets", [])
         ] or list(ctx.selected_sheets)
-        if decision.status == "scope_conflict":
+        if decision.reason == "no sheets are checked for analysis":
+            message = (
+                "当前没有勾选任何数据工作表。"
+                "请先在 Import Your Data 中勾选至少一个 Sheet，再重新提交问题。"
+            )
+        elif decision.status == "scope_conflict":
             candidate = decision.candidates[0]
             message = (
-                f"当前选择的工作表与问题不一致；“{candidate.sheet_name}”中的字段更匹配。"
-                "请选择是否切换后继续。"
+                "当前勾选范围内没有合适的数据源。"
+                f"“{candidate.file_name} / {candidate.sheet_name}”更匹配这个问题。"
+                "请先在 Import Your Data 中勾选该 Sheet，再重新提交问题；系统不会读取未勾选的数据。"
             )
         else:
-            message = "多个工作表都可能包含所需数据，请选择后继续。"
+            message = (
+                "多个已勾选的数据源都能回答这个问题。"
+                "请在 Import Your Data 中只保留要使用的文件与 Sheet，"
+                "或在问题中明确写出文件名和 Sheet 名后重新提交。"
+            )
         return SheetResolutionBlock(
             status=decision.status,
             message=message,
@@ -859,6 +1629,7 @@ class SheetMindAgent:
             candidates=[
                 SheetCandidate(
                     candidate_id=candidate.candidate_id,
+                    file_id=candidate.file_id or None,
                     file_name=candidate.file_name,
                     sheet_name=candidate.sheet_name,
                     columns=candidate.columns[:12],
@@ -885,18 +1656,140 @@ class SheetMindAgent:
         return any(ref in q_lower for ref in refs)
 
     @staticmethod
+    def _can_reuse_previous_result_for_chart(
+        *,
+        ctx: AnalysisContext,
+        query: str,
+        plan: QueryPlan,
+        previous_result_df: Optional[pd.DataFrame],
+        wants_chart: bool,
+        explicit_source_switch: bool,
+    ) -> bool:
+        """Recognize chart-only follow-ups even when planning labels them new."""
+        if (
+            not wants_chart
+            or explicit_source_switch
+            or ctx.source_scope_changed
+            or plan.mode == MultiTurnMode.RESET
+            or previous_result_df is None
+            or previous_result_df.empty
+            or len(plan.steps) != 1
+        ):
+            return False
+
+        step = plan.steps[0]
+        operations = set(step.operation_intents)
+        if not operations.issubset({"chart_data_prep", "trend", "general"}):
+            return False
+
+        output_intents = set(step.output_intents)
+        if output_intents and not output_intents.issubset({"chart", "insight", "auto"}):
+            return False
+
+        columns = [str(column) for column in previous_result_df.columns]
+        if len(columns) < 2 or not any(
+            pd.api.types.is_numeric_dtype(previous_result_df[column])
+            for column in previous_result_df.columns
+        ):
+            return False
+
+        normalized_columns = [normalise_field_text(column) for column in columns]
+        numeric_columns = [
+            str(column)
+            for column in previous_result_df.columns
+            if pd.api.types.is_numeric_dtype(previous_result_df[column])
+        ]
+        lineage_filters = (
+            ctx.active_lineage.filters
+            if ctx.active_lineage is not None
+            else {}
+        )
+        normalized_query = normalise_field_text(query)
+
+        scope_aliases = {
+            "平台": ("平台", "渠道"),
+            "店铺": ("店铺", "门店"),
+            "仓库": ("仓库",),
+            "物流商": ("物流商", "承运商"),
+            "费用类型": ("费用类型", "尾程", "仓储"),
+        }
+        for column, values in lineage_filters.items():
+            normalized_column = normalise_field_text(column)
+            aliases = scope_aliases.get(
+                normalized_column,
+                (normalized_column,),
+            )
+            if not any(
+                normalise_field_text(alias) in normalized_query
+                for alias in aliases
+                if normalise_field_text(alias)
+            ):
+                continue
+            if not any(
+                normalise_field_text(value) in normalized_query
+                for value in values
+                if normalise_field_text(value)
+            ):
+                return False
+
+        def covered_by_result(target: str) -> bool:
+            normalized_target = normalise_field_text(target)
+            if not normalized_target:
+                return True
+            if any(
+                normalized_target == column
+                or normalized_target in column
+                or column in normalized_target
+                for column in normalized_columns
+            ):
+                return True
+
+            metric_terms = ("费用", "花费", "金额", "cost", "fee")
+            return (
+                len(numeric_columns) == 1
+                and any(term in normalized_target for term in metric_terms)
+            )
+
+        def covered_by_active_scope(target: str) -> bool:
+            normalized_target = normalise_field_text(target)
+            for column, values in lineage_filters.items():
+                normalized_column = normalise_field_text(column)
+                if not (
+                    normalized_target == normalized_column
+                    or normalized_target in normalized_column
+                    or normalized_column in normalized_target
+                ):
+                    continue
+                return any(
+                    normalise_field_text(value) in normalized_query
+                    for value in values
+                    if normalise_field_text(value)
+                )
+            return False
+
+        return all(
+            covered_by_result(target) or covered_by_active_scope(target)
+            for target in step.target_fields
+        )
+
+    @staticmethod
     def _previous_result_dataframe(ctx: AnalysisContext) -> Optional[pd.DataFrame]:
         """Rebuild the previous tabular result as a DataFrame when available."""
         if isinstance(ctx._result_df, pd.DataFrame) and not ctx._result_df.empty:
             return ctx._result_df
 
-        result = ctx.active_result or ctx.last_assistant_result()
+        result = ctx.last_tabular_result()
         if result is None:
             return None
 
-        table = result.first_table()
+        table = result.focused_table()
         if table is None or not table.rows or not table.columns:
             return None
+
+        if table.artifact_id:
+            artifact_df = get_artifact_store().load(table.artifact_id, ctx.task_id)
+            if artifact_df is not None:
+                return artifact_df
 
         try:
             return pd.DataFrame(table.rows, columns=table.columns)
@@ -945,8 +1838,17 @@ class SheetMindAgent:
             status="needs_clarification",
         )
         if clarification_blocks:
+            question = QuestionResult(
+                question_id=step.question_id if step else "q1",
+                query=query,
+                status="needs_input",
+                blocks=clarification_blocks,
+            )
             result = ResultBlocks(
+                status="needs_input",
+                focus_question_id=question.question_id,
                 output_intents=["chart"],
+                questions=[question],
                 blocks=clarification_blocks,
             )
             return validate_result(result), hint, mode
@@ -959,13 +1861,57 @@ class SheetMindAgent:
             required_columns=required_columns,
         )
         if chart_block is None:
-            result = ResultBlocks(output_intents=["chart"], blocks=[
-                SummaryBlock(content="上一次结果无法直接生成图表，请换一种图表描述。")
-            ])
+            status_block = StatusBlock(
+                status="failed",
+                message="上一次结果缺少可绘制的维度或数值字段。",
+                error_code="chart_not_supported",
+            )
+            question = QuestionResult(
+                question_id=step.question_id if step else "q1",
+                query=query,
+                status="failed",
+                blocks=[status_block],
+            )
+            result = ResultBlocks(
+                status="failed",
+                focus_question_id=question.question_id,
+                output_intents=["chart"],
+                questions=[question],
+                blocks=[status_block],
+            )
             return result, hint, mode
 
         if emitter:
             await emitter.emit_progress("正在生成分析洞察...", step_id="insight_writing")
+
+        question_id = step.question_id if step else "q1"
+        artifact_id = self.artifact_store.save(
+            ctx.task_id,
+            question_id,
+            previous_result_df,
+        )
+        table_block = self._build_table_block(
+            previous_result_df,
+            artifact_id=artifact_id,
+        )
+        if table_block is not None:
+            table_block.title = query
+            basis_step = step or ExecutionStep(
+                step_id="previous_result_chart",
+                query=query,
+                route=hint,
+                input_source="previous_result",
+                operation_intents=["chart_data_prep"],
+                output_intents=["chart"],
+                needs_new_computation=False,
+                required_source_columns=required_columns,
+            )
+            table_block.calculation_basis = self._build_calculation_basis(
+                ctx,
+                basis_step,
+                previous_result_df,
+                from_previous_result=True,
+            )
 
         summary_text = await self.insight_skill.run(
             ctx,
@@ -973,7 +1919,7 @@ class SheetMindAgent:
             scenario="chart",
             result_df=previous_result_df,
             chart_block=chart_block,
-            table_block=None,
+            table_block=table_block,
         )
 
         blocks: List[Any] = self._field_resolution_blocks(
@@ -982,9 +1928,35 @@ class SheetMindAgent:
         )
         if summary_text:
             blocks.append(SummaryBlock(content=summary_text))
+        if table_block is not None:
+            blocks.append(table_block)
         blocks.append(chart_block)
 
-        result = ResultBlocks(output_intents=["chart"], blocks=blocks)
+        report = ExecutionReport(
+            status="success",
+            engine="insight",
+            source_bindings=step.source_bindings if step else [],
+            source_rows=len(previous_result_df),
+            result_rows=len(previous_result_df),
+            fields=required_columns,
+            operations=["chart_data_prep"],
+        )
+        if step is not None:
+            step.execution_report = report
+        question = QuestionResult(
+            question_id=question_id,
+            query=query,
+            status="success",
+            blocks=blocks,
+            execution_report=report,
+        )
+        result = ResultBlocks(
+            status="success",
+            focus_question_id=question_id,
+            output_intents=["chart"],
+            questions=[question],
+            blocks=blocks,
+        )
         return validate_result(result, degrade_invalid_charts=True), hint, mode
 
     @staticmethod
@@ -1012,7 +1984,10 @@ class SheetMindAgent:
             ctx._active_df = result_df
 
     @staticmethod
-    def _build_table_block(df: pd.DataFrame) -> Optional[TableBlock]:
+    def _build_table_block(
+        df: pd.DataFrame,
+        artifact_id: Optional[str] = None,
+    ) -> Optional[TableBlock]:
         """Convert a result DataFrame into a TableBlock."""
         if df is None or df.empty:
             return None
@@ -1057,7 +2032,95 @@ class SheetMindAgent:
             columns=columns,
             rows=rows,
             total_rows=len(df),
+            preview_row_count=len(display_df),
             columns_metadata=col_meta,
+            artifact_id=artifact_id,
+        )
+
+    @staticmethod
+    def _build_calculation_basis(
+        ctx: AnalysisContext,
+        step: ExecutionStep,
+        result_df: pd.DataFrame,
+        *,
+        from_previous_result: bool = False,
+    ) -> CalculationBasis:
+        """Describe reproducible inputs and operations without exposing model reasoning."""
+        source_sheets: List[str] = []
+        raw_scope: List[Dict[str, Any]] = [
+            {
+                **({"fileId": binding.file_id} if binding.file_id else {}),
+                "fileName": binding.file_name,
+                "sheets": [binding.sheet_name],
+            }
+            for binding in step.source_bindings
+        ]
+        if not raw_scope and ctx.active_source_scope:
+            try:
+                parsed_scope = json.loads(ctx.active_source_scope)
+                if isinstance(parsed_scope, list):
+                    raw_scope = parsed_scope
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw_scope = []
+        if not raw_scope:
+            raw_scope = ctx.requested_sheet_scope
+
+        for item in raw_scope:
+            file_name = str(item.get("fileName", "")).strip()
+            for sheet in item.get("sheets", []):
+                sheet_name = str(sheet).strip()
+                label = f"{file_name} / {sheet_name}" if file_name else sheet_name
+                if label and label not in source_sheets:
+                    source_sheets.append(label)
+        if not source_sheets:
+            source_sheets = list(dict.fromkeys(str(item) for item in ctx.selected_sheets))
+
+        report = step.execution_report
+        fields: List[str] = []
+        for column in [
+            *(report.fields if report else []),
+            *step.required_source_columns,
+            *map(str, result_df.columns),
+        ]:
+            if column and column not in fields:
+                fields.append(column)
+        fields = fields[:12]
+
+        operation_labels = {
+            "filter": "筛选",
+            "keyword_filter": "筛选",
+            "date_filter": "日期筛选",
+            "aggregate": "分组汇总",
+            "aggregation": "分组汇总",
+            "groupby": "分组汇总",
+            "which": "分组比较",
+            "extreme": "极值比较",
+            "sort": "排序",
+            "top_n": "Top N 筛选",
+            "trend": "趋势计算",
+            "pivot": "透视汇总",
+            "compare": "对比",
+            "chart_data_prep": "生成图表",
+            "complex_transform": "数据处理",
+        }
+        operations: List[str] = []
+        executed_operations = report.operations if report and report.operations else step.operation_intents
+        for intent in executed_operations:
+            label = operation_labels.get(intent, intent.replace("_", " "))
+            if label and label not in operations:
+                operations.append(label)
+        if from_previous_result:
+            operations.insert(0, "复用上一轮结果")
+        operations = list(dict.fromkeys(operations)) or ["数据处理"]
+
+        source_text = "、".join(f"「{item}」" for item in source_sheets) or "当前所选工作表"
+        field_text = "、".join(f"「{item}」" for item in fields) or "结果字段"
+        operation_text = "、".join(operations)
+        return CalculationBasis(
+            source_sheets=source_sheets,
+            fields=fields,
+            operations=operations,
+            summary=f"基于 {source_text}，使用 {field_text}，执行{operation_text}。",
         )
 
     @staticmethod

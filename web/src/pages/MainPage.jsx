@@ -1,6 +1,5 @@
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import Header from "../components/Header";
-import Footer from "../components/Footer";
 import FileUploader from "../components/UploadSection/FileUploader";
 import AIDataAnalysis from "../components/AIDataAnalysis";
 import Toast from "../components/Toast";
@@ -16,6 +15,7 @@ import { useFileManagement } from "../hooks/useFileManagement";
 export default function MainPage() {
   const [toast, setToast] = useState(null);
   const [errorModal, setErrorModal] = useState(null);
+  const [isNavigationOpen, setIsNavigationOpen] = useState(false);
   const suppressTaskReloadRef = useRef(false);
 
   const projectManagement = useProjectManagement();
@@ -57,7 +57,7 @@ export default function MainPage() {
     setToast({ id: Date.now(), message, title, type, autoClose });
   }, []);
 
-  const showErrorModal = useCallback(({ message, title = "错误" }) => {
+  const showErrorModal = useCallback(({ message, title = "Error" }) => {
     setErrorModal({ id: Date.now(), message, title });
   }, []);
 
@@ -153,7 +153,7 @@ export default function MainPage() {
             ...prev,
             {
               id: projectId,
-              name: projectName || `项目_${new Date().toISOString().split("T")[0]}`,
+              name: projectName || `Project_${new Date().toISOString().split("T")[0]}`,
               createdAt: Date.now(),
             },
           ];
@@ -173,10 +173,10 @@ export default function MainPage() {
   );
 
   return (
-    <div className="flex flex-col min-h-screen bg-gray-50">
-      <Header />
+    <div className="flex h-screen flex-col overflow-hidden bg-slate-50">
+      <Header onOpenNavigation={() => setIsNavigationOpen(true)} />
 
-      <div className="flex flex-1 pt-[60px] pb-[80px]">
+      <div className="flex min-h-0 flex-1 pt-[60px]">
         <Sidebar
           projects={projectManagement.projects}
           activeProjectId={projectManagement.activeProjectId}
@@ -194,11 +194,13 @@ export default function MainPage() {
           onDeleteTask={(taskId) => {
             window.dispatchEvent(new CustomEvent("deleteTask", { detail: { taskId } }));
           }}
+          isOpen={isNavigationOpen}
+          onClose={() => setIsNavigationOpen(false)}
         />
 
         <main
           key={projectManagement.activeProjectId || "no-project"}
-          className="flex-1 ml-72 leading-normal overflow-y-auto animate-project-switch"
+          className="min-w-0 flex-1 overflow-y-auto leading-normal animate-project-switch lg:ml-72"
         >
           <Toast
             key={toast?.id}
@@ -215,20 +217,20 @@ export default function MainPage() {
             onClose={handleCloseErrorModal}
           />
 
-          <section className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
-            <div className="flex flex-col items-center text-center mb-8">
-              <h1 className="text-3xl sm:text-[32px] font-bold text-gray-900 tracking-tight mb-2">
-                SheetMind
+          <section className="mx-auto w-full max-w-7xl px-4 pb-40 pt-5 sm:px-6 sm:pt-6 lg:px-8">
+            <div className="mb-5 border-b border-slate-200 pb-5">
+              <p className="text-xs font-semibold uppercase tracking-wide text-blue-600">
+                AI spreadsheet analyst for Excel data
+              </p>
+              <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
+                Understand, clean, and reason about your workbook.
               </h1>
-              <p className="text-[16px] text-gray-700 mb-6 max-w-2xl">
-                Upload Excel files now to start analyzing data with{" "}
-                <span className="text-blue-600 font-medium">natural language</span> — get{" "}
-                <span className="text-blue-600 font-medium">charts, summaries, and answers</span>{" "}
-                instantly.
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
+                Upload an Excel file, ask questions, detect data issues, and preview cleaning logic before exporting a clean table.
               </p>
             </div>
 
-            <div className="mb-8">
+            <div className="mb-5">
               <FileUploader
                 uploadedFiles={uploadedFiles}
                 onFilesChange={handleFilesChange}
@@ -244,6 +246,7 @@ export default function MainPage() {
 
             <AIDataAnalysis
               uploadedFile={analysisTargetFile}
+              uploadedFiles={uploadedFiles}
               activeProjectId={projectManagement.activeProjectId}
               uploadedFilesCount={uploadedFilesCount}
               selectedSheetsTotal={selectedSheetsTotal}
@@ -255,8 +258,6 @@ export default function MainPage() {
           </section>
         </main>
       </div>
-
-      <Footer />
     </div>
   );
 }

@@ -66,11 +66,34 @@ _SORT_TRIGGER_KWS = ["排序", "sort", "order", "排", "按"]
 # Filter trigger keywords
 _FILTER_TRIGGER_KWS = ["筛选", "过滤", "filter", "where", "只看", "只要"]
 
-_EXTREME_MAX_KWS = ["最多", "最高", "最大", "最贵", "花费最多", "费用最高", "金额最高"]
-_EXTREME_SUBJECT_KWS = ["哪个", "哪家", "哪一个", "哪类", "哪种", "who", "which"]
+_EXTREME_MAX_KWS = [
+    "最多", "最高", "最大", "最贵", "花费最多", "费用最高", "金额最高",
+    "费用高", "花费高", "成本高", "金额高", "占比高", "占比最高", "物流费用高",
+]
+_EXTREME_MIN_KWS = ["最低", "最少", "最小", "最便宜", "费用低", "花费低", "成本低", "金额低"]
+_EXTREME_SUBJECT_KWS = ["哪个", "哪些", "哪家", "哪一个", "哪类", "哪种", "who", "which"]
+_SHARE_KWS = ["占比", "比例", "份额", "percent", "percentage", "ratio", "share"]
+_AVERAGE_KWS = ["平均", "均值", "avg", "average", "mean"]
+_SINGULAR_SUBJECT_KWS = ["哪个", "哪家", "哪一个", "哪类", "哪种", "who", "which"]
 
-_MONEY_QUERY_KWS = ["尾程花费", "花费", "费用", "金额", "成本", "cost", "spend", "expense", "amount"]
+_MONEY_QUERY_KWS = [
+    "尾程花费", "仓储费", "物流费", "尾程费", "运费", "花费", "花钱", "花的",
+    "费用", "金额", "成本", "cost", "spend", "expense", "amount",
+]
 _MONEY_COL_KWS = ["费用金额", "人民币金额", "金额", "花费", "费用", "成本", "销售额", "收入", "amount", "cost", "expense"]
+
+_CURRENCY_COLUMN_NAMES = {
+    "币别", "币种", "货币", "货币类型", "currency", "currencycode",
+}
+_CURRENCY_ALIASES = {
+    "CNY": ("人民币", "cny", "rmb"),
+    "USD": ("美元", "usd", "美金"),
+    "EUR": ("欧元", "eur"),
+    "JPY": ("日元", "jpy", "日币"),
+    "GBP": ("英镑", "gbp"),
+    "HKD": ("港币", "港元", "hkd"),
+}
+_NORMALIZED_MONEY_PRIORITY = ("CNY", "USD", "EUR", "JPY", "GBP", "HKD")
 
 
 class RuleEngineTool(Tool):
@@ -114,6 +137,7 @@ class RuleEngineTool(Tool):
             result,
             field_map,
             required_columns,
+            selected_sheets=ctx.selected_sheets,
         )
         if aggregate_result is not None:
             return self._result(aggregate_result.reset_index(drop=True), ["aggregate_extreme"], return_report)
@@ -190,11 +214,12 @@ class RuleEngineTool(Tool):
         df: pd.DataFrame,
         field_map: Optional[SemanticFieldMap] = None,
         required_columns: Optional[List[str]] = None,
+        selected_sheets: Optional[List[str]] = None,
     ) -> Optional[pd.DataFrame]:
         q_lower = query.lower()
         if not (
             any(kw in q_lower for kw in _EXTREME_SUBJECT_KWS)
-            and any(kw in q_lower for kw in _EXTREME_MAX_KWS)
+            and any(kw in q_lower for kw in [*_EXTREME_MAX_KWS, *_EXTREME_MIN_KWS])
         ):
             return None
 
@@ -213,20 +238,157 @@ class RuleEngineTool(Tool):
         if group_col is None or value_col is None:
             return None
 
-        work = df[[group_col, value_col]].copy()
+        filtered = self._apply_context_value_filters(
+            query,
+            df,
+            excluded_columns={group_col, value_col},
+            field_map=field_map,
+            selected_sheets=selected_sheets,
+        )
+
+        currency_col = self._find_currency_column(filtered)
+        explicit_currency = self._query_currency_code(query)
+        if currency_col is not None and explicit_currency is not None:
+            currency_codes = filtered[currency_col].map(self._currency_code)
+            matching_currency = currency_codes == explicit_currency
+            if matching_currency.any():
+                filtered = filtered[matching_currency]
+
+        if (
+            currency_col is not None
+            and self._is_money_query(query, value_col)
+            and explicit_currency is None
+        ):
+            populated_currencies = (
+                filtered[currency_col]
+                .dropna()
+                .astype(str)
+                .str.strip()
+            )
+            populated_currencies = populated_currencies[populated_currencies != ""]
+            if populated_currencies.nunique() > 1:
+                normalized_value_col = self._find_complete_normalized_money_column(
+                    filtered,
+                    raw_value_col=value_col,
+                    group_col=group_col,
+                    field_map=field_map,
+                )
+                if normalized_value_col is not None:
+                    value_col = normalized_value_col
+                else:
+                    return self._aggregate_extreme_by_currency(
+                        query,
+                        filtered,
+                        currency_col=currency_col,
+                        group_col=group_col,
+                        value_col=value_col,
+                    )
+
+        work = filtered[[group_col, value_col]].copy()
         work = work[work[group_col].notna()]
         work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
         work = work.dropna(subset=[value_col])
         if work.empty:
             return None
 
+        aggregation = "mean" if any(kw in q_lower for kw in _AVERAGE_KWS) else "sum"
+        ascending = any(kw in q_lower for kw in _EXTREME_MIN_KWS)
         grouped = (
             work.groupby(group_col, dropna=True)[value_col]
-            .sum()
-            .sort_values(ascending=False)
+            .agg(aggregation)
+            .sort_values(ascending=ascending)
             .reset_index()
         )
+        if any(kw in q_lower for kw in _SHARE_KWS):
+            total = grouped[value_col].sum()
+            if total:
+                grouped[f"{value_col}占比"] = grouped[value_col] / total
+
+        top_n_match = re.search(r"(?:前|top\s*)(\d+)", q_lower, re.IGNORECASE)
+        if top_n_match:
+            return grouped.head(max(1, int(top_n_match.group(1))))
+        if "哪些" in q_lower:
+            superlative = any(kw in q_lower for kw in ["最高", "最多", "最大", "最贵", "最低", "最少", "最小"])
+            if superlative and not grouped.empty:
+                best = grouped.iloc[0][value_col]
+                return grouped[grouped[value_col] == best]
+            if not grouped.empty:
+                benchmark = grouped[value_col].mean()
+                return grouped[
+                    grouped[value_col] <= benchmark
+                    if ascending
+                    else grouped[value_col] >= benchmark
+                ]
+        if any(kw in q_lower for kw in _SINGULAR_SUBJECT_KWS):
+            return grouped.head(1)
         return grouped.head(20)
+
+    @classmethod
+    def _aggregate_extreme_by_currency(
+        cls,
+        query: str,
+        df: pd.DataFrame,
+        *,
+        currency_col: str,
+        group_col: str,
+        value_col: str,
+    ) -> Optional[pd.DataFrame]:
+        """Return comparable winners per currency instead of mixing raw amounts."""
+        q_lower = query.lower()
+        work = df[[currency_col, group_col, value_col]].copy()
+        work = work[work[group_col].notna()]
+        work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+        work = work.dropna(subset=[value_col])
+        if work.empty:
+            return None
+
+        currency_values = work[currency_col].astype("string").str.strip()
+        work[currency_col] = currency_values.mask(
+            currency_values.isna() | (currency_values == ""),
+            "未标注币种",
+        )
+        aggregation = "mean" if any(kw in q_lower for kw in _AVERAGE_KWS) else "sum"
+        ascending = any(kw in q_lower for kw in _EXTREME_MIN_KWS)
+        grouped = (
+            work.groupby([currency_col, group_col], dropna=False)[value_col]
+            .agg(aggregation)
+            .reset_index()
+            .sort_values(
+                [currency_col, value_col],
+                ascending=[True, ascending],
+                kind="stable",
+            )
+        )
+
+        if any(kw in q_lower for kw in _SHARE_KWS):
+            totals = grouped.groupby(currency_col)[value_col].transform("sum")
+            grouped[f"{value_col}占比"] = grouped[value_col] / totals.where(totals != 0)
+
+        top_n_match = re.search(r"(?:前|top\s*)(\d+)", q_lower, re.IGNORECASE)
+        if top_n_match:
+            limit = max(1, int(top_n_match.group(1)))
+            return grouped.groupby(currency_col, sort=False, group_keys=False).head(limit)
+
+        if "哪些" in q_lower:
+            superlative = any(
+                kw in q_lower
+                for kw in ["最高", "最多", "最大", "最贵", "最低", "最少", "最小"]
+            )
+            if superlative:
+                best = grouped.groupby(currency_col)[value_col].transform(
+                    "min" if ascending else "max"
+                )
+                return grouped[grouped[value_col] == best]
+            benchmark = grouped.groupby(currency_col)[value_col].transform("mean")
+            return grouped[
+                grouped[value_col] <= benchmark
+                if ascending
+                else grouped[value_col] >= benchmark
+            ]
+
+        if any(kw in q_lower for kw in _SINGULAR_SUBJECT_KWS):
+            return grouped.groupby(currency_col, sort=False, group_keys=False).head(1)
+        return grouped.groupby(currency_col, sort=False, group_keys=False).head(20)
 
     @staticmethod
     def _find_group_column(
@@ -235,23 +397,23 @@ class RuleEngineTool(Tool):
         field_map: Optional[SemanticFieldMap] = None,
         required_columns: Optional[List[str]] = None,
     ) -> Optional[str]:
-        for column in required_columns or []:
-            if column not in df.columns:
-                continue
-            info = field_map.get(column) if field_map else None
-            if info and info.type in {"categorical", "datetime", "datetime-like"}:
-                return column
-            if info is None and not pd.api.types.is_numeric_dtype(df[column]):
-                return column
-
         if field_map:
             match = FieldResolver().resolve(
                 query,
                 field_map,
-                allowed_types={"categorical", "datetime", "datetime-like"},
+                allowed_types={"categorical", "datetime", "datetime-like", "identifier"},
             )
             if match and match.column in df.columns:
                 return match.column
+
+        for column in required_columns or []:
+            if column not in df.columns:
+                continue
+            info = field_map.get(column) if field_map else None
+            if info and info.type in {"categorical", "datetime", "datetime-like", "identifier"}:
+                return column
+            if info is None and not pd.api.types.is_numeric_dtype(df[column]):
+                return column
         # Exact user-mentioned non-numeric column wins.
         for col in df.columns:
             col_clean = re.sub(r"[（(）)\[\]【】]", "", str(col))
@@ -268,6 +430,164 @@ class RuleEngineTool(Tool):
                         return col
 
         return None
+
+    @staticmethod
+    def _apply_context_value_filters(
+        query: str,
+        df: pd.DataFrame,
+        *,
+        excluded_columns: set[str],
+        field_map: Optional[SemanticFieldMap] = None,
+        selected_sheets: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """Filter by categorical values mentioned as context before aggregating."""
+        result = df
+        for col in df.columns:
+            if col in excluded_columns or pd.api.types.is_numeric_dtype(df[col]):
+                continue
+            info = field_map.get(col) if field_map else None
+            if info and info.type not in {"categorical", "identifier", "datetime-like"}:
+                continue
+
+            values = (
+                result[col]
+                .dropna()
+                .astype(str)
+                .drop_duplicates()
+                .sort_values(key=lambda series: series.str.len(), ascending=False)
+                .head(1000)
+            )
+            for value in values:
+                token = value.strip()
+                if len(token) < 2 or token not in query:
+                    continue
+                if (
+                    str(col) not in query
+                    and (
+                        re.search(
+                            rf"{re.escape(token)}(?:表格|表|sheet)",
+                            query,
+                            re.IGNORECASE,
+                        )
+                        or RuleEngineTool._matches_selected_sheet(token, selected_sheets)
+                    )
+                ):
+                    # A worksheet/domain name is context, not a row predicate.
+                    # An explicit column reference ("费用类型为仓储费") still filters.
+                    continue
+                mask = result[col].astype(str).str.contains(re.escape(token), case=False, na=False)
+                if mask.any() and mask.sum() < len(result):
+                    result = result[mask]
+                break
+        return result
+
+    @staticmethod
+    def _normalise_domain_name(value: str) -> str:
+        return re.sub(
+            r"(?:worksheet|sheet|工作表|表格|表)$|[\s_\-（()）【】\[\]]",
+            "",
+            str(value).lower(),
+        )
+
+    @classmethod
+    def _matches_selected_sheet(
+        cls,
+        value: str,
+        selected_sheets: Optional[List[str]],
+    ) -> bool:
+        value_name = cls._normalise_domain_name(value)
+        if len(value_name) < 2:
+            return False
+        for sheet in selected_sheets or []:
+            sheet_name = cls._normalise_domain_name(sheet)
+            if len(sheet_name) >= 2 and (
+                sheet_name in value_name or value_name in sheet_name
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _normalise_currency_text(value: Any) -> str:
+        return re.sub(r"[\s_\-（()）【】\[\].]", "", str(value).lower())
+
+    @classmethod
+    def _currency_code(cls, value: Any) -> Optional[str]:
+        normalized = cls._normalise_currency_text(value)
+        for code, aliases in _CURRENCY_ALIASES.items():
+            if normalized == code.lower() or any(
+                cls._normalise_currency_text(alias) in normalized
+                for alias in aliases
+            ):
+                return code
+        return None
+
+    @classmethod
+    def _query_currency_code(cls, query: str) -> Optional[str]:
+        normalized = cls._normalise_currency_text(query)
+        for code, aliases in _CURRENCY_ALIASES.items():
+            if code.lower() in normalized or any(
+                cls._normalise_currency_text(alias) in normalized
+                for alias in aliases
+            ):
+                return code
+        return None
+
+    @classmethod
+    def _find_currency_column(cls, df: pd.DataFrame) -> Optional[str]:
+        for column in df.columns:
+            normalized = cls._normalise_currency_text(column)
+            if normalized in _CURRENCY_COLUMN_NAMES:
+                return str(column)
+        return None
+
+    @staticmethod
+    def _is_money_query(query: str, value_col: str) -> bool:
+        q_lower = query.lower()
+        value_name = str(value_col).lower()
+        return (
+            any(keyword in q_lower for keyword in _MONEY_QUERY_KWS)
+            and any(keyword in value_name for keyword in _MONEY_COL_KWS)
+        )
+
+    @classmethod
+    def _find_complete_normalized_money_column(
+        cls,
+        df: pd.DataFrame,
+        *,
+        raw_value_col: str,
+        group_col: str,
+        field_map: Optional[SemanticFieldMap],
+    ) -> Optional[str]:
+        required_rows = df[group_col].notna() & pd.to_numeric(
+            df[raw_value_col], errors="coerce"
+        ).notna()
+        required_count = int(required_rows.sum())
+        if required_count == 0:
+            return None
+
+        candidates: List[Tuple[int, str]] = []
+        for column in df.columns:
+            column_name = str(column)
+            if column_name in {raw_value_col, group_col}:
+                continue
+            currency_code = cls._currency_code(column_name)
+            info = field_map.get(column_name) if field_map else None
+            if currency_code is None and info is not None:
+                for code in _NORMALIZED_MONEY_PRIORITY:
+                    if code.lower() in info.qualifiers:
+                        currency_code = code
+                        break
+            if currency_code is None or not any(
+                keyword in column_name.lower() for keyword in _MONEY_COL_KWS
+            ):
+                continue
+            converted = pd.to_numeric(df.loc[required_rows, column_name], errors="coerce")
+            if int(converted.notna().sum()) != required_count:
+                continue
+            priority = _NORMALIZED_MONEY_PRIORITY.index(currency_code)
+            candidates.append((priority, column_name))
+
+        return min(candidates)[1] if candidates else None
 
     @staticmethod
     def _find_value_column(

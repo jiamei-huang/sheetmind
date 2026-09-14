@@ -47,12 +47,12 @@ export const getProjectFiles = async (projectId) => {
 };
 
 
-export const previewExcelFile = async ({ projectId, fileName }) => {
-  const response = await apiClient.post("/files/preview", { projectId, fileName });
+export const previewExcelFile = async ({ projectId, fileId, fileName }) => {
+  const response = await apiClient.post("/files/preview", { projectId, fileId, fileName });
   return response.data;
 };
 
 
-export const deleteExcelFile = async ({ projectId, fileName }) => {
-  await apiClient.delete(`/files/project/${projectId}/${encodeURIComponent(fileName)}`);
+export const deleteExcelFile = async ({ projectId, fileId }) => {
+  await apiClient.delete(`/files/project/${projectId}/id/${encodeURIComponent(fileId)}`);
 };

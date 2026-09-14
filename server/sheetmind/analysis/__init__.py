@@ -18,6 +18,7 @@ Import these from route handlers and tests:
 from .agent import SheetMindAgent
 from .context import (
     AnalysisContext,
+    CalculationBasis,
     ChartBlock,
     ChartSeries,
     ColumnMeta,
@@ -29,15 +30,25 @@ from .context import (
     FileRef,
     MetricBlock,
     MultiTurnMode,
+    ExecutionReport,
+    QueryFilter,
+    QueryMetric,
+    QuerySemantics,
+    QuerySort,
+    QuestionResult,
     ResultBlocks,
+    ResultLineage,
     RoutingHint,
     SheetCandidate,
     SheetResolutionBlock,
     SummaryBlock,
+    SourceBinding,
+    StatusBlock,
     TableBlock,
     Turn,
 )
 from .context_store import ContextStore, get_context_store
+from .artifacts import AnalysisArtifactStore, get_artifact_store
 from .models.router import ModelRouter
 from .streaming.emitter import StreamEmitter
 from .tracing.storage import get_trace_store
@@ -48,9 +59,19 @@ __all__ = [
     "SheetMindAgent",
     # Context + data models
     "AnalysisContext",
+    "CalculationBasis",
     "FileRef",
     "Turn",
     "ResultBlocks",
+    "QuestionResult",
+    "StatusBlock",
+    "ExecutionReport",
+    "SourceBinding",
+    "QuerySemantics",
+    "QueryFilter",
+    "QueryMetric",
+    "QuerySort",
+    "ResultLineage",
     "SummaryBlock",
     "MetricBlock",
     "TableBlock",
@@ -70,6 +91,8 @@ __all__ = [
     # Context store
     "ContextStore",
     "get_context_store",
+    "AnalysisArtifactStore",
+    "get_artifact_store",
     # Infrastructure
     "ModelRouter",
     "StreamEmitter",

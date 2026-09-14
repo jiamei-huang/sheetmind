@@ -1,16 +1,29 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import TaskContentPanel from "./AIDataAnalysis/TaskContentPanel";
-import { analyzeStream, toAnalysisErrorMessage } from "../api/analysis";
+import {
+  analyzeStream,
+  buildSelectedFileScope,
+  downloadArtifactExcel,
+  toAnalysisErrorMessage,
+} from "../api/analysis";
 import { createTask as createTaskApi } from "../api/tasks";
 import { toAnalysisViewModel } from "../api/resultBlocks";
 import { isValidBackendProjectId } from "../utils/validation";
 import { createTask, PAGE_SIZE_OPTIONS } from "../constants/task";
-import { CHART_TYPES, CHART_TYPE_LABELS } from "../constants/chart";
-
-const maxChars = 500;
+import {
+  CHART_TYPES,
+  CHART_TYPE_LABELS,
+  DEFAULT_CHART_DISPLAY_LIMIT,
+} from "../constants/chart";
+import {
+  downloadChartDataAsExcel,
+  downloadTableDataAsExcel,
+} from "../utils/chartExcelExport";
+import { MAX_ANALYSIS_QUERY_LENGTH } from "../constants/analysis";
 
 function AIDataAnalysis({
   uploadedFile,
+  uploadedFiles = [],
   uploadedFilesCount = 0,
   selectedSheetsTotal = 0,
   hasUploadedFiles = false,
@@ -25,7 +38,7 @@ function AIDataAnalysis({
   const [progressSteps, setProgressSteps] = useState([]);
   const [isConfirmDiscardOpen, setIsConfirmDiscardOpen] = useState(false);
   const [confirmDiscardTaskId, setConfirmDiscardTaskId] = useState(null);
-  const [exportMenuTaskId, setExportMenuTaskId] = useState(null);
+  const [exportMenuKey, setExportMenuKey] = useState(null);
   const chartContainerRefs = useRef({});
   const [isRenameModalOpen, setIsRenameModalOpen] = useState(false);
   const [renameTaskId, setRenameTaskId] = useState(null);
@@ -34,19 +47,19 @@ function AIDataAnalysis({
   const [deleteTaskId, setDeleteTaskId] = useState(null);
 
   useEffect(() => {
-    if (!exportMenuTaskId) {
+    if (!exportMenuKey) {
       return undefined;
     }
 
     const handleClickOutside = () => {
-      setExportMenuTaskId(null);
+      setExportMenuKey(null);
     };
 
     document.addEventListener("click", handleClickOutside);
     return () => {
       document.removeEventListener("click", handleClickOutside);
     };
-  }, [exportMenuTaskId]);
+  }, [exportMenuKey]);
 
   // 创建别名变量以保持代码一致性
   const effectiveTasks = tasks || [];
@@ -89,6 +102,18 @@ function AIDataAnalysis({
     return [];
   }, [activeTask, uploadedFile]);
 
+  const selectedFileScope = useMemo(() => {
+    const completeScope = buildSelectedFileScope(uploadedFiles);
+    if (completeScope.length) {
+      return completeScope;
+    }
+    return buildSelectedFileScope([
+      uploadedFile
+        ? { ...uploadedFile, selectedSheets }
+        : null,
+    ]);
+  }, [selectedSheets, uploadedFile, uploadedFiles]);
+
   // updateTask 现在从 taskManagement 获取或使用本地版本
 
   const handleTaskPromptChange = useCallback((taskId, value) => {
@@ -97,26 +122,13 @@ function AIDataAnalysis({
         task.id === taskId
           ? {
               ...task,
-              prompt: value.slice(0, maxChars),
+              prompt: value.slice(0, MAX_ANALYSIS_QUERY_LENGTH),
               classification: task.status === "completed" ? task.classification : null,
             }
           : task
       )
     );
   }, [effectiveSetTasks]);
-
-  const handleSuggestionSelect = useCallback(
-    (taskId, suggestion) => {
-      const ready = Boolean(uploadedFile?.fileId && selectedSheets.length > 0);
-      if (!ready || isAnalyzing) {
-        return;
-      }
-      effectiveSetTasks((prev) =>
-        prev.map((task) => (task.id === taskId ? { ...task, prompt: suggestion } : task))
-      );
-    },
-    [isAnalyzing, selectedSheets, uploadedFile?.fileId, effectiveSetTasks]
-  );
 
   const handleTaskPageSizeChange = useCallback((taskId, size) => {
     effectiveUpdateTask(taskId, () => ({ pageSize: size, currentPage: 1 }));
@@ -149,20 +161,32 @@ function AIDataAnalysis({
   }, [effectiveUpdateTask]);
 
 
-  const handleExportPreview = useCallback((taskId) => {
+  const handleExportPreview = useCallback(async (taskId, resultIndex, previewIndex) => {
     const targetTask = effectiveTasks.find((task) => task.id === taskId);
-    const lastResult = targetTask?.results && targetTask.results.length > 0
-      ? targetTask.results[targetTask.results.length - 1]
-      : null;
-    if (!lastResult) {
+    const results = targetTask?.results || [];
+    const resolvedResultIndex = resultIndex ?? results.length - 1;
+    const result = results[resolvedResultIndex] ?? null;
+    const preview = result?.previews?.[previewIndex ?? targetTask?.activePreviewIndex ?? 0]
+      ?? result?.preview;
+    if (!preview?.columns?.length) {
+      onShowToast?.({ title: "导出失败", message: "无表格数据可导出", type: "error" });
       return;
     }
-    onShowToast?.({
-      title: "导出中",
-      message: `正在导出数据预览（${lastResult.fileName || "analysis"}）`,
-      type: "info",
-      autoClose: true,
-    });
+
+    try {
+      if (preview.artifactId) {
+        await downloadArtifactExcel(preview.artifactId, taskId);
+      } else {
+        await downloadTableDataAsExcel(
+          preview,
+          `analysis-data-${taskId}-${resolvedResultIndex + 1}`
+        );
+      }
+      onShowToast?.({ title: "导出成功", message: "计算结果已下载为 Excel", type: "success", autoClose: true });
+    } catch (err) {
+      console.error("[Export Table]", err);
+      onShowToast?.({ title: "导出失败", message: err?.message || "导出数据时出错", type: "error" });
+    }
   }, [onShowToast, effectiveTasks]);
 
   const handleTaskVisualizationModeChange = useCallback(
@@ -182,7 +206,7 @@ function AIDataAnalysis({
   );
 
   const handleExportChartImage = useCallback(
-    async (taskId, resultIndex) => {
+    async (taskId, resultIndex, chartIndex = 0) => {
       const targetTask = effectiveTasks.find((task) => task.id === taskId);
       const results = targetTask?.results || [];
       const idx = resultIndex ?? results.length - 1;
@@ -191,7 +215,7 @@ function AIDataAnalysis({
         onShowToast?.({ title: "导出失败", message: "无图表数据可导出", type: "error" });
         return;
       }
-      const chartData = result.chartDatas?.[targetTask.activeChartIndex ?? 0] ?? result.chartData;
+      const chartData = result.chartDatas?.[chartIndex] ?? result.chartData;
 
       try {
         onShowToast?.({ title: "导出中", message: "正在生成图表图片...", type: "info", autoClose: true });
@@ -223,38 +247,21 @@ function AIDataAnalysis({
   );
 
   const handleExportChartData = useCallback(
-    (taskId, resultIndex) => {
+    async (taskId, resultIndex, chartIndex = 0) => {
       const targetTask = effectiveTasks.find((task) => task.id === taskId);
       const results = targetTask?.results || [];
       const idx = resultIndex ?? results.length - 1;
       const result = results[idx] ?? null;
-      if (!result?.chartData?.labels?.length || !result.chartData.series?.length) {
+      const chartData = result?.chartDatas?.[chartIndex]
+        ?? result?.chartData;
+      if (!chartData?.labels?.length || !chartData.series?.length) {
         onShowToast?.({ title: "导出失败", message: "无图表数据可导出", type: "error" });
         return;
       }
-      const chartData = result.chartDatas?.[targetTask.activeChartIndex ?? 0] ?? result.chartData;
-      const { labels, series } = chartData;
 
       try {
-        const headers = ["Label", ...series.map((s) => s.name)];
-        const rows = labels.map((label, i) => {
-          const values = series.map((s) => {
-            const v = s.values?.[i];
-            if (v === null || v === undefined) return "";
-            return typeof v === "number" ? String(v) : String(v).replace(/"/g, '""');
-          });
-          const safeLabel = String(label ?? "").replace(/"/g, '""');
-          return [safeLabel, ...values];
-        });
-        const csvContent = [headers.join(","), ...rows.map((r) => r.map((c) => `"${c}"`).join(","))].join("\n");
-        const blob = new Blob(["\uFEFF" + csvContent], { type: "text/csv;charset=utf-8" });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = `chart-data-${taskId}-${idx}.csv`;
-        link.click();
-        URL.revokeObjectURL(url);
-        onShowToast?.({ title: "导出成功", message: "图表数据已下载为 CSV", type: "success", autoClose: true });
+        await downloadChartDataAsExcel(chartData, `chart-data-${taskId}-${idx}`);
+        onShowToast?.({ title: "导出成功", message: "图表数据已下载为 Excel", type: "success", autoClose: true });
       } catch (err) {
         console.error("[Export Data]", err);
         onShowToast?.({ title: "导出失败", message: err?.message || "导出数据时出错", type: "error" });
@@ -263,8 +270,8 @@ function AIDataAnalysis({
     [onShowToast, effectiveTasks]
   );
 
-  const toggleExportMenuForTask = useCallback((taskId) => {
-    setExportMenuTaskId((prev) => (prev === taskId ? null : taskId));
+  const toggleExportMenuForTask = useCallback((menuKey) => {
+    setExportMenuKey((prev) => (prev === menuKey ? null : menuKey));
   }, []);
 
   const handleAnalyzeTask = useCallback(async (taskId) => {
@@ -448,9 +455,7 @@ function AIDataAnalysis({
       const response = await analyzeStream({
         taskId: actualTaskId,
         query: trimmedPrompt,
-        selectedFiles: uploadedFile?.fileName && selectedSheets.length > 0
-          ? [{ fileName: uploadedFile.fileName, sheets: selectedSheets }]
-          : [],
+        selectedFiles: selectedFileScope,
         onEvent: pushProgressEvent,
       });
 
@@ -481,6 +486,7 @@ function AIDataAnalysis({
               currentPage: 1,
               selectedChartType: defaultChartType,
               isChartDataView: false,
+              chartDisplayLimit: DEFAULT_CHART_DISPLAY_LIMIT,
             };
           }
           return item;
@@ -528,6 +534,7 @@ function AIDataAnalysis({
     onShowErrorModal,
     onShowToast,
     selectedSheets,
+    selectedFileScope,
     uploadedFile,
   ]);
 
@@ -660,18 +667,18 @@ function AIDataAnalysis({
   );
 
   return (
-    <div className="w-full mt-8">
-      <div className="flex items-center mb-4">
+    <div className="w-full">
+      <div className="flex items-center mb-3">
         <div className="w-7 h-7 rounded-full bg-blue-600 text-white text-sm font-semibold flex items-center justify-center mr-3">
           2
         </div>
-        <h2 className="text-lg font-semibold text-gray-800">AI Data Analysis</h2>
+        <h2 className="text-lg font-semibold text-slate-800">AI Data Analysis</h2>
       </div>
 
       {/* ⚠️ 添加任务切换动画：使用 key 触发重新渲染 */}
       <div
         key={activeTaskId || 'no-task'}
-        className="bg-white rounded-xl shadow-sm animate-task-switch"
+        className="animate-task-switch"
       >
         <TaskContentPanel
           task={activeTask}
@@ -682,7 +689,6 @@ function AIDataAnalysis({
           progressMsg={progressMsg}
           progressSteps={progressSteps}
           onTaskPromptChange={handleTaskPromptChange}
-          onSuggestionSelect={handleSuggestionSelect}
           onAnalyzeTask={handleAnalyzeTask}
           onTaskPageSizeChange={handleTaskPageSizeChange}
           onTaskPageChange={handleTaskPageChange}
@@ -696,7 +702,7 @@ function AIDataAnalysis({
           onTaskChartDataPageChange={handleTaskChartDataPageChange}
           onExportChartImage={handleExportChartImage}
           onExportChartData={handleExportChartData}
-          exportMenuTaskId={exportMenuTaskId}
+          exportMenuKey={exportMenuKey}
           onToggleExportMenu={toggleExportMenuForTask}
           chartContainerRefs={chartContainerRefs}
           onUpdateTask={effectiveUpdateTask}
@@ -705,10 +711,10 @@ function AIDataAnalysis({
 
       {isConfirmDiscardOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-sm p-6 space-y-4">
+          <div className="sm-dialog w-full max-w-sm space-y-4 p-6" role="alertdialog" aria-modal="true" aria-labelledby="discard-task-title">
             <div>
-              <h4 className="text-base font-semibold text-gray-900">Discard task?</h4>
-              <p className="mt-1 text-sm text-gray-600">
+              <h4 id="discard-task-title" className="text-base font-semibold text-slate-900">Discard task?</h4>
+              <p className="mt-1 text-sm text-slate-600">
                 This will remove the selected task and its results. You can't undo this action.
                 {confirmDiscardTaskId && (
                   <>
@@ -727,7 +733,7 @@ function AIDataAnalysis({
                   setIsConfirmDiscardOpen(false);
                   setConfirmDiscardTaskId(null);
                 }}
-                className="px-4 py-2 text-sm font-medium text-gray-600 border border-gray-200 rounded-md hover:bg-gray-100 transition-colors"
+                className="px-4 py-2 text-sm font-medium text-slate-600 border border-slate-200 rounded-md hover:bg-slate-100 transition-colors"
               >
                 Cancel
               </button>
@@ -745,10 +751,10 @@ function AIDataAnalysis({
 
       {isRenameModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-sm p-6 space-y-4">
+          <div className="sm-dialog w-full max-w-sm space-y-4 p-6" role="dialog" aria-modal="true" aria-labelledby="rename-task-title">
             <div>
-              <h4 className="text-base font-semibold text-gray-900">Rename Task</h4>
-              <p className="mt-1 text-sm text-gray-600">Enter a new name for this task.</p>
+              <h4 id="rename-task-title" className="text-base font-semibold text-slate-900">Rename Task</h4>
+              <p className="mt-1 text-sm text-slate-600">Enter a new name for this task.</p>
             </div>
             <div>
               <input
@@ -763,7 +769,7 @@ function AIDataAnalysis({
                     setRenameTaskTitle("");
                   }
                 }}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                 placeholder="Task name"
                 autoFocus
               />
@@ -776,7 +782,7 @@ function AIDataAnalysis({
                   setRenameTaskTitle("");
                   setRenameTaskId(null);
                 }}
-                className="px-4 py-2 text-sm font-medium text-gray-600 border border-gray-200 rounded-md hover:bg-gray-100 transition-colors"
+                className="px-4 py-2 text-sm font-medium text-slate-600 border border-slate-200 rounded-md hover:bg-slate-100 transition-colors"
               >
                 Cancel
               </button>
@@ -784,7 +790,7 @@ function AIDataAnalysis({
                 type="button"
                 onClick={handleConfirmRename}
                 disabled={!renameTaskTitle.trim()}
-                className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed rounded-md transition-colors"
+                className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed rounded-md transition-colors"
               >
                 Rename
               </button>
@@ -795,10 +801,10 @@ function AIDataAnalysis({
 
       {isDeleteModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-sm p-6 space-y-4">
+          <div className="sm-dialog w-full max-w-sm space-y-4 p-6" role="alertdialog" aria-modal="true" aria-labelledby="delete-task-title">
             <div>
-              <h4 className="text-base font-semibold text-gray-900">Delete Task</h4>
-              <p className="mt-1 text-sm text-gray-600">
+              <h4 id="delete-task-title" className="text-base font-semibold text-slate-900">Delete Task</h4>
+              <p className="mt-1 text-sm text-slate-600">
                 Are you sure you want to delete this task? This action cannot be undone.
                 {deleteTaskId && (
                   <>
@@ -817,7 +823,7 @@ function AIDataAnalysis({
                   setIsDeleteModalOpen(false);
                   setDeleteTaskId(null);
                 }}
-                className="px-4 py-2 text-sm font-medium text-gray-600 border border-gray-200 rounded-md hover:bg-gray-100 transition-colors"
+                className="px-4 py-2 text-sm font-medium text-slate-600 border border-slate-200 rounded-md hover:bg-slate-100 transition-colors"
               >
                 Cancel
               </button>

@@ -2,6 +2,8 @@
  * 任务相关常量与工厂函数
  */
 
+import { DEFAULT_CHART_DISPLAY_LIMIT } from "./chart";
+
 /** 分页选项 */
 export const PAGE_SIZE_OPTIONS = [10, 20, 50];
 
@@ -36,6 +38,7 @@ export const createTask = (number, prompt = "", parentTaskId = null) => ({
   parentTaskId,
   selectedChartType: "bar",
   isChartDataView: false,
+  chartDisplayLimit: DEFAULT_CHART_DISPLAY_LIMIT,
 });
 
 /**

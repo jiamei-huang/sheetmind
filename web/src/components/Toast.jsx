@@ -113,7 +113,7 @@ export default function Toast({
             type="button"
             aria-label="关闭提示"
             onClick={onDismiss}
-            className="flex-shrink-0 text-gray-400 hover:text-gray-600 transition-colors p-1 -mr-1"
+            className="flex-shrink-0 text-slate-400 hover:text-slate-600 transition-colors p-1 -mr-1"
           >
             <X className="w-4 h-4" />
           </button>

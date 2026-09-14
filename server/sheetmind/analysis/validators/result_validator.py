@@ -58,7 +58,17 @@ def validate_result(
     """
     if not result.blocks:
         logger.warning("[ResultValidator] ResultBlocks has no blocks")
-        return result
+        if not result.questions:
+            return result
+
+    question_ids = [question.question_id for question in result.questions]
+    if len(question_ids) != len(set(question_ids)):
+        raise ResultValidationError("QuestionResult question_id values must be unique")
+    for question in result.questions:
+        if question.status == "success" and not question.blocks:
+            raise ResultValidationError(
+                f"QuestionResult[{question.question_id}] is successful but has no blocks"
+            )
 
     valid_blocks = []
     removed_charts = 0
@@ -75,6 +85,8 @@ def validate_result(
                 _validate_field_resolution(block, index=i)
             elif kind == "sheet_resolution":
                 _validate_sheet_resolution(block, index=i)
+            elif kind == "status":
+                _validate_status(block, index=i)
             # metric blocks and unknown kinds are passed through without validation
         except ResultValidationError as exc:
             if kind == "chart" and degrade_invalid_charts:
@@ -92,8 +104,26 @@ def validate_result(
         if not has_summary:
             valid_blocks.insert(0, SummaryBlock(content="图表数据不完整，已保留可用的分析结果。"))
         result.blocks = valid_blocks
+        for question in result.questions:
+            question.blocks = [
+                block
+                for block in question.blocks
+                if _block_kind(block) != "chart" or _chart_is_valid(block)
+            ]
+            if question.status == "success" and not question.blocks:
+                question.blocks = [
+                    SummaryBlock(content="图表数据不完整，暂时无法展示。")
+                ]
 
     return result
+
+
+def _chart_is_valid(block: Any) -> bool:
+    try:
+        _validate_chart(block, index=0)
+    except ResultValidationError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +293,15 @@ def _validate_sheet_resolution(block: Any, index: int) -> None:
         raise ResultValidationError(
             f"SheetResolutionBlock[{index}]: at least one candidate is required"
         )
+
+
+def _validate_status(block: Any, index: int) -> None:
+    status = block.get("status") if isinstance(block, dict) else getattr(block, "status", "")
+    message = block.get("message") if isinstance(block, dict) else getattr(block, "message", "")
+    if status not in {"empty", "failed", "partial", "needs_input"}:
+        raise ResultValidationError(f"StatusBlock[{index}]: invalid status {status!r}")
+    if not str(message or "").strip():
+        raise ResultValidationError(f"StatusBlock[{index}]: message is required")
 
 
 # ---------------------------------------------------------------------------

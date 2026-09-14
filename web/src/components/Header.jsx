@@ -1,57 +1,139 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { BarChart3, User, Settings, Clock, HelpCircle } from "lucide-react";
+import { BarChart3, Clock3, Menu, RotateCcw, UserRound } from "lucide-react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import {
+  clearAnonymousBrowserState,
+  getAnonymousSession,
+  resetAnonymousSession,
+} from "../api/session.js";
 
-export default function Header() {
+export default function Header({ onOpenNavigation }) {
   const navigate = useNavigate();
+  const [retentionDays, setRetentionDays] = useState(null);
+  const [isResetOpen, setIsResetOpen] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+  const [resetError, setResetError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    getAnonymousSession()
+      .then((session) => {
+        if (!cancelled) setRetentionDays(session.retentionDays);
+      })
+      .catch(() => {
+        if (!cancelled) setRetentionDays(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleReset = async () => {
+    setIsResetting(true);
+    setResetError("");
+    try {
+      await resetAnonymousSession();
+      clearAnonymousBrowserState();
+      window.location.reload();
+    } catch {
+      setResetError("Could not reset the demo. Please try again.");
+      setIsResetting(false);
+    }
+  };
 
   return (
-    <header className="fixed top-0 left-0 w-full h-[60px] bg-white shadow z-40 flex items-center">
+    <header className="fixed left-0 top-0 z-40 flex h-[60px] w-full items-center border-b border-slate-200 bg-white">
       <div className="w-full px-4 sm:px-6 lg:px-8 flex items-center justify-between">
-        {/* 左侧图标与文字 - 可点击返回主页 */}
-        <button
-          onClick={() => navigate("/")}
-          className="flex items-center h-full hover:opacity-80 transition-opacity cursor-pointer"
-        >
-          <div className="bg-blue-500 rounded-full w-10 h-10 flex items-center justify-center mr-3 flex-shrink-0">
-            <BarChart3 className="text-white w-6 h-6" />
+        <div className="flex min-w-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={onOpenNavigation}
+            aria-label="Open navigation"
+            className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 lg:hidden"
+          >
+            <Menu className="h-5 w-5" />
+          </button>
+          <button
+            onClick={() => navigate("/")}
+            className="flex min-w-0 cursor-pointer items-center transition-opacity hover:opacity-80 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+          >
+          <div className="mr-2.5 flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-blue-600">
+            <BarChart3 className="h-5 w-5 text-white" />
           </div>
-          <div className="flex flex-col items-start">
-            <span className="font-bold text-xl text-black leading-tight">SheetMind</span>
-            <span className="text-xs text-gray-500 leading-tight -mt-0.5 text-left">
-              An intelligent analysis assistant that lets you interact with Excel using natural language
-            </span>
-          </div>
-        </button>
-        {/* 右侧菜单与账号下拉 */}
+          <span className="text-lg font-semibold text-slate-950">SheetMind</span>
+          </button>
+        </div>
+        {/* Anonymous demo controls */}
         <div className="flex items-center">
           <DropdownMenu.Root>
             <DropdownMenu.Trigger asChild>
-              <button className="flex items-center focus:outline-none font-medium text-black/80 hover:text-black px-3 py-2 rounded-md hover:bg-gray-50 transition-colors">
-                <User className="w-5 h-5 mr-2" />
-                <span>Account</span>
+              <button
+                className="flex items-center focus:outline-none font-medium text-black/80 hover:text-black px-2 sm:px-3 py-2 rounded-md hover:bg-slate-50 transition-colors"
+                aria-label="Anonymous Demo settings"
+              >
+                <UserRound className="w-5 h-5 sm:mr-2" />
+                <span className="hidden sm:inline">Anonymous Demo</span>
               </button>
             </DropdownMenu.Trigger>
             <DropdownMenu.Portal>
-              <DropdownMenu.Content className="min-w-[180px] rounded shadow-lg bg-white p-1 border border-gray-100 mt-1">
-                <DropdownMenu.Item className="flex items-center px-3 py-2 rounded cursor-pointer hover:bg-blue-50 text-black/90">
-                  <Settings className="w-4 h-4 mr-2 opacity-70" />
-                  Account Settings
-                </DropdownMenu.Item>
-                <DropdownMenu.Item className="flex items-center px-3 py-2 rounded cursor-pointer hover:bg-blue-50 text-black/90">
-                  <Clock className="w-4 h-4 mr-2 opacity-70" />
-                  Analysis History
-                </DropdownMenu.Item>
-                <DropdownMenu.Item className="flex items-center px-3 py-2 rounded cursor-pointer hover:bg-blue-50 text-black/90">
-                  <HelpCircle className="w-4 h-4 mr-2 opacity-70" />
-                  Help & Feedback
+              <DropdownMenu.Content
+                align="end"
+                sideOffset={4}
+                className="min-w-[240px] rounded shadow-lg bg-white p-1 border border-slate-100 z-50"
+              >
+                <DropdownMenu.Label className="flex items-start gap-2 px-3 py-2 text-xs font-normal text-slate-500">
+                  <Clock3 className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <span>
+                    Data expires after {retentionDays ?? "the configured number of"} days of inactivity.
+                  </span>
+                </DropdownMenu.Label>
+                <DropdownMenu.Separator className="h-px bg-slate-100 my-1" />
+                <DropdownMenu.Item
+                  onSelect={() => setIsResetOpen(true)}
+                  className="flex items-center px-3 py-2 rounded cursor-pointer hover:bg-red-50 focus:bg-red-50 focus:outline-none text-red-600"
+                >
+                  <RotateCcw className="w-4 h-4 mr-2" />
+                  Reset Demo Data
                 </DropdownMenu.Item>
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
         </div>
       </div>
+
+      {isResetOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/40 px-4">
+          <div className="sm-dialog w-full max-w-sm p-6" role="alertdialog" aria-modal="true" aria-labelledby="reset-demo-title">
+            <h2 id="reset-demo-title" className="text-base font-semibold text-slate-900">Reset Demo Data</h2>
+            <p className="mt-2 text-sm text-slate-600">
+              This permanently deletes your uploaded workbooks, projects, tasks, and analysis history.
+            </p>
+            {resetError && <p className="mt-3 text-sm text-red-600">{resetError}</p>}
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsResetOpen(false);
+                  setResetError("");
+                }}
+                disabled={isResetting}
+                className="px-4 py-2 text-sm font-medium text-slate-700 border border-slate-200 rounded-md hover:bg-slate-100 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleReset}
+                disabled={isResetting}
+                className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-md hover:bg-red-700 disabled:bg-red-300"
+              >
+                {isResetting ? "Resetting..." : "Reset"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </header>
   );
 }

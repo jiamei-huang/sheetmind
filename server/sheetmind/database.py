@@ -104,9 +104,39 @@ def init_db() -> None:
             FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS analysis_contexts (
+            task_id TEXT PRIMARY KEY,
+            context_json TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS analysis_artifacts (
+            artifact_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            question_id TEXT NOT NULL,
+            payload BLOB NOT NULL,
+            row_count INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS analysis_traces (
+            trace_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            trace_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+        )
+        """,
         "CREATE INDEX IF NOT EXISTS idx_files_project_id ON files(project_id)",
         "CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id)",
         "CREATE INDEX IF NOT EXISTS idx_conversations_task_id ON conversations(task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_artifacts_task_id ON analysis_artifacts(task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_traces_task_id ON analysis_traces(task_id)",
         )
 
         for statement in statements:
@@ -123,6 +153,10 @@ def init_db() -> None:
             "ON files(project_id, file_name, content_sha256)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_session_id ON projects(session_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_anonymous_sessions_expires_at "
+            "ON anonymous_sessions(expires_at)"
+        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -186,14 +220,14 @@ def _backfill_file_hashes(conn: sqlite3.Connection) -> None:
         ORDER BY created_at DESC, file_id DESC
         """
     ).fetchall()
-    seen_names: set[tuple[str, str]] = set()
+    seen_files: set[tuple[str, str, str]] = set()
     for row in rows:
         digest = row[4] or hashlib.sha256(row[3]).hexdigest()
-        name_key = (row[1], row[2])
-        if name_key in seen_names:
+        file_key = (row[1], row[2], digest)
+        if file_key in seen_files:
             conn.execute("DELETE FROM files WHERE file_id = ?", (row[0],))
             continue
-        seen_names.add(name_key)
+        seen_files.add(file_key)
         if row[4] != digest:
             conn.execute(
                 "UPDATE files SET content_sha256 = ? WHERE file_id = ?",

@@ -2,6 +2,105 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --sm-surface: #ffffff;
+  --sm-canvas: #f8fafc;
+  --sm-border: #e2e8f0;
+  --sm-text: #0f172a;
+  --sm-muted: #64748b;
+  --sm-primary: #496fc0;
+  --sm-radius-control: 6px;
+  --sm-radius-panel: 8px;
+  --sm-space-1: 4px;
+  --sm-space-2: 8px;
+  --sm-space-3: 12px;
+  --sm-space-4: 16px;
+  --sm-space-6: 24px;
+  --sm-space-8: 32px;
+}
+
+@layer base {
+  html {
+    color: var(--sm-text);
+    background: var(--sm-canvas);
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    background: var(--sm-canvas);
+    color: var(--sm-text);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    letter-spacing: 0;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+}
+
+@layer components {
+  .sm-panel {
+    border: 1px solid var(--sm-border);
+    border-radius: var(--sm-radius-panel);
+    background: var(--sm-surface);
+  }
+
+  .sm-dialog {
+    border: 1px solid rgb(226 232 240 / 0.8);
+    border-radius: var(--sm-radius-panel);
+    background: var(--sm-surface);
+    box-shadow: 0 18px 48px rgb(15 23 42 / 0.18);
+  }
+
+  .sm-control-secondary {
+    min-height: 36px;
+    border: 1px solid var(--sm-border);
+    border-radius: var(--sm-radius-control);
+    background: #f8fafc;
+    padding: 6px 12px;
+    color: #334155;
+    font-size: 14px;
+    font-weight: 500;
+    transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+  }
+
+  .sm-control-secondary:hover {
+    background: #f1f5f9;
+  }
+
+  .sm-control-secondary:focus-visible {
+    outline: 2px solid var(--sm-primary);
+    outline-offset: 2px;
+  }
+
+  .sm-status {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sm-space-3);
+    border-left: 2px solid currentColor;
+    padding: var(--sm-space-3) var(--sm-space-4);
+  }
+
+  .sm-status-info {
+    background: #f2f6fc;
+    color: #344d84;
+  }
+
+  .sm-status-warning {
+    background: #fcf8ef;
+    color: #523c21;
+  }
+
+  .sm-status-error {
+    background: #fcf5f4;
+    color: #5e2e2d;
+  }
+}
+
 /* 任务切换动画 */
 @keyframes task-switch {
   0% {
@@ -32,4 +131,15 @@
 
 .animate-project-switch {
   animation: project-switch 0.4s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

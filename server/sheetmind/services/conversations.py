@@ -1,16 +1,23 @@
 """
 对话历史管理服务
 """
+import json
 import uuid
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional
 from sheetmind.database import get_db_connection
 
 
 class ConversationService:
     """对话历史服务"""
 
-    def add_message(self, task_id: str, role: str, content: str) -> str:
+    def add_message(
+        self,
+        task_id: str,
+        role: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """
         添加对话消息
         Args:
@@ -26,8 +33,19 @@ class ConversationService:
 
         try:
             cursor.execute(
-                "INSERT INTO conversations (conversation_id, task_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-                (conversation_id, task_id, role, content, datetime.now())
+                """
+                INSERT INTO conversations (
+                    conversation_id, task_id, role, content, metadata, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    task_id,
+                    role,
+                    content,
+                    json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+                    datetime.now(),
+                ),
             )
             conn.commit()
             return conversation_id
@@ -37,7 +55,11 @@ class ConversationService:
         finally:
             conn.close()
 
-    def get_conversation_history(self, task_id: str, limit: int = 50) -> List[Dict[str, str]]:
+    def get_conversation_history(
+        self,
+        task_id: str,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
         """
         获取对话历史
         Args:
@@ -51,7 +73,13 @@ class ConversationService:
 
         try:
             cursor.execute(
-                "SELECT role, content, created_at FROM conversations WHERE task_id = ? ORDER BY created_at ASC LIMIT ?",
+                """
+                SELECT role, content, metadata, created_at
+                FROM conversations
+                WHERE task_id = ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
                 (task_id, limit)
             )
             rows = cursor.fetchall()
@@ -60,12 +88,29 @@ class ConversationService:
                 {
                     "role": row[0],
                     "content": row[1],
-                    "createdAt": row[2].isoformat() if row[2] and hasattr(row[2], 'isoformat') else (str(row[2]) if row[2] else None)
+                    "metadata": self._parse_metadata(row[2]),
+                    "createdAt": (
+                        row[3].isoformat()
+                        if row[3] and hasattr(row[3], "isoformat")
+                        else str(row[3]) if row[3] else None
+                    ),
                 }
                 for row in rows
             ]
         finally:
             conn.close()
+
+    @staticmethod
+    def _parse_metadata(raw: Any) -> Optional[Dict[str, Any]]:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return raw
+        try:
+            parsed = json.loads(str(raw))
+            return parsed if isinstance(parsed, dict) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
 
     def clear_conversation(self, task_id: str) -> bool:
         """清空对话历史"""

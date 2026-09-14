@@ -1,7 +1,8 @@
 """
-SheetMind — In-Memory Context Store
-=======================================
-Maintains AnalysisContext objects keyed by task_id for multi-turn sessions.
+SheetMind analysis context store.
+================================
+Maintains AnalysisContext objects keyed by task_id for multi-turn sessions,
+with optional SQLite persistence across process restarts.
 
 Design:
 - OrderedDict as LRU backing store (oldest at front, newest at back)
@@ -18,25 +19,31 @@ Usage:
 from __future__ import annotations
 
 import threading
+import logging
 from collections import OrderedDict
 from typing import Optional
 
 from .context import AnalysisContext
+from sheetmind.database import get_db_connection
+
+logger = logging.getLogger(__name__)
 
 _MAX_SIZE = 200
 
 
 class ContextStore:
     """
-    Thread-safe in-memory LRU store for AnalysisContext objects.
+    Thread-safe LRU cache for AnalysisContext objects.
 
     Keys are task_id strings. On get/set, the entry is promoted to MRU
     (back of the OrderedDict).  When max_size is exceeded, the LRU entry
-    (front of the OrderedDict) is evicted.
+    (front of the OrderedDict) is evicted. Persistent stores lazily restore
+    cache misses from SQLite.
     """
 
-    def __init__(self, max_size: int = _MAX_SIZE) -> None:
+    def __init__(self, max_size: int = _MAX_SIZE, persist: bool = False) -> None:
         self._max_size = max_size
+        self._persist_enabled = persist
         self._store: OrderedDict[str, AnalysisContext] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -47,14 +54,24 @@ class ContextStore:
     def get(self, task_id: str) -> Optional[AnalysisContext]:
         """Return the context for task_id, or None if not present.  Promotes to MRU."""
         with self._lock:
-            if task_id not in self._store:
-                return None
-            # Promote to MRU
-            self._store.move_to_end(task_id)
-            return self._store[task_id]
+            if task_id in self._store:
+                # Promote to MRU
+                self._store.move_to_end(task_id)
+                return self._store[task_id]
+        if not self._persist_enabled:
+            return None
+        ctx = self._load_persisted(task_id)
+        if ctx is not None:
+            self._remember(task_id, ctx)
+        return ctx
 
     def set(self, task_id: str, ctx: AnalysisContext) -> None:
         """Store/update a context.  Promotes to MRU; evicts LRU if over capacity."""
+        self._remember(task_id, ctx)
+        if self._persist_enabled:
+            self._persist(ctx)
+
+    def _remember(self, task_id: str, ctx: AnalysisContext) -> None:
         with self._lock:
             if task_id in self._store:
                 self._store.move_to_end(task_id)
@@ -82,6 +99,16 @@ class ContextStore:
         """Remove a context from the store (e.g. on task deletion)."""
         with self._lock:
             self._store.pop(task_id, None)
+        if self._persist_enabled:
+            try:
+                conn = get_db_connection()
+                try:
+                    conn.execute("DELETE FROM analysis_contexts WHERE task_id = ?", (task_id,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as exc:
+                logger.warning("Failed to delete persisted analysis context: %s", exc)
 
     def size(self) -> int:
         """Return number of contexts currently held."""
@@ -92,6 +119,45 @@ class ContextStore:
         """Remove all contexts (test helper)."""
         with self._lock:
             self._store.clear()
+
+    @staticmethod
+    def _load_persisted(task_id: str) -> Optional[AnalysisContext]:
+        try:
+            conn = get_db_connection()
+            try:
+                row = conn.execute(
+                    "SELECT context_json FROM analysis_contexts WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                return None
+            return AnalysisContext.model_validate_json(row[0])
+        except Exception as exc:
+            logger.debug("Persisted analysis context unavailable: %s", exc)
+            return None
+
+    @staticmethod
+    def _persist(ctx: AnalysisContext) -> None:
+        try:
+            conn = get_db_connection()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO analysis_contexts (task_id, context_json, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        context_json = excluded.context_json,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (ctx.task_id, ctx.model_dump_json()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("Failed to persist analysis context: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -108,5 +174,5 @@ def get_context_store() -> ContextStore:
     if _singleton is None:
         with _singleton_lock:
             if _singleton is None:
-                _singleton = ContextStore()
+                _singleton = ContextStore(persist=True)
     return _singleton

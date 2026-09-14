@@ -19,6 +19,7 @@ from collections import deque
 from typing import Deque, Dict, List, Optional
 
 from .trace import Trace
+from sheetmind.database import get_db_connection
 
 
 class TraceStore:
@@ -51,6 +52,7 @@ class TraceStore:
 
             self._store[trace.trace_id] = trace
             self._order.append(trace.trace_id)
+        self._persist(trace)
 
     # ------------------------------------------------------------------
     # Read
@@ -58,7 +60,21 @@ class TraceStore:
 
     def get(self, trace_id: str) -> Optional[Trace]:
         """Return the trace for `trace_id`, or None if not found."""
-        return self._store.get(trace_id)
+        cached = self._store.get(trace_id)
+        if cached is not None:
+            return cached
+        try:
+            conn = get_db_connection()
+            try:
+                row = conn.execute(
+                    "SELECT trace_json FROM analysis_traces WHERE trace_id = ?",
+                    (trace_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            return Trace.model_validate_json(row[0]) if row else None
+        except Exception:
+            return None
 
     def list_recent(self, limit: int = 20) -> List[Trace]:
         """Return the most recent `limit` traces, newest first."""
@@ -86,6 +102,25 @@ class TraceStore:
     @property
     def count(self) -> int:
         return len(self._store)
+
+    @staticmethod
+    def _persist(trace: Trace) -> None:
+        try:
+            conn = get_db_connection()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO analysis_traces (trace_id, task_id, trace_json)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(trace_id) DO UPDATE SET trace_json = excluded.trace_json
+                    """,
+                    (trace.trace_id, trace.task_id, trace.model_dump_json()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

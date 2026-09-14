@@ -1,4 +1,4 @@
-import { BASE_URL } from "./client";
+import { BASE_URL } from "./client.js";
 
 const STREAM_TIMEOUT_MS = 300000;
 
@@ -39,6 +39,16 @@ export const toAnalysisErrorMessage = (error) => {
   return rawMessage;
 };
 
+export const buildSelectedFileScope = (files = []) =>
+  files.flatMap((file) => {
+    const fileName = file?.fileName || file?.name;
+    const fileId = file?.fileId;
+    const sheets = Array.isArray(file?.selectedSheets)
+      ? file.selectedSheets.filter(Boolean)
+      : [];
+    return fileName && sheets.length ? [{ fileId, fileName, sheets }] : [];
+  });
+
 export const analyzeStream = ({ taskId, query, selectedFiles = [], onEvent }) =>
   new Promise(async (resolve, reject) => {
     if (!taskId || !query?.trim()) {
@@ -51,6 +61,7 @@ export const analyzeStream = ({ taskId, query, selectedFiles = [], onEvent }) =>
     try {
       const response = await fetch(`${BASE_URL}/analysis/stream`, {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ taskId, query: query.trim(), selectedFiles }),
         signal: controller.signal,
@@ -100,3 +111,21 @@ export const analyzeStream = ({ taskId, query, selectedFiles = [], onEvent }) =>
       window.clearTimeout(timeoutId);
     }
   });
+
+
+export const downloadArtifactExcel = async (artifactId, taskId) => {
+  const response = await fetch(
+    `${BASE_URL}/analysis/artifacts/${encodeURIComponent(artifactId)}/excel?taskId=${encodeURIComponent(taskId)}`,
+    { credentials: "include" }
+  );
+  if (!response.ok) {
+    throw new Error(toAnalysisErrorMessage(await readError(response)));
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `analysis-${artifactId.slice(0, 8)}.xlsx`;
+  link.click();
+  URL.revokeObjectURL(url);
+};

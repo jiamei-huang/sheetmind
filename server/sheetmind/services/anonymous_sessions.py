@@ -6,11 +6,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sheetmind.database import get_db_connection, transaction
+from sheetmind.database import transaction
 
 
 SESSION_COOKIE_NAME = "sheetmind_anonymous_session"
-SESSION_LIFETIME_DAYS = 30
 
 
 @dataclass(frozen=True)
@@ -21,22 +20,29 @@ class AnonymousSession:
 
 
 class AnonymousSessionService:
+    def __init__(self, lifetime_days: int = 30) -> None:
+        if lifetime_days < 1:
+            raise ValueError("Anonymous session lifetime must be at least 1 day")
+        self.lifetime_days = lifetime_days
+
     def resolve(self, candidate: str | None) -> AnonymousSession:
         now = datetime.now(timezone.utc)
-        if candidate:
-            conn = get_db_connection()
-            try:
+        with transaction() as conn:
+            conn.execute(
+                "DELETE FROM anonymous_sessions WHERE expires_at <= ?",
+                (now.isoformat(),),
+            )
+            if candidate:
                 row = conn.execute(
                     "SELECT expires_at FROM anonymous_sessions WHERE session_id = ?",
                     (candidate,),
                 ).fetchone()
-            finally:
-                conn.close()
-            if row:
-                expires_at = datetime.fromisoformat(str(row[0]))
-                if expires_at > now:
-                    renewed = now + timedelta(days=SESSION_LIFETIME_DAYS)
-                    with transaction() as conn:
+                if row:
+                    expires_at = datetime.fromisoformat(str(row[0]))
+                    if expires_at.tzinfo is None:
+                        expires_at = expires_at.replace(tzinfo=timezone.utc)
+                    if expires_at > now:
+                        renewed = now + timedelta(days=self.lifetime_days)
                         conn.execute(
                             """
                             UPDATE anonymous_sessions
@@ -45,11 +51,10 @@ class AnonymousSessionService:
                             """,
                             (now.isoformat(), renewed.isoformat(), candidate),
                         )
-                    return AnonymousSession(candidate, renewed)
+                        return AnonymousSession(candidate, renewed)
 
-        session_id = str(uuid.uuid4())
-        expires_at = now + timedelta(days=SESSION_LIFETIME_DAYS)
-        with transaction() as conn:
+            session_id = str(uuid.uuid4())
+            expires_at = now + timedelta(days=self.lifetime_days)
             conn.execute(
                 """
                 INSERT INTO anonymous_sessions
@@ -59,3 +64,24 @@ class AnonymousSessionService:
                 (session_id, now.isoformat(), now.isoformat(), expires_at.isoformat()),
             )
         return AnonymousSession(session_id, expires_at, is_new=True)
+
+    def delete(self, session_id: str) -> list[str]:
+        """Delete one anonymous workspace and return its task ids for cache eviction."""
+        with transaction() as conn:
+            task_ids = [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT tasks.task_id
+                    FROM tasks
+                    JOIN projects ON projects.project_id = tasks.project_id
+                    WHERE projects.session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchall()
+            ]
+            conn.execute(
+                "DELETE FROM anonymous_sessions WHERE session_id = ?",
+                (session_id,),
+            )
+        return task_ids

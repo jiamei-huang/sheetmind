@@ -35,6 +35,7 @@ class ModelRouter:
     ) -> None:
         # Start from defaults, apply overrides
         self._configs: Dict[ModelRole, ModelConfig] = {**DEFAULT_CONFIGS}
+        self._explicit_overrides = set(overrides or {})
         if overrides:
             self._configs.update(overrides)
         self._apply_env_overrides()
@@ -53,7 +54,7 @@ class ModelRouter:
                     f"ModelRouter: no config for role {role!r}. "
                     "Add it to DEFAULT_CONFIGS or pass it as an override."
                 )
-            self._providers[role] = ModelProvider(config)
+            self._providers[role] = ModelProvider(config, role=role.value)
         return self._providers[role]
 
     def config_for(self, role: ModelRole) -> ModelConfig:
@@ -80,6 +81,16 @@ class ModelRouter:
         for role in ModelRole:
             env_key = f"SHEETMIND_MODEL_{role.value.upper().replace('-', '_')}_ID"
             model_id = os.environ.get(env_key)
+            if (
+                not model_id
+                and role == ModelRole.QUERY_PLANNING
+                and role not in self._explicit_overrides
+            ):
+                # QUERY_PLANNING was introduced after the original role set.
+                # Existing deployments already configure ROUTING for the same
+                # low-latency reasoning tier, so inherit it instead of sending
+                # the OpenAI default model to a custom endpoint.
+                model_id = os.environ.get("SHEETMIND_MODEL_ROUTING_ID")
             if model_id and role in self._configs:
                 self._configs[role] = self._configs[role].model_copy(
                     update={"model_id": model_id}
@@ -87,6 +98,12 @@ class ModelRouter:
 
             provider_key = f"SHEETMIND_MODEL_{role.value.upper().replace('-', '_')}_PROVIDER"
             provider = os.environ.get(provider_key)
+            if (
+                not provider
+                and role == ModelRole.QUERY_PLANNING
+                and role not in self._explicit_overrides
+            ):
+                provider = os.environ.get("SHEETMIND_MODEL_ROUTING_PROVIDER")
             if provider and role in self._configs:
                 self._configs[role] = self._configs[role].model_copy(
                     update={"provider": provider}

@@ -32,15 +32,13 @@ class OutputPlanningSkill(Skill):
         **kwargs: Any,
     ) -> OutputPlan:
         formats = set(output_intents or ["auto"])
-        has_auto_output = not formats or "auto" in formats
         return OutputPlan(
             include_summary=True,
             include_table=(
                 "table" in formats
                 or "export_excel" in formats
                 or (
-                    has_auto_output
-                    and has_computation
+                    has_computation
                     and route != RoutingHint.INSIGHT_ONLY
                 )
             ),

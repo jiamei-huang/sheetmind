@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+from time import perf_counter
 from typing import Any, Dict, List, Optional
 
 from .configs import ModelConfig
@@ -30,8 +31,9 @@ class ModelProvider:
     and cached for the life of the provider instance.
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, role: Optional[str] = None) -> None:
         self.config = config
+        self.role = role
         self._client: Any = None
 
     # ------------------------------------------------------------------
@@ -63,17 +65,47 @@ class ModelProvider:
             messages = [{"role": "system", "content": system}] + list(messages)
 
         provider = self.config.provider
-        if provider == "openai":
-            return await self._complete_openai(
-                messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                json_mode=json_mode,
-            )
+        started = perf_counter()
+        try:
+            if provider == "openai":
+                result = await self._complete_openai(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    json_mode=json_mode,
+                )
+                self._record_trace(messages, result, perf_counter() - started)
+                return result
+        except Exception as exc:
+            self._record_trace(messages, "", perf_counter() - started, error=str(exc))
+            raise
 
         raise ValueError(
             f"ModelProvider: unsupported provider {provider!r}. "
             "Add a new _complete_<provider>() branch to extend."
+        )
+
+    def _record_trace(
+        self,
+        messages: List[Dict[str, str]],
+        result: str,
+        duration: float,
+        error: Optional[str] = None,
+    ) -> None:
+        from ..tracing.current import current_trace
+        from ..tracing.trace import EVT_MODEL_CALL
+
+        trace = current_trace()
+        if trace is None:
+            return
+        trace.add_event(
+            EVT_MODEL_CALL,
+            model_role=self.role,
+            model_id=self.config.model_id,
+            input_summary=f"messages={len(messages)} chars={sum(len(item.get('content', '')) for item in messages)}",
+            output_summary=f"chars={len(result)}",
+            duration_ms=duration * 1000,
+            error=error,
         )
 
     # ------------------------------------------------------------------

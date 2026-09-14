@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from sheetmind.database import get_db_connection
 
-from .dependencies import excel, projects, uploads
+from .dependencies import analysis_contexts, excel, projects, tasks, uploads
 from .schemas import ParseExcelRequest, UploadFilesRequest
 from .session import current_session_id
 
@@ -34,7 +34,7 @@ def list_project_files(project_id: str, request: Request) -> dict:
     result = []
     for row in rows:
         try:
-            parsed = excel.parse_excel(project_id, row[1])
+            parsed = excel.parse_excel(project_id, row[1], file_id=row[0])
             sheet_names = [sheet["sheetName"] for sheet in parsed["sheets"]]
         except Exception:
             sheet_names = []
@@ -55,12 +55,19 @@ def upload_files(request: Request, payload: UploadFilesRequest) -> dict:
     session_id = current_session_id(request)
     if not projects.get_project(payload.projectId, session_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    parsed_files = uploads.parse_files(payload.files)
-    write_results = projects.add_files_to_project(
-        payload.projectId, payload.files, session_id
-    )
+    try:
+        parsed_files = uploads.parse_files(payload.files)
+        write_results = projects.add_files_to_project(
+            payload.projectId, payload.files, session_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     for info, write in zip(parsed_files, write_results):
-        info.update(fileId=write.file_id, uploadStatus=write.status)
+        info.update(
+            fileId=write.file_id,
+            fileName=write.file_name,
+            uploadStatus=write.status,
+        )
     return {"projectId": payload.projectId, "files": parsed_files}
 
 
@@ -69,7 +76,11 @@ def preview_file(request: Request, payload: ParseExcelRequest) -> dict:
     if not projects.get_project(payload.projectId, current_session_id(request)):
         raise HTTPException(status_code=404, detail="Project not found")
     try:
-        return excel.parse_excel(payload.projectId, payload.fileName)
+        return excel.parse_excel(
+            payload.projectId,
+            payload.fileName,
+            file_id=payload.fileId,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -84,4 +95,21 @@ def delete_file(project_id: str, file_name: str, request: Request) -> dict[str, 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if not deleted:
         raise HTTPException(status_code=404, detail="File not found")
+    for task in tasks.list_tasks(project_id):
+        analysis_contexts.delete(task.task_id)
+    return {"success": True}
+
+
+@router.delete("/project/{project_id}/id/{file_id}")
+def delete_file_version(project_id: str, file_id: str, request: Request) -> dict[str, bool]:
+    if not projects.get_project(project_id, current_session_id(request)):
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        deleted = excel.delete_file_by_id(project_id, file_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="File not found")
+    for task in tasks.list_tasks(project_id):
+        analysis_contexts.delete(task.task_id)
     return {"success": True}

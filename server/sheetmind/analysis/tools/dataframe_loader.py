@@ -4,9 +4,9 @@ SheetMind — DataFrame Loader Tool
 Loads a pandas DataFrame from selected Excel files.
 
 Handles:
-  - Single file, single sheet → df
-  - Single file, multiple sheets → concatenate if same columns, else first sheet
-  - Multiple files → concatenate if same columns, else first file
+  - One selected source → one DataFrame
+  - Explicit union → concatenate only when every source has the same schema
+  - Multiple unrelated sources → reject instead of silently mixing them
   - FOLLOW_UP mode → use ctx._active_df (already loaded from previous turn)
 """
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import logging
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from xml.etree import ElementTree
@@ -55,7 +56,7 @@ class DataframeLoaderTool(Tool):
 
     Input kwargs:
         selected_files: List[Dict]  — from SheetSelectionSkill
-                        [{"fileName": "...", "sheets": ["Sheet1"]}]
+                        [{"fileId": "...", "fileName": "...", "sheets": ["Sheet1"]}]
         multiturn_mode: MultiTurnMode — if FOLLOW_UP, reuse ctx._active_df
 
     Output: pd.DataFrame by default, or LoadResult when return_report=True.
@@ -70,8 +71,12 @@ class DataframeLoaderTool(Tool):
         selected_files: Optional[List[Dict[str, Any]]] = None,
         multiturn_mode: Optional[MultiTurnMode] = None,
         return_report: bool = False,
+        merge_strategy: str = "single",
+        update_context: bool = True,
         **kwargs: Any,
     ) -> pd.DataFrame:
+        self._validate_checked_scope(ctx, selected_files or [])
+
         # FOLLOW_UP: reuse the active working DataFrame from the previous turn.
         # `_active_df` is deliberately the current analysis workspace, not always
         # the last output table; aggregation outputs are kept separately so they
@@ -97,21 +102,40 @@ class DataframeLoaderTool(Tool):
         all_dfs: List[pd.DataFrame] = []
         report = LoadResult(df=pd.DataFrame())
 
+        selected_source_count = sum(len(item.get("sheets", [])) for item in selected_files)
+        selected_name_counts = Counter(
+            str(item.get("fileName", "")) for item in selected_files
+        )
         for file_info in selected_files:
+            file_id = str(file_info.get("fileId", ""))
             file_name = file_info.get("fileName", "")
             sheet_names = file_info.get("sheets", [])
             if not file_name:
                 continue
 
-            file_bytes = excel_service.get_file_by_name(ctx.project_id, file_name)
+            file_bytes = (
+                excel_service.get_file_by_id(ctx.project_id, file_id)
+                if file_id
+                else excel_service.get_file_by_name(ctx.project_id, file_name)
+            )
             if not file_bytes:
-                logger.warning("[DataframeLoader] file not found: %s", file_name)
+                logger.warning("[DataframeLoader] file not found: %s (%s)", file_name, file_id)
                 continue
 
-            file_dfs = self._load_sheets(file_bytes, file_name, sheet_names, report=report)
+            source_label = file_name
+            if file_id and selected_name_counts[file_name] > 1:
+                source_label = f"{file_name} [{file_id[:8]}]"
+
+            file_dfs = self._load_sheets(
+                file_bytes,
+                source_label,
+                sheet_names,
+                report=report,
+                annotate_sources=selected_source_count > 1,
+            )
             all_dfs.extend(file_dfs)
             if file_dfs:
-                report.source_files.append(file_name)
+                report.source_files.append(source_label)
 
         if not all_dfs:
             raise ToolError(
@@ -119,21 +143,66 @@ class DataframeLoaderTool(Tool):
                 detail=f"Tried files: {[f.get('fileName') for f in selected_files]}",
             )
 
-        df = self._merge_dfs(all_dfs)
+        df = self._merge_dfs(all_dfs, merge_strategy=merge_strategy)
         report.df = df
         duplicate_columns = df.columns[df.columns.duplicated()].tolist()
         if duplicate_columns:
             report.warnings.append(f"Duplicate column names: {duplicate_columns}")
         # Store in context for FOLLOW_UP access in the next turn.
-        ctx._source_df = df
-        ctx._active_df = df
-        ctx._load_report = report
+        if update_context:
+            ctx._source_df = df
+            ctx._active_df = df
+            ctx._load_report = report
+            ctx.active_source_scope = AnalysisContext.scope_key(selected_files or [])
+            ctx.source_scope_changed = False
         logger.debug(
             "[DataframeLoader] loaded df shape=%s columns=%s",
             df.shape,
             list(df.columns[:5]),
         )
         return report if return_report else df
+
+    @staticmethod
+    def _validate_checked_scope(
+        ctx: AnalysisContext,
+        selected_files: List[Dict[str, Any]],
+    ) -> None:
+        """Reject every physical source that is outside the user's checkboxes."""
+        requested = ctx.requested_sheet_scope
+        if not requested:
+            raise ToolError(
+                "没有勾选任何工作表，无法读取或处理数据。",
+                retryable=False,
+            )
+
+        violations: List[str] = []
+        for selected in selected_files:
+            selected_file_id = str(selected.get("fileId", ""))
+            selected_file_name = str(selected.get("fileName", ""))
+            for sheet in selected.get("sheets", []):
+                sheet_name = str(sheet)
+                allowed = False
+                for scope in requested:
+                    scope_file_id = str(scope.get("fileId", ""))
+                    scope_file_name = str(scope.get("fileName", ""))
+                    same_file = (
+                        selected_file_id == scope_file_id
+                        if selected_file_id and scope_file_id
+                        else bool(selected_file_name and selected_file_name == scope_file_name)
+                    )
+                    if same_file and sheet_name in {
+                        str(value) for value in scope.get("sheets", [])
+                    }:
+                        allowed = True
+                        break
+                if not allowed:
+                    violations.append(f"{selected_file_name} / {sheet_name}")
+
+        if violations:
+            raise ToolError(
+                "以下数据源未勾选，系统不会读取：" + "、".join(violations),
+                retryable=False,
+            )
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -145,6 +214,7 @@ class DataframeLoaderTool(Tool):
         file_name: str,
         sheet_names: List[str],
         report: Optional[LoadResult] = None,
+        annotate_sources: bool = False,
     ) -> List[pd.DataFrame]:
         dfs: List[pd.DataFrame] = []
         try:
@@ -204,6 +274,9 @@ class DataframeLoaderTool(Tool):
                     )
                 original_rows, original_columns = df.shape
                 df = self._clean_df(df)
+                if annotate_sources:
+                    df.insert(0, "__source_sheet", sheet)
+                    df.insert(0, "__source_file", file_name)
                 if report is not None:
                     report.dropped_empty_rows += original_rows - len(df)
                     report.dropped_empty_columns += original_columns - len(df.columns)
@@ -360,17 +433,24 @@ class DataframeLoaderTool(Tool):
         return df.reset_index(drop=True)
 
     @staticmethod
-    def _merge_dfs(dfs: List[pd.DataFrame]) -> pd.DataFrame:
-        """Merge multiple DFs: concat if same columns, else use first."""
+    def _merge_dfs(
+        dfs: List[pd.DataFrame],
+        merge_strategy: str = "single",
+    ) -> pd.DataFrame:
+        """Combine sources only when the semantic plan explicitly requests a union."""
         if len(dfs) == 1:
             return dfs[0]
+        if merge_strategy != "union":
+            raise ToolError(
+                "多个工作表不能自动拼接。请分别提问，或明确说明需要纵向合并。",
+                retryable=False,
+            )
 
-        col_sets = [frozenset(d.columns) for d in dfs]
-        if len(set(col_sets)) == 1:
-            return pd.concat(dfs, ignore_index=True)
-
-        # Columns differ: try to concat anyway (pandas fills missing with NaN)
-        try:
-            return pd.concat(dfs, ignore_index=True)
-        except Exception:
-            return dfs[0]
+        source_columns = {"__source_file", "__source_sheet"}
+        schemas = [tuple(column for column in df.columns if column not in source_columns) for df in dfs]
+        if len(set(schemas)) != 1:
+            raise ToolError(
+                "所选工作表字段结构不同，不能直接纵向合并；请说明关联字段或分别分析。",
+                retryable=False,
+            )
+        return pd.concat(dfs, ignore_index=True)

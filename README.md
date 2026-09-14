@@ -2,7 +2,9 @@
 
 SheetMind is an Excel analysis application for persistent projects, multi-turn questions, structured charts, and reproducible execution traces.
 
-The local web app uses a 30-day anonymous browser session. Projects, tasks, uploaded workbooks, and conversations are restored after refresh or server restart without requiring an account or another upload. Re-uploading identical file content is idempotent; changed content with the same file name replaces the stored workbook.
+The web app uses an anonymous browser session. Projects, tasks, uploaded workbooks, and conversations are restored after refresh or server restart without requiring an account or another upload. Session data expires after `ANONYMOUS_SESSION_TTL_DAYS` days of inactivity and can be deleted immediately from the Anonymous Demo menu. Use 30 days locally and 7 days for a public demo. Every upload remains a separate workbook; repeated names receive desktop-style numeric suffixes.
+
+Uploads support valid `.xlsx` and `.xls` workbooks. Other formats, including `.xlsm` and CSV, are rejected by both the browser and API before persistence.
 
 ## Analysis runtime
 
@@ -14,7 +16,9 @@ atomic step independently extracts operation and output intents. Deterministic
 operation rules select guarded rules, generated pandas code, or insight writing;
 output planning separately selects table, chart, insight, or export-ready results.
 Sheet selection combines workbook metadata with constrained model ranking and
-asks before leaving a user-selected sheet. Semantic typing combines physical
+uses checked Sheets as a hard read boundary. It asks the user to update the
+selection when a better source is unchecked or duplicate checked versions are
+ambiguous. Semantic typing combines physical
 column profiles, deterministic rules, and validated model refinement for
 ambiguous fields. It recognizes period labels and identifier columns, prefers
 qualified metrics such as RMB amounts, and returns validated table, chart, metric, and summary

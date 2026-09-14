@@ -162,9 +162,9 @@ class FieldResolver:
                 else:
                     score -= 55.0
 
-            if info.type == "numeric" and aggregate_only:
-                score += 5.0
             if score > 0:
+                if info.type == "numeric" and aggregate_only:
+                    score += 5.0
                 ranked.append(FieldResolution(
                     column=column,
                     score=score,
@@ -240,9 +240,15 @@ class FieldResolver:
     @staticmethod
     def _mention_matches_group(mention: str, aliases: Iterable[str]) -> bool:
         normalized = normalise_field_text(mention)
-        return bool(normalized) and any(
-            normalized == alias or normalized in alias or alias in normalized
-            for alias in aliases
+        if not normalized:
+            return False
+        normalized_aliases = list(aliases)
+        if normalized in normalized_aliases:
+            return True
+        return any(
+            not re.fullmatch(rf"{re.escape(normalized)}\.\d+", alias)
+            and (normalized in alias or alias in normalized)
+            for alias in normalized_aliases
         )
 
     @staticmethod

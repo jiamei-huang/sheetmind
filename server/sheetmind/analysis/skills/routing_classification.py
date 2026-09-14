@@ -365,6 +365,7 @@ class RoutingClassificationSkill(Skill):
         computational = {
             "aggregate", "top_n", "trend", "pivot", "compare", "chart_data_prep",
             "anomaly_detect", "complex_transform", "advanced_analysis", "numeric_condition",
+            "extreme",
         }
         mixed_compute_insight = bool(
             operations.intersection(computational)
@@ -435,6 +436,7 @@ class RoutingClassificationSkill(Skill):
         computational = {
             "aggregate", "top_n", "trend", "pivot", "chart_data_prep", "compare",
             "anomaly_detect", "complex_transform", "advanced_analysis", "numeric_condition",
+            "extreme",
         }
         hard_computation = computational - {"compare"}
         extreme_complexity = {

@@ -4,11 +4,14 @@
 """
 import base64
 import io
+from pathlib import Path
 from typing import List, Dict, Any
 import pandas as pd
 from sheetmind.logging import get_logger
 
 logger = get_logger("file_uploader")
+
+SUPPORTED_EXCEL_EXTENSIONS = {".xlsx", ".xls"}
 
 
 class FileUploader:
@@ -28,26 +31,13 @@ class FileUploader:
         files_to_process = files or []
 
         for file_upload in files_to_process:
-            try:
-                # 解码base64文件数据
-                file_bytes = base64.b64decode(file_upload.base64)
-
-                # 读取Excel文件获取sheet列表
-                with pd.ExcelFile(io.BytesIO(file_bytes)) as xls:
-                    sheet_names = xls.sheet_names
-
-                file_info_list.append({
-                    "fileName": file_upload.fileName,
-                    "sheets": sheet_names
-                })
-                logger.info(f"成功解析文件: {file_upload.fileName}, 包含 {len(sheet_names)} 个sheet")
-            except Exception as e:
-                # 如果某个文件解析失败，记录错误但继续处理其他文件
-                logger.warning(f"解析文件失败 {file_upload.fileName}: {e}")
-                file_info_list.append({
-                    "fileName": file_upload.fileName,
-                    "sheets": []
-                })
+            file_bytes = self.decode_base64_file(file_upload.base64)
+            sheet_names = self.validate_workbook(file_bytes, file_upload.fileName)
+            file_info_list.append({
+                "fileName": file_upload.fileName,
+                "sheets": sheet_names
+            })
+            logger.info(f"成功解析文件: {file_upload.fileName}, 包含 {len(sheet_names)} 个sheet")
 
         return file_info_list
 
@@ -63,16 +53,32 @@ class FileUploader:
             是否为有效的Excel文件
         """
         try:
-            # 尝试读取Excel文件
-            with pd.ExcelFile(io.BytesIO(file_bytes)) as xls:
-                # 检查是否有至少一个sheet
-                if len(xls.sheet_names) == 0:
-                    logger.warning(f"文件 {file_name} 没有包含任何sheet")
-                    return False
+            self.validate_workbook(file_bytes, file_name)
             return True
-        except Exception as e:
+        except ValueError as e:
             logger.error(f"文件验证失败 {file_name}: {e}")
             return False
+
+    @staticmethod
+    def validate_workbook(file_bytes: bytes, file_name: str) -> List[str]:
+        suffix = Path(file_name).suffix.lower()
+        if suffix not in SUPPORTED_EXCEL_EXTENSIONS:
+            raise ValueError(
+                f"不支持文件“{file_name}”。当前仅支持 Excel 文件"
+                "（.xlsx、.xls）。"
+            )
+        if not file_bytes:
+            raise ValueError(f"文件“{file_name}”为空，无法作为 Excel 工作簿上传。")
+        try:
+            with pd.ExcelFile(io.BytesIO(file_bytes)) as xls:
+                sheet_names = [str(sheet) for sheet in xls.sheet_names]
+        except Exception as exc:
+            raise ValueError(
+                f"文件“{file_name}”不是有效的 Excel 工作簿，或文件已损坏。"
+            ) from exc
+        if not sheet_names:
+            raise ValueError(f"Excel 文件“{file_name}”不包含任何 Sheet。")
+        return sheet_names
 
     def decode_base64_file(self, base64_data: str) -> bytes:
         """
@@ -85,7 +91,7 @@ class FileUploader:
             解码后的文件字节数据
         """
         try:
-            return base64.b64decode(base64_data)
+            return base64.b64decode(base64_data, validate=True)
         except Exception as e:
             logger.error(f"Base64解码失败: {e}")
             raise ValueError(f"无效的base64数据: {e}")

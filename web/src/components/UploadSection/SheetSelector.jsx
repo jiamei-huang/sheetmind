@@ -10,6 +10,7 @@ export default function SheetSelector({
   onConfirm,
   onCancel,
   projectId,
+  fileId,
   fileName,
   onShowToast,
   onShowErrorModal,
@@ -27,7 +28,7 @@ export default function SheetSelector({
 
   const handleOpenPreview = async (sheetName) => {
     // 如果没有 projectId 或 fileName，显示错误
-    if (!projectId || !fileName) {
+    if (!projectId || !fileId || !fileName) {
       console.error("[SheetSelector] Missing projectId or fileName, cannot load preview");
       onShowErrorModal?.({
         title: "预览失败",
@@ -43,6 +44,7 @@ export default function SheetSelector({
     try {
       const response = await previewExcelFile({
         projectId,
+        fileId,
         fileName,
       });
 
@@ -90,31 +92,31 @@ export default function SheetSelector({
   };
 
   return (
-    <div className="bg-[#f5f7fa] rounded-lg border border-gray-200 p-4 space-y-4">
+    <div className="space-y-3 rounded-md bg-slate-50 p-3 sm:p-4">
       <div>
-        <h4 className="text-sm font-semibold text-gray-800">Available Sheets</h4>
-        <p className="text-xs text-gray-500 mt-1">Select one or more sheets to analyze</p>
+        <h4 className="text-sm font-semibold text-slate-800">Available Sheets</h4>
+        <p className="text-xs text-slate-500 mt-1">Select one or more sheets to analyze</p>
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-1 sm:grid-cols-2 sm:gap-x-4">
         {sheetList.map((sheetName) => {
           const isChecked = draftSelectedSheets.includes(sheetName);
           return (
             <div
               key={sheetName}
-              className={`flex items-center justify-between gap-3 rounded-md px-3 py-2 border transition-colors min-h-[56px] sm:min-w-[240px] ${
+              className={`flex min-h-[52px] items-center justify-between gap-3 rounded-md px-3 py-2 transition-colors sm:min-w-[240px] ${
                 isChecked
-                  ? "border-blue-300 bg-blue-50/80 ring-1 ring-blue-200"
-                  : "border-gray-200 bg-white"
+                  ? "bg-blue-50 text-blue-700"
+                  : "hover:bg-white"
               }`}
             >
               <label className={`flex items-center gap-3 text-sm font-medium flex-1 min-w-0 ${
-                isChecked ? "text-blue-600" : "text-gray-700"
+                isChecked ? "text-blue-600" : "text-slate-700"
               }`}>
                 <input
                   type="checkbox"
                   checked={isChecked}
                   onChange={() => onToggleSheet(sheetName)}
-                  className="w-4 h-4 border-gray-300 rounded accent-blue-600 focus:ring-blue-500"
+                  className="w-4 h-4 border-slate-300 rounded accent-blue-600 focus:ring-blue-500"
                 />
                 <span className="truncate block max-w-full" title={sheetName}>
                   {sheetName}
@@ -125,7 +127,7 @@ export default function SheetSelector({
                 type="button"
                 onClick={() => handleOpenPreview(sheetName)}
                 disabled={loadingPreview}
-                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-gray-700 bg-[#f5f7fa] hover:bg-[#e5e7eb] rounded-md transition-colors flex-shrink-0 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+                className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {loadingPreview && loadingSheetName === sheetName ? (
                   <>
@@ -144,14 +146,14 @@ export default function SheetSelector({
         })}
       </div>
 
-      <div className="flex flex-col sm:flex-row sm:justify-end sm:items-center gap-3 pt-2">
+      <div className="flex flex-col gap-2 pt-1 sm:flex-row sm:items-center sm:justify-end">
         <button
           type="button"
           onClick={() => {
             handleClosePreview();
             onCancel?.();
           }}
-          className="px-4 py-2 text-sm font-medium text-gray-600 bg-white border border-gray-200 rounded-md hover:bg-gray-100 transition-colors w-full sm:w-auto"
+          className="px-4 py-2 text-sm font-medium text-slate-600 bg-white border border-slate-200 rounded-md hover:bg-slate-100 transition-colors w-full sm:w-auto"
         >
           Cancel
         </button>

@@ -19,6 +19,16 @@ python3 -m sheetmind
 
 The local database defaults to `server/data/sheetmind.db`. Override it with `SHEETMIND_DB_PATH` when tests or deployments need isolated state.
 
+Anonymous workspaces use a sliding inactivity window. Keep the local default for debugging:
+
+```bash
+ANONYMOUS_SESSION_TTL_DAYS=30
+```
+
+Set `ANONYMOUS_SESSION_TTL_DAYS=7` in the public Demo environment. Expired sessions are deleted with their projects, uploaded workbooks, tasks, conversations, and analysis contexts on the next API request. Deploy the Demo with a fresh database. If a local database contains projects created before session isolation, set `SHEETMIND_CLAIM_LEGACY_PROJECTS=true` for one local migration run only; never enable it in the public Demo.
+
+Set `SHEETMIND_SESSION_COOKIE_SECURE=true` when the public Demo is served over HTTPS.
+
 Run tests and routing evaluations:
 
 ```bash
