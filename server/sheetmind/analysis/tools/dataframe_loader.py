@@ -300,11 +300,16 @@ class DataframeLoaderTool(Tool):
 
     @staticmethod
     def _read_sheet(file_bytes: bytes, sheet: str, header_row: int) -> pd.DataFrame:
+        if MAX_ROWS_PER_SHEET is not None:
+            raise ToolError(
+                "Exact analysis must read the full Sheet; preview row caps cannot be used for computation.",
+                retryable=False,
+            )
         return pd.read_excel(
             io.BytesIO(file_bytes),
             sheet_name=sheet,
             header=header_row,
-            nrows=MAX_ROWS_PER_SHEET,
+            nrows=None,
         )
 
     @staticmethod

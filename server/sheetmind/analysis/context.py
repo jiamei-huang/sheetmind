@@ -275,6 +275,8 @@ class CalculationBasis(BaseModel):
     source_sheets: List[str] = Field(default_factory=list)
     fields: List[str] = Field(default_factory=list)
     operations: List[str] = Field(default_factory=list)
+    source_row_count: Optional[int] = None
+    result_row_count: Optional[int] = None
     summary: str = ""
 
 

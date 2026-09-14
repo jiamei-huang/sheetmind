@@ -109,6 +109,89 @@ test("keeps every table block as a named preview", () => {
   assert.deepEqual(result.preview, result.previews[0]);
 });
 
+test("associates each data preview with its atomic question", () => {
+  const firstTable = {
+    kind: "table",
+    title: "按物流商汇总",
+    columns: ["物流商", "费用金额"],
+    rows: [
+      { 物流商: "A物流", 费用金额: 300 },
+      { 物流商: "B物流", 费用金额: 200 },
+    ],
+  };
+  const secondTable = {
+    kind: "table",
+    title: "按店铺汇总",
+    columns: ["店铺", "费用金额"],
+    rows: [
+      { 店铺: "乐天", 费用金额: 500 },
+      { 店铺: "官网", 费用金额: 100 },
+    ],
+  };
+  const result = toAnalysisViewModel(
+    {
+      type: "result_blocks",
+      blocks: [
+        { kind: "summary", content: "A物流最高" },
+        firstTable,
+        { kind: "summary", content: "乐天最高" },
+        secondTable,
+      ],
+      questions: [
+        {
+          question_id: "q1",
+          query: "哪个物流商花钱最多",
+          status: "success",
+          blocks: [{ kind: "summary", content: "A物流最高" }, firstTable],
+        },
+        {
+          question_id: "q2",
+          query: "哪个店铺物流用的最贵",
+          status: "success",
+          blocks: [{ kind: "summary", content: "乐天最高" }, secondTable],
+        },
+      ],
+    },
+    "两个问题"
+  );
+
+  assert.deepEqual(result.summaryItems.map((item) => item.questionId), ["q1", "q2"]);
+  assert.deepEqual(result.previews.map((preview) => preview.questionId), ["q1", "q2"]);
+  assert.equal(result.previews[0].rows.length, 2);
+  assert.equal(result.previews[1].rows.length, 2);
+});
+
+test("creates three preview tabs for three successful computed questions", () => {
+  const questions = [
+    ["q1", "物流商", "A物流"],
+    ["q2", "店铺", "乐天"],
+    ["q3", "平台", "亚马逊"],
+  ].map(([questionId, dimension, value], index) => {
+    const table = {
+      kind: "table",
+      title: `问题${index + 1}`,
+      columns: [dimension, "费用金额"],
+      rows: [{ [dimension]: value, 费用金额: 300 - index * 10 }],
+    };
+    return {
+      question_id: questionId,
+      query: `问题${index + 1}`,
+      status: "success",
+      blocks: [{ kind: "summary", content: `${value}最高` }, table],
+    };
+  });
+  const blocks = questions.flatMap((question) => question.blocks);
+
+  const result = toAnalysisViewModel(
+    { type: "result_blocks", blocks, questions },
+    "三个并列问题"
+  );
+
+  assert.equal(result.summaryItems.length, 3);
+  assert.equal(result.previews.length, 3);
+  assert.deepEqual(result.previews.map((preview) => preview.questionId), ["q1", "q2", "q3"]);
+});
+
 
 test("keeps every chart block as a named visualization", () => {
   const result = toAnalysisViewModel(
@@ -230,4 +313,8 @@ test("keeps one conclusion per question and full-result artifact ids", () => {
   assert.equal(result.preview.artifactId, "artifact-1");
   assert.equal(result.runId, "run-1");
   assert.equal(result.focusQuestionId, "q2");
+  assert.equal(
+    result.runtimeNote,
+    "Showing 1 of 1,205 result rows. Source rows used for computation are listed under Calculation basis."
+  );
 });

@@ -9,6 +9,9 @@ import pandas as pd
 from ..context import ExecutionStep
 
 
+_CURRENCY_COLUMNS = {"币别", "币种", "货币", "货币类型", "currency", "currencycode"}
+
+
 @dataclass(frozen=True)
 class ExecutionContractDecision:
     valid: bool
@@ -46,11 +49,26 @@ class ExecutionContractValidator:
             ]
             if not candidates:
                 continue
-            values = result_df[candidates[0]].dropna()
-            ordered = (
-                values.is_monotonic_increasing
-                if sort.direction == "asc"
-                else values.is_monotonic_decreasing
+            sort_column = candidates[0]
+            currency_column = next(
+                (
+                    column for column in result_df.columns
+                    if self._normalize_field(str(column)) in _CURRENCY_COLUMNS
+                ),
+                None,
+            )
+            partitions = (
+                [group for _, group in result_df.groupby(currency_column, dropna=False, sort=False)]
+                if currency_column is not None
+                else [result_df]
+            )
+            ordered = all(
+                (
+                    group[sort_column].dropna().is_monotonic_increasing
+                    if sort.direction == "asc"
+                    else group[sort_column].dropna().is_monotonic_decreasing
+                )
+                for group in partitions
             )
             if not ordered:
                 reasons.append(f"result is not {sort.direction} by {candidates[0]!r}")
@@ -64,9 +82,12 @@ class ExecutionContractValidator:
 
     @staticmethod
     def _same_field(left: str, right: str) -> bool:
-        normalize = lambda value: "".join(
+        a = ExecutionContractValidator._normalize_field(left)
+        b = ExecutionContractValidator._normalize_field(right)
+        return bool(a and b and (a == b or a in b or b in a))
+
+    @staticmethod
+    def _normalize_field(value: str) -> str:
+        return "".join(
             character.lower() for character in value if character.isalnum()
         )
-        a = normalize(left)
-        b = normalize(right)
-        return bool(a and b and (a == b or a in b or b in a))

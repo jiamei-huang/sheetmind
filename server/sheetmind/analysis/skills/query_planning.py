@@ -31,6 +31,10 @@ from .routing_classification import (
 logger = logging.getLogger(__name__)
 
 _MAX_PLAN_STEPS = int(_LEVEL_1_THRESHOLDS.get("max_plan_steps", 6))
+_EXPLICIT_LIMIT = re.compile(
+    r"(?:前\s*|top\s*|最高(?:的)?\s*|最低(?:的)?\s*)(\d+)",
+    re.IGNORECASE,
+)
 
 
 class QueryPlan(BaseModel):
@@ -108,7 +112,7 @@ class QueryPlanningSkill(Skill):
             source = "llm"
         except Exception as exc:
             logger.warning("[QueryPlanning] planner fallback: %s", exc)
-            raw_steps = self._rule_decompose(query)
+            raw_steps = self._rule_decompose(query, sheet_catalog=sheet_catalog)
             source = "rule_fallback"
             response_language = inferred_language
             reasoning = f"Deterministic fallback after planner error: {exc}"
@@ -200,7 +204,9 @@ class QueryPlanningSkill(Skill):
             "默认single；只有明确要求纵向合并且字段结构相同才是union；按键关联是join；"
             "分别回答多个Sheet必须拆成独立步骤，不得把compare误写成union。"
             "dimensions是分组维度；metrics包含field、aggregation和可选alias；"
-            "filters包含field/operator/value；sort包含field/direction；limit是Top N数量。\n"
+            "filters包含field/operator/value；sort包含field/direction；limit只用于用户明确给出数字的Top N。"
+            "对于‘哪个最高/最低/最多/最贵’等隐式极值问题，limit必须为null：结论指出极值项，"
+            "但执行结果必须保留用于比较的完整分组排序表。\n"
             "target_fields必须列出步骤使用的精确字段名；如果规划上下文中存在精确列名，"
             "禁止把易仓SKU、平台SKU等不同字段合并成泛称SKU。"
             "scope_from为空、previous_result或前序步骤ID，表示从哪里继承筛选范围；"
@@ -497,9 +503,14 @@ class QueryPlanningSkill(Skill):
             raise ValueError("planner response must be a JSON object")
         return data
 
-    @staticmethod
-    def _rule_decompose(query: str) -> List[Dict[str, Any]]:
-        """Conservative fallback for explicit sequential or parallel clauses."""
+    @classmethod
+    def _rule_decompose(
+        cls,
+        query: str,
+        *,
+        sheet_catalog: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Conservatively split clauses while preserving explicit source scope."""
         marked = query
         for keyword in sorted(_SEQUENCE_KWS, key=len, reverse=True):
             marked = marked.replace(keyword, f"<SEQ>{keyword}")
@@ -510,6 +521,8 @@ class QueryPlanningSkill(Skill):
         pieces = re.split(r"(<SEQ>|<PAR>)", marked)
         raw_steps: List[Dict[str, Any]] = []
         next_dependency = False
+        inherited_source_ids: List[str] = []
+        inherited_source_hints: List[str] = []
         for piece in pieces:
             if piece == "<SEQ>":
                 next_dependency = True
@@ -521,12 +534,63 @@ class QueryPlanningSkill(Skill):
             clause = re.sub(r"^(?:先|然后|接着|随后|最后)", "", clause).strip()
             if len(clause) < 2:
                 continue
+            named_sources = cls._sources_named_in_clause(clause, sheet_catalog or [])
+            if named_sources:
+                inherited_source_ids = [
+                    str(candidate.get("candidateId", ""))
+                    for candidate in named_sources
+                    if str(candidate.get("candidateId", ""))
+                ]
+                inherited_source_hints = list(dict.fromkeys(
+                    str(candidate.get("sheetName", ""))
+                    for candidate in named_sources
+                    if str(candidate.get("sheetName", ""))
+                ))
             step_id = f"s{len(raw_steps) + 1}"
             dependencies = [raw_steps[-1]["id"]] if raw_steps and next_dependency else []
-            raw_steps.append({"id": step_id, "query": clause, "depends_on": dependencies})
+            raw_steps.append({
+                "id": step_id,
+                "query": clause,
+                "depends_on": dependencies,
+                "semantics": QuerySemantics(
+                    source_hints=list(inherited_source_hints),
+                    source_candidate_ids=list(inherited_source_ids),
+                ),
+            })
             next_dependency = False
 
         return raw_steps[:_MAX_PLAN_STEPS]
+
+    @staticmethod
+    def _sources_named_in_clause(
+        clause: str,
+        sheet_catalog: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Return exact Sheet-name matches; duplicate workbook versions stay ambiguous."""
+        normalized_clause = re.sub(
+            r"[\s_\-（）()【】\[\]{}.,，。:：]",
+            "",
+            str(clause).lower(),
+        )
+        matches: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in sheet_catalog:
+            sheet_name = str(candidate.get("sheetName", "")).strip()
+            normalized_sheet = re.sub(
+                r"[\s_\-（）()【】\[\]{}.,，。:：]",
+                "",
+                sheet_name.lower(),
+            )
+            candidate_id = str(candidate.get("candidateId", ""))
+            if (
+                len(normalized_sheet) >= 2
+                and normalized_sheet in normalized_clause
+                and candidate_id
+                and candidate_id not in seen
+            ):
+                matches.append(candidate)
+                seen.add(candidate_id)
+        return matches
 
     async def _route_steps(
         self,
@@ -579,6 +643,15 @@ class QueryPlanningSkill(Skill):
             semantics = raw.get("semantics")
             if not isinstance(semantics, QuerySemantics):
                 semantics = QuerySemantics()
+            # For an implicit extreme ("which is highest"), the limit belongs
+            # to the prose conclusion, not to the evidence table. Keep every
+            # grouped candidate so the user can verify how the winner was found.
+            if (
+                "extreme" in operations
+                and semantics.limit is not None
+                and _EXPLICIT_LIMIT.search(raw["query"]) is None
+            ):
+                semantics = semantics.model_copy(update={"limit": None})
             if dependencies:
                 question_id = question_by_step.get(dependencies[0], f"q{question_count or 1}")
             else:

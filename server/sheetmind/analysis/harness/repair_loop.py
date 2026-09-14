@@ -181,6 +181,12 @@ class RepairLoop:
                     query,
                     df,
                 )
+            if field_error is None:
+                field_error = CodeGenerationSkill.validate_extreme_evidence(
+                    code,
+                    query,
+                    semantics,
+                )
             if field_error:
                 logger.warning("[RepairLoop] field contract failed attempt=%d: %s", attempt + 1, field_error)
                 if trace:

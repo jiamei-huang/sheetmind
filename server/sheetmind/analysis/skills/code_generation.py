@@ -222,6 +222,15 @@ class CodeGenerationSkill(Skill):
                 "禁止自行更换字段、Sheet 语义或聚合方式。"
             )
 
+        if self._requires_complete_extreme_evidence(query, semantics):
+            parts.append(
+                "【极值证据表约束】\n"
+                "这是隐式最高/最低类问题。result_df 必须返回完整的分组排序结果，"
+                "让结论可核验；禁止只保留最高或最低的1行，禁止使用 head(1)、"
+                "nlargest(1)、nsmallest(1) 或 idxmax/idxmin 裁掉其余分组。"
+                "只有用户明确要求数字 Top N 时才能按该数字截取。"
+            )
+
         currency_policy = self._currency_safety_policy(query, df)
         if currency_policy is not None:
             currencies = "、".join(currency_policy.currencies)
@@ -287,6 +296,25 @@ class CodeGenerationSkill(Skill):
 
         return "\n\n".join(parts)
 
+    @staticmethod
+    def _requires_complete_extreme_evidence(
+        query: str,
+        semantics: Optional[QuerySemantics],
+    ) -> bool:
+        if semantics is not None and semantics.limit is not None:
+            return False
+        q_lower = query.lower()
+        extreme_terms = (
+            "最高", "最低", "最多", "最少", "最大", "最小", "最贵", "最便宜",
+            "highest", "lowest", "most", "least", "maximum", "minimum",
+        )
+        explicit_limit = re.search(
+            r"(?:前\s*|top\s*|最高(?:的)?\s*|最低(?:的)?\s*)(\d+)",
+            q_lower,
+            re.IGNORECASE,
+        )
+        return any(term in q_lower for term in extreme_terms) and explicit_limit is None
+
     # ------------------------------------------------------------------
     # Post-processing
     # ------------------------------------------------------------------
@@ -330,6 +358,43 @@ class CodeGenerationSkill(Skill):
             f"{missing!r}。请让这些精确列名参与筛选、分组、排序或计算，"
             "不能只把列名写在无关变量或输出标签中。"
         )
+
+    @classmethod
+    def validate_extreme_evidence(
+        cls,
+        code: str,
+        query: str,
+        semantics: Optional[QuerySemantics],
+    ) -> Optional[str]:
+        """Reject generated code that collapses implicit extrema to one winner."""
+        if not cls._requires_complete_extreme_evidence(query, semantics):
+            return None
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None
+
+        truncating_calls = {"head", "tail", "nlargest", "nsmallest", "idxmax", "idxmin"}
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in truncating_calls
+            ):
+                return (
+                    "极值证据约束失败：隐式最高/最低问题必须在 result_df 中保留完整的"
+                    "分组排序结果，不能只截取极值行。结论层会从完整结果中指出最高或最低项。"
+                )
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "iloc"
+            ):
+                return (
+                    "极值证据约束失败：隐式最高/最低问题不能通过 iloc 截取极值行；"
+                    "result_df 必须保留完整的分组排序结果。"
+                )
+        return None
 
     @classmethod
     def validate_currency_safety(
@@ -513,7 +578,14 @@ class CodeGenerationSkill(Skill):
                     if variable is None:
                         continue
                     if isinstance(target, ast.Name):
-                        lineage[variable] = (set(columns), set(dependencies))
+                        next_columns = set(columns)
+                        next_dependencies = set(dependencies)
+                        if variable in next_dependencies and variable in lineage:
+                            prior_columns, prior_dependencies = lineage[variable]
+                            next_columns.update(prior_columns)
+                            next_dependencies.remove(variable)
+                            next_dependencies.update(prior_dependencies)
+                        lineage[variable] = (next_columns, next_dependencies)
                     else:
                         prior_columns, prior_dependencies = lineage.get(variable, (set(), set()))
                         lineage[variable] = (

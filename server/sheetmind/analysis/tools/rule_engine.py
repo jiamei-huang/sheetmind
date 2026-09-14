@@ -74,11 +74,10 @@ _EXTREME_MIN_KWS = ["最低", "最少", "最小", "最便宜", "费用低", "花
 _EXTREME_SUBJECT_KWS = ["哪个", "哪些", "哪家", "哪一个", "哪类", "哪种", "who", "which"]
 _SHARE_KWS = ["占比", "比例", "份额", "percent", "percentage", "ratio", "share"]
 _AVERAGE_KWS = ["平均", "均值", "avg", "average", "mean"]
-_SINGULAR_SUBJECT_KWS = ["哪个", "哪家", "哪一个", "哪类", "哪种", "who", "which"]
 
 _MONEY_QUERY_KWS = [
     "尾程花费", "仓储费", "物流费", "尾程费", "运费", "花费", "花钱", "花的",
-    "费用", "金额", "成本", "cost", "spend", "expense", "amount",
+    "物流用", "费用", "金额", "成本", "最贵", "cost", "spend", "expense", "amount",
 ]
 _MONEY_COL_KWS = ["费用金额", "人民币金额", "金额", "花费", "费用", "成本", "销售额", "收入", "amount", "cost", "expense"]
 
@@ -309,9 +308,8 @@ class RuleEngineTool(Tool):
             return grouped.head(max(1, int(top_n_match.group(1))))
         if "哪些" in q_lower:
             superlative = any(kw in q_lower for kw in ["最高", "最多", "最大", "最贵", "最低", "最少", "最小"])
-            if superlative and not grouped.empty:
-                best = grouped.iloc[0][value_col]
-                return grouped[grouped[value_col] == best]
+            if superlative:
+                return grouped
             if not grouped.empty:
                 benchmark = grouped[value_col].mean()
                 return grouped[
@@ -319,9 +317,7 @@ class RuleEngineTool(Tool):
                     if ascending
                     else grouped[value_col] >= benchmark
                 ]
-        if any(kw in q_lower for kw in _SINGULAR_SUBJECT_KWS):
-            return grouped.head(1)
-        return grouped.head(20)
+        return grouped
 
     @classmethod
     def _aggregate_extreme_by_currency(
@@ -375,10 +371,7 @@ class RuleEngineTool(Tool):
                 for kw in ["最高", "最多", "最大", "最贵", "最低", "最少", "最小"]
             )
             if superlative:
-                best = grouped.groupby(currency_col)[value_col].transform(
-                    "min" if ascending else "max"
-                )
-                return grouped[grouped[value_col] == best]
+                return grouped
             benchmark = grouped.groupby(currency_col)[value_col].transform("mean")
             return grouped[
                 grouped[value_col] <= benchmark
@@ -386,9 +379,7 @@ class RuleEngineTool(Tool):
                 else grouped[value_col] >= benchmark
             ]
 
-        if any(kw in q_lower for kw in _SINGULAR_SUBJECT_KWS):
-            return grouped.groupby(currency_col, sort=False, group_keys=False).head(1)
-        return grouped.groupby(currency_col, sort=False, group_keys=False).head(20)
+        return grouped
 
     @staticmethod
     def _find_group_column(

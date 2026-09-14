@@ -728,6 +728,11 @@ class SheetMindAgent:
                     chart_block=question_charts[0] if question_charts else None,
                     table_block=table_block,
                     response_language=response_language,
+                    source_row_count=(
+                        evidence_step.execution_report.source_rows
+                        if evidence_step.execution_report is not None
+                        else None
+                    ),
                 )
                 if summary_text and step_output_plan.include_summary:
                     question_blocks.append(SummaryBlock(content=summary_text))
@@ -2319,14 +2324,32 @@ class SheetMindAgent:
             zh="结果字段",
         )
         operation_text = ", ".join(operations)
+        source_row_count = report.source_rows if report is not None else None
+        result_row_count = len(result_df)
+        row_text = user_text(
+            response_language,
+            en=(
+                f" Read {source_row_count:,} source rows and produced "
+                f"{result_row_count:,} result rows."
+                if source_row_count is not None
+                else f" Produced {result_row_count:,} result rows."
+            ),
+            zh=(
+                f"读取 {source_row_count:,} 行源数据，得到 {result_row_count:,} 行计算结果。"
+                if source_row_count is not None
+                else f"得到 {result_row_count:,} 行计算结果。"
+            ),
+        )
         return CalculationBasis(
             source_sheets=source_sheets,
             fields=fields,
             operations=operations,
+            source_row_count=source_row_count,
+            result_row_count=result_row_count,
             summary=user_text(
                 response_language,
-                en=f"Based on {source_text}, using {field_text}, with {operation_text}.",
-                zh=f"基于 {source_text}，使用 {field_text}，执行了 {operation_text}。",
+                en=f"Based on {source_text}, using {field_text}, with {operation_text}.{row_text}",
+                zh=f"基于 {source_text}，使用 {field_text}，执行了 {operation_text}。{row_text}",
             ),
         )
 

@@ -32,6 +32,7 @@ import {
   MAX_ANALYSIS_QUERY_LENGTH,
 } from "../../constants/analysis";
 import { hasExpandableResultContent } from "../../utils/conversationDisplay";
+import { buildPaginationState } from "../../utils/pagination";
 
 const RechartsVisualization = lazy(() => import("./RechartsVisualization"));
 const AnalysisMarkdown = lazy(() => import("./AnalysisMarkdown"));
@@ -424,12 +425,17 @@ const TaskContentPanel = ({
     });
 
     const totalsFromResult = preview?.totals ?? {};
-    const totalRowsProcessed = preview?.totalRowCount ?? previewRows.length;
-    const isPreviewTruncated = totalRowsProcessed > previewRows.length;
+    const totalResultRows = preview?.totalRowCount ?? previewRows.length;
+    const isPreviewTruncated = totalResultRows > previewRows.length;
 
     const rowsPerPage = uiState.pageSize ?? 10;
-    const totalPages = Math.max(1, Math.ceil(previewRows.length / rowsPerPage));
-    const safeCurrentPage = Math.min(uiState.currentPage ?? 1, totalPages);
+    const resultPagination = buildPaginationState(
+      previewRows.length,
+      rowsPerPage,
+      uiState.currentPage ?? 1
+    );
+    const totalPages = resultPagination.totalPages;
+    const safeCurrentPage = resultPagination.currentPage;
     const startIndex = (safeCurrentPage - 1) * rowsPerPage;
     const paginatedRows = previewRows.slice(startIndex, startIndex + rowsPerPage);
     const paginationRange = buildPaginationRange(safeCurrentPage, totalPages, 2);
@@ -461,20 +467,18 @@ const TaskContentPanel = ({
     const activeVisualizationMode = isChartDataView ? "data" : activeChartType;
     const chartDataRows = buildChartDataRows(chartData);
     const chartDataPageSize = uiState.chartDataPageSize || 25;
-    const chartDataTotalPages = Math.max(
-      1,
-      Math.ceil(chartDataRows.length / chartDataPageSize)
+    const chartDataPagination = buildPaginationState(
+      chartDataRows.length,
+      chartDataPageSize,
+      uiState.chartDataPage || 1
     );
-    const chartDataPage = Math.min(
-      Math.max(uiState.chartDataPage || 1, 1),
-      chartDataTotalPages
-    );
+    const chartDataTotalPages = chartDataPagination.totalPages;
+    const chartDataPage = chartDataPagination.currentPage;
     const chartDataStartIndex = (chartDataPage - 1) * chartDataPageSize;
     const paginatedChartRows = chartDataRows.slice(
       chartDataStartIndex,
       chartDataStartIndex + chartDataPageSize
     );
-    const showChartDataPagination = chartDataTotalPages > 1;
     const chartXAxisLabel = chartData?.xAxisLabel?.trim() || "Category";
     const chartDisplayState = buildChartDisplayData(
       chartData,
@@ -562,7 +566,7 @@ const TaskContentPanel = ({
                     {preview.title || "Data Preview"}
                   </h5>
                   <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
-                    <span>Total Rows Processed: {totalRowsProcessed.toLocaleString()}</span>
+                    <span>Result rows: {totalResultRows.toLocaleString()}</span>
                     {isPreviewTruncated && (
                       <span className="inline-flex items-center gap-1 rounded bg-amber-50 px-2 py-0.5 text-amber-700 border border-amber-100">
                         <Database className="w-3 h-3" />
@@ -582,7 +586,7 @@ const TaskContentPanel = ({
               </div>
               {((availablePreviews.length === 1 && runtimeNote) || isPreviewTruncated) && (
                 <div className="bg-amber-50 px-4 py-2 text-xs leading-5 text-amber-800">
-                  {(availablePreviews.length === 1 && runtimeNote) || "The backend analyzes the full dataset. This table shows preview rows to keep the page responsive."}
+                  {(availablePreviews.length === 1 && runtimeNote) || "This table shows a preview of the computed result. Source rows used for computation are listed under Calculation basis."}
                 </div>
               )}
               {preview.calculationBasis?.summary && (
@@ -602,6 +606,16 @@ const TaskContentPanel = ({
                     <dd className="break-words text-slate-700">{preview.calculationBasis.fields?.join(", ") || "Result fields"}</dd>
                     <dt className="font-medium text-slate-500">Method</dt>
                     <dd className="break-words text-slate-700">{preview.calculationBasis.operations?.join(", ") || "Data processing"}</dd>
+                    {(preview.calculationBasis.source_row_count != null || preview.calculationBasis.result_row_count != null) && (
+                      <>
+                        <dt className="font-medium text-slate-500">Rows</dt>
+                        <dd className="break-words text-slate-700">
+                          {preview.calculationBasis.source_row_count?.toLocaleString() ?? "Unknown"} source
+                          {" → "}
+                          {preview.calculationBasis.result_row_count?.toLocaleString() ?? preview.totalRowCount.toLocaleString()} result
+                        </dd>
+                      </>
+                    )}
                   </dl>
                 </details>
               )}
@@ -660,7 +674,7 @@ const TaskContentPanel = ({
                 </table>
               </div>
 
-              {totalPages > 1 && (
+              {resultPagination.showPageSize && (
               <div className="flex flex-col gap-3 border-t border-slate-100 bg-slate-50/60 px-4 py-3 md:flex-row md:items-center md:justify-between">
                 <div className="flex flex-col sm:flex-row sm:items-center gap-3">
                   <label className="flex items-center gap-2 text-xs font-medium text-slate-600">
@@ -679,6 +693,7 @@ const TaskContentPanel = ({
                     </select>
                   </label>
                 </div>
+                {resultPagination.showNavigation && (
                 <div className="flex items-center gap-1">
                   <button
                     type="button"
@@ -719,6 +734,7 @@ const TaskContentPanel = ({
                     <ChevronRight className="w-4 h-4" />
                   </button>
                 </div>
+                )}
               </div>
               )}
             </div>
@@ -904,7 +920,7 @@ const TaskContentPanel = ({
                       </table>
                     </div>
 
-                    {showChartDataPagination && (
+                    {chartDataPagination.showPageSize && (
                       <div className="flex flex-col gap-3 border-t border-slate-100 bg-slate-50 px-4 py-3 md:flex-row md:items-center md:justify-between">
                         <div className="flex flex-col sm:flex-row sm:items-center gap-3">
                           <label className="flex items-center gap-2 text-xs font-medium text-slate-600">
@@ -928,6 +944,7 @@ const TaskContentPanel = ({
                           </p>
                         </div>
 
+                        {chartDataPagination.showNavigation && (
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
@@ -951,6 +968,7 @@ const TaskContentPanel = ({
                             <ChevronRight className="w-4 h-4" />
                           </button>
                         </div>
+                        )}
                       </div>
                     )}
                   </div>

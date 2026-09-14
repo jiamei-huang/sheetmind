@@ -15,6 +15,7 @@ them as readable conversation replies.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -65,6 +66,7 @@ class InsightWritingSkill(Skill):
         table_block: Optional[TableBlock] = None,
         result_sets: Optional[List[tuple[str, pd.DataFrame]]] = None,
         response_language: Optional[ResponseLanguage] = None,
+        source_row_count: Optional[int] = None,
         **kwargs: Any,
     ) -> str:
         provider = self.router.get_provider(ModelRole.INSIGHT_WRITING)
@@ -78,7 +80,13 @@ class InsightWritingSkill(Skill):
             user_msg = self._text_insight_prompt(query, result_df, ctx, language)
         else:
             # "processing" — brief description
-            user_msg = self._processing_prompt(query, result_df, table_block, language)
+            user_msg = self._processing_prompt(
+                query,
+                result_df,
+                table_block,
+                language,
+                source_row_count=source_row_count,
+            )
 
         try:
             text = await provider.complete(
@@ -87,17 +95,24 @@ class InsightWritingSkill(Skill):
                 max_tokens=512,
                 temperature=0.3,
             )
-            return text.strip()
+            summary = text.strip()
         except Exception as exc:
             logger.warning("[InsightWriting] LLM failed: %s", exc)
             # Graceful degradation — build a minimal rule-based summary
-            return self._fallback_summary(
+            summary = self._fallback_summary(
                 scenario,
                 result_df,
                 chart_block,
                 result_sets=result_sets,
                 response_language=language,
+                query=query,
             )
+        return self._clarify_ambiguous_row_count_claims(
+            summary,
+            source_row_count=source_row_count,
+            result_row_count=len(result_df) if result_df is not None else None,
+            response_language=language,
+        )
 
     # ------------------------------------------------------------------
     # Prompt builders
@@ -109,6 +124,8 @@ class InsightWritingSkill(Skill):
         result_df: Optional[pd.DataFrame],
         table_block: Optional[TableBlock],
         response_language: ResponseLanguage = "en",
+        *,
+        source_row_count: Optional[int] = None,
     ) -> str:
         rows = len(result_df) if result_df is not None else (len(table_block.rows) if table_block else 0)
         cols = list(result_df.columns[:5]) if result_df is not None else (table_block.columns[:5] if table_block else [])
@@ -139,12 +156,62 @@ class InsightWritingSkill(Skill):
 
         return (
             f"User query: {query}\n"
-            f"Processed result: {rows} rows, columns: {cols}"
+            f"Source rows used for computation: {source_row_count if source_row_count is not None else 'unknown'}\n"
+            f"Computed result rows: {rows}; columns: {cols}"
             f"\n\nComputed facts:\n{InsightWritingSkill._facts_block(result_df)}"
             f"{data_str}{currency_instruction}\n\n"
             f"Write one concise sentence in {language_name(response_language)} explaining the key finding, such as the highest or lowest item. "
-            "Only mention names that appear in the computed data."
+            "Only mention names that appear in the computed data. "
+            "Never describe the computed result row count as the Sheet row count or as the number of source rows analyzed. "
+            "If row counts are useful, explicitly label both the source rows used for computation and the computed result rows."
         )
+
+    @staticmethod
+    def _clarify_ambiguous_row_count_claims(
+        summary: str,
+        *,
+        source_row_count: Optional[int],
+        result_row_count: Optional[int],
+        response_language: ResponseLanguage,
+    ) -> str:
+        """Prevent an aggregate result size from being presented as source size."""
+        if (
+            not summary
+            or source_row_count is None
+            or result_row_count is None
+            or source_row_count == result_row_count
+        ):
+            return summary
+
+        source_label = f"{source_row_count:,}"
+        result_label = f"{result_row_count:,}"
+        if response_language == "zh":
+            pattern = re.compile(
+                rf"[^，。；;\n]{{0,80}}?(?:共|共有|总共|共计|总计)\s*{result_row_count:,}\s*(?:行|条(?:记录|数据)?)",
+                re.IGNORECASE,
+            )
+            match = pattern.search(summary)
+            if match and not any(
+                marker in match.group(0)
+                for marker in ("计算结果", "聚合结果", "查询结果", "输出结果")
+            ):
+                replacement = (
+                    f"基于 {source_label} 行源数据计算，得到 {result_label} 行计算结果"
+                )
+                return pattern.sub(replacement, summary, count=1)
+            return summary
+
+        pattern = re.compile(
+            rf"[^.;\n]{{0,80}}?(?:contains|has|with|processed|total(?:s)?)\s*{result_row_count:,}\s+rows?",
+            re.IGNORECASE,
+        )
+        match = pattern.search(summary)
+        if match and "result" not in match.group(0).lower():
+            replacement = (
+                f"Computed from {source_label} source rows into {result_label} result rows"
+            )
+            return pattern.sub(replacement, summary, count=1)
+        return summary
 
     @staticmethod
     def _multi_result_prompt(
@@ -328,6 +395,7 @@ class InsightWritingSkill(Skill):
         chart_block: Optional[ChartBlock],
         result_sets: Optional[List[tuple[str, pd.DataFrame]]] = None,
         response_language: ResponseLanguage = "en",
+        query: str = "",
     ) -> str:
         if scenario == "multi_result" and result_sets:
             lines: List[str] = []
@@ -371,6 +439,44 @@ class InsightWritingSkill(Skill):
                 en="The chart is ready.",
                 zh="图表已生成。",
             )
+
+        if result_df is not None and not result_df.empty:
+            q_lower = query.lower()
+            extreme_terms = (
+                "最高", "最低", "最多", "最少", "最大", "最小", "最贵", "最便宜",
+                "highest", "lowest", "most", "least", "maximum", "minimum",
+            )
+            if any(term in q_lower for term in extreme_terms):
+                numeric_columns = list(result_df.select_dtypes(include="number").columns)
+                currency_column = InsightWritingSkill._currency_column(result_df)
+                label_columns = [
+                    str(column) for column in result_df.columns
+                    if column not in numeric_columns and str(column) != currency_column
+                ]
+                if numeric_columns and label_columns:
+                    metric = str(numeric_columns[-1])
+                    label = label_columns[-1]
+                    groups = (
+                        result_df.groupby(currency_column, dropna=False, sort=False)
+                        if currency_column is not None
+                        else [(None, result_df)]
+                    )
+                    findings = []
+                    for currency, frame in groups:
+                        if frame.empty:
+                            continue
+                        row = frame.iloc[0]
+                        value = row[metric]
+                        formatted = f"{value:,.2f}" if isinstance(value, (int, float)) else str(value)
+                        if response_language == "zh":
+                            prefix = f"{currency}下，" if currency_column is not None else ""
+                            findings.append(f"{prefix}{metric}最高的是{row[label]}（{formatted}）")
+                        else:
+                            prefix = f"For {currency}, " if currency_column is not None else ""
+                            findings.append(f"{prefix}{row[label]} has the highest {metric} ({formatted})")
+                    if findings:
+                        separator = "；" if response_language == "zh" else "; "
+                        return separator.join(findings) + ("。" if response_language == "zh" else ".")
 
         if result_df is not None:
             return user_text(

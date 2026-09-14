@@ -32,8 +32,10 @@ from sheetmind.analysis.context import (
     AnalysisContext,
     ChartBlock,
     ChartSeries,
+    ExecutionReport,
     ExecutionStep,
     MultiTurnMode,
+    QuestionResult,
     QuerySemantics,
     ResultBlocks,
     ResultLineage,
@@ -491,6 +493,100 @@ class TestRoutingClassificationSkill:
 # ---------------------------------------------------------------------------
 
 class TestQueryPlanningSkill:
+    def test_three_parallel_questions_receive_three_question_ids(self):
+        response = """{
+          "mode": "new",
+          "response_language": "zh",
+          "steps": [
+            {"query": "按物流商汇总费用", "depends_on": [], "needs_new_computation": true},
+            {"query": "按店铺汇总费用", "depends_on": [], "needs_new_computation": true},
+            {"query": "按平台汇总费用", "depends_on": [], "needs_new_computation": true}
+          ],
+          "confidence": 0.9
+        }"""
+        router = MockRouter(response)
+        planning_skill = QueryPlanningSkill(
+            router,
+            RoutingClassificationSkill(router),
+        )
+        query = "哪个物流商花钱最多。哪个店铺最贵。哪个平台费用最高"
+
+        plan = run(planning_skill.run(
+            make_ctx(),
+            query,
+            force_semantic_planning=True,
+        ))
+
+        assert len(plan.steps) == 3
+        assert [step.question_id for step in plan.steps] == ["q1", "q2", "q3"]
+        assert [step.depends_on for step in plan.steps] == [[], [], []]
+
+    def test_implicit_extreme_preserves_complete_ranked_evidence(self):
+        response = """{
+          "mode": "new",
+          "response_language": "zh",
+          "steps": [{
+            "query": "尾程表中按物流商汇总费用金额，找出花钱最多的物流商",
+            "depends_on": [],
+            "input_source": "source",
+            "target_fields": ["物流商", "费用金额"],
+            "needs_new_computation": true,
+            "semantics": {
+              "dimensions": ["物流商"],
+              "metrics": [{"field": "费用金额", "aggregation": "sum"}],
+              "sort": [{"field": "费用金额", "direction": "desc"}],
+              "limit": 1
+            }
+          }],
+          "confidence": 0.9
+        }"""
+        router = MockRouter(response)
+        planning_skill = QueryPlanningSkill(
+            router,
+            RoutingClassificationSkill(router),
+        )
+
+        plan = run(planning_skill.run(
+            make_ctx(),
+            "尾程表哪个物流商花钱最多",
+            force_semantic_planning=True,
+        ))
+
+        assert plan.steps[0].semantics.limit is None
+
+    def test_explicit_top_n_keeps_requested_limit(self):
+        response = """{
+          "mode": "new",
+          "response_language": "zh",
+          "steps": [{
+            "query": "尾程表费用最高的前2个物流商",
+            "depends_on": [],
+            "input_source": "source",
+            "target_fields": ["物流商", "费用金额"],
+            "needs_new_computation": true,
+            "semantics": {
+              "dimensions": ["物流商"],
+              "metrics": [{"field": "费用金额", "aggregation": "sum"}],
+              "sort": [{"field": "费用金额", "direction": "desc"}],
+              "limit": 2
+            }
+          }],
+          "confidence": 0.9
+        }"""
+        router = MockRouter(response)
+        planning_skill = QueryPlanningSkill(
+            router,
+            RoutingClassificationSkill(router),
+        )
+
+        plan = run(planning_skill.run(
+            make_ctx(),
+            "尾程表费用最高的前2个物流商",
+            force_semantic_planning=True,
+        ))
+
+        assert plan.steps[0].semantics.limit == 2
+
     def test_decomposes_dependent_mixed_route_query(self):
         response = """{
           "steps": [
@@ -850,6 +946,64 @@ class TestQueryPlanningSkill:
         ]
         assert [step.depends_on for step in plan.steps] == [[], []]
 
+    def test_rule_fallback_inherits_one_explicit_sheet_across_parallel_questions(self):
+        router = MockRouter('{"unexpected": true}')
+        routing_skill = RoutingClassificationSkill(router)
+        planning_skill = QueryPlanningSkill(router, routing_skill)
+        ctx = make_ctx()
+        ctx.requested_sheet_scope = [{
+            "fileId": "costs",
+            "fileName": "costs.xlsx",
+            "sheets": ["尾程", "仓储"],
+        }]
+        catalog = [
+            {
+                "candidateId": "costs::尾程",
+                "fileId": "costs",
+                "fileName": "costs.xlsx",
+                "sheetName": "尾程",
+                "columns": ["物流商", "店铺", "费用金额"],
+            },
+            {
+                "candidateId": "costs::仓储",
+                "fileId": "costs",
+                "fileName": "costs.xlsx",
+                "sheetName": "仓储",
+                "columns": ["物流商", "店铺", "费用金额"],
+            },
+        ]
+        query = "尾程表哪个物流商花钱最多。哪个店铺物流用的最贵"
+
+        routing = run(routing_skill.run(ctx, query))
+        plan = run(planning_skill.run(
+            ctx,
+            query,
+            routing=routing,
+            sheet_catalog=catalog,
+        ))
+
+        assert plan.source == "rule_fallback"
+        assert [step.semantics.source_candidate_ids for step in plan.steps] == [
+            ["costs::尾程"],
+            ["costs::尾程"],
+        ]
+
+    def test_rule_fallback_switches_sheet_when_a_later_clause_names_one(self):
+        catalog = [
+            {"candidateId": "costs::尾程", "sheetName": "尾程"},
+            {"candidateId": "costs::仓储", "sheetName": "仓储"},
+        ]
+
+        steps = QueryPlanningSkill._rule_decompose(
+            "尾程表哪个物流商最高。仓储表哪个平台最高",
+            sheet_catalog=catalog,
+        )
+
+        assert [step["semantics"].source_candidate_ids for step in steps] == [
+            ["costs::尾程"],
+            ["costs::仓储"],
+        ]
+
     def test_llm_plan_cannot_drop_qualified_field(self):
         response = """{
           "steps": [
@@ -966,6 +1120,20 @@ class TestRuleEngineTool:
         assert result.iloc[0]["费用金额"] == pytest.approx(1281015.0)
         assert "速卖通" not in result.columns
 
+    def test_implicit_extreme_returns_every_group_as_ranked_evidence(self):
+        df = pd.DataFrame({
+            "物流商": ["A物流", "A物流", "B物流", "C物流"],
+            "费用金额": [100.0, 200.0, 250.0, 50.0],
+        })
+
+        result = self.tool.run(self.ctx, query="哪个物流商花钱最多", df=df)
+
+        assert result.to_dict("records") == [
+            {"物流商": "A物流", "费用金额": 300.0},
+            {"物流商": "B物流", "费用金额": 250.0},
+            {"物流商": "C物流", "费用金额": 50.0},
+        ]
+
     @pytest.mark.parametrize(
         "query,group_column,expected_name",
         [
@@ -1016,10 +1184,10 @@ class TestRuleEngineTool:
             df=df,
         )
 
-        assert result.to_dict("records") == [{
-            "物流商": "日本海外仓",
-            "费用金额": 2569359.2,
-        }]
+        assert result.to_dict("records") == [
+            {"物流商": "日本海外仓", "费用金额": 2569359.2},
+            {"物流商": "顺丰", "费用金额": 49862.72},
+        ]
 
     def test_storage_sheet_extreme_does_not_mix_currencies_or_filter_to_one_fee_label(self):
         self.ctx.selected_sheets = ["仓储"]
@@ -1039,6 +1207,7 @@ class TestRuleEngineTool:
         assert list(result.columns) == ["币别", "平台", "费用金额"]
         assert result.to_dict("records") == [
             {"币别": "日元", "平台": "乐天", "费用金额": 259640.0},
+            {"币别": "日元", "平台": "日本官网", "费用金额": 204777.0},
             {"币别": "欧元", "平台": "德国官网", "费用金额": 4000.0},
             {"币别": "美元", "平台": "美国官网", "费用金额": 5000.0},
             {"币别": "英镑", "平台": "英国官网", "费用金额": 3000.0},
@@ -1059,10 +1228,10 @@ class TestRuleEngineTool:
             df=df,
         )
 
-        assert result.to_dict("records") == [{
-            "平台": "美国亚马逊",
-            "费用金额": 7000.0,
-        }]
+        assert result.to_dict("records") == [
+            {"平台": "美国亚马逊", "费用金额": 7000.0},
+            {"平台": "美国官网", "费用金额": 5000.0},
+        ]
 
     def test_storage_fee_wording_does_not_treat_numeric_month_as_amount(self):
         self.ctx.selected_sheets = ["仓储"]
@@ -1078,10 +1247,29 @@ class TestRuleEngineTool:
             df=df,
         )
 
-        assert result.to_dict("records") == [{
-            "平台": "乐天",
-            "费用金额": 259640.0,
-        }]
+        assert result.to_dict("records") == [
+            {"平台": "乐天", "费用金额": 259640.0},
+            {"平台": "美国官网", "费用金额": 5000.0},
+        ]
+
+    def test_colloquial_logistics_cost_does_not_treat_numeric_month_as_amount(self):
+        df = pd.DataFrame({
+            "月份": [202612, 202612, 202612],
+            "店铺": ["乐天", "乐天", "官网"],
+            "费用金额": [100.0, 200.0, 250.0],
+        })
+
+        result = self.tool.run(
+            self.ctx,
+            query="哪个店铺物流用的最贵",
+            df=df,
+        )
+
+        assert list(result.columns) == ["店铺", "费用金额"]
+        assert result.to_dict("records") == [
+            {"店铺": "乐天", "费用金额": 300.0},
+            {"店铺": "官网", "费用金额": 250.0},
+        ]
 
     def test_mixed_currency_extreme_prefers_complete_normalized_amount_column(self):
         self.ctx.selected_sheets = ["仓储"]
@@ -1099,10 +1287,10 @@ class TestRuleEngineTool:
             df=df,
         )
 
-        assert result.to_dict("records") == [{
-            "平台": "美国官网",
-            "人民币金额": 35000.0,
-        }]
+        assert result.to_dict("records") == [
+            {"平台": "美国官网", "人民币金额": 35000.0},
+            {"平台": "乐天", "人民币金额": 12500.0},
+        ]
 
     def test_explicit_fee_type_reference_still_filters_inside_selected_sheet(self):
         self.ctx.selected_sheets = ["仓储"]
@@ -1145,9 +1333,9 @@ class TestRuleEngineTool:
         assert result.iloc[0]["易仓SKU"] == "A"
         assert result.iloc[0]["物流费用"] == pytest.approx(40.0)
         assert result.iloc[0]["物流费用占比"] == pytest.approx(0.5)
-        assert len(result) == 1
+        assert len(result) == 2
 
-    def test_singular_average_extreme_uses_mean_and_returns_only_winner(self):
+    def test_singular_average_extreme_uses_mean_and_keeps_ranked_evidence(self):
         df = pd.DataFrame({
             "店铺": ["A", "A", "B", "B"],
             "物流费用": [0.0, 100.0, 60.0, 60.0],
@@ -1159,7 +1347,10 @@ class TestRuleEngineTool:
             df=df,
         )
 
-        assert result.to_dict("records") == [{"店铺": "B", "物流费用": 60.0}]
+        assert result.to_dict("records") == [
+            {"店铺": "B", "物流费用": 60.0},
+            {"店铺": "A", "物流费用": 50.0},
+        ]
 
     def test_filter_by_value_without_column_name(self):
         df = pd.DataFrame({
@@ -1767,6 +1958,41 @@ class TestDataProfilingSkill:
 # ---------------------------------------------------------------------------
 
 class TestInsightWritingSkill:
+    def test_processing_summary_corrects_ambiguous_result_row_claim(self):
+        router = MockRouter(
+            "选尾程 sheet 共 25 行，费用金额最高的是物流商顺丰。"
+        )
+        skill = InsightWritingSkill(router)
+        result_df = pd.DataFrame({"物流商": [f"物流商{i}" for i in range(25)]})
+
+        summary = run(skill.run(
+            make_ctx(),
+            "尾程表哪个物流商花钱最多",
+            scenario="processing",
+            result_df=result_df,
+            source_row_count=23190,
+            response_language="zh",
+        ))
+
+        assert "23,190 行源数据" in summary
+        assert "25 行计算结果" in summary
+        assert "尾程 sheet 共 25 行" not in summary
+
+    def test_processing_prompt_labels_source_and_result_rows_separately(self):
+        result_df = pd.DataFrame({"物流商": [f"物流商{i}" for i in range(25)]})
+
+        prompt = InsightWritingSkill._processing_prompt(
+            "尾程表哪个物流商花钱最多",
+            result_df,
+            None,
+            "zh",
+            source_row_count=23190,
+        )
+
+        assert "Source rows used for computation: 23190" in prompt
+        assert "Computed result rows: 25" in prompt
+        assert "Never describe the computed result row count as the Sheet row count" in prompt
+
     def test_processing_prompt_for_partitioned_currencies_forbids_a_global_winner(self):
         result = pd.DataFrame({
             "币别": ["日元", "美元"],
@@ -1824,6 +2050,20 @@ class TestInsightWritingSkill:
 
         assert "1. 物流商问题: 物流商=A物流, 费用=30.0" in summary
         assert "2. 店铺问题: 店铺=乐天, 费用=20.0" in summary
+
+    def test_extreme_fallback_names_the_winner_from_complete_evidence(self):
+        summary = InsightWritingSkill._fallback_summary(
+            "processing",
+            pd.DataFrame({
+                "物流商": ["A物流", "B物流"],
+                "费用金额": [300.0, 200.0],
+            }),
+            None,
+            response_language="zh",
+            query="哪个物流商花钱最多",
+        )
+
+        assert summary == "费用金额最高的是A物流（300.00）。"
 
 
 # ---------------------------------------------------------------------------
@@ -1921,6 +2161,28 @@ class TestResultValidator:
         result = ResultBlocks(blocks=[])
         validate_result(result)  # should warn but not raise
 
+    def test_successful_computed_question_requires_its_own_table(self):
+        summary = SummaryBlock(content="A物流最高")
+        result = ResultBlocks(
+            questions=[QuestionResult(
+                question_id="q1",
+                query="哪个物流商花钱最多",
+                status="success",
+                blocks=[summary],
+                execution_report=ExecutionReport(
+                    status="success",
+                    engine="code",
+                    source_rows=100,
+                    result_rows=20,
+                    operations=["aggregate", "extreme"],
+                ),
+            )],
+            blocks=[summary],
+        )
+
+        with pytest.raises(ResultValidationError, match="computed successfully but has no table"):
+            validate_result(result)
+
 
 # ---------------------------------------------------------------------------
 # PythonExecutorTool — security scan
@@ -1983,6 +2245,48 @@ class TestPythonExecutorTool:
 # ---------------------------------------------------------------------------
 
 class TestCodeGenerationSkill:
+    def test_implicit_extreme_prompt_requires_complete_ranked_evidence(self):
+        router = MockRouter("result_df = df")
+        skill = CodeGenerationSkill(router)
+        semantics = QuerySemantics(limit=None)
+
+        run(skill.run(
+            make_ctx(),
+            "哪个物流商花钱最多",
+            df=pd.DataFrame({"物流商": ["A", "B"], "费用金额": [2, 1]}),
+            semantics=semantics,
+        ))
+
+        prompt = router._mock.requests[0]["messages"][0]["content"]
+        assert "完整的分组排序结果" in prompt
+        assert "禁止只保留最高或最低的1行" in prompt
+
+    def test_implicit_extreme_contract_rejects_head_one(self):
+        semantics = QuerySemantics(limit=None)
+        code = (
+            "result_df = df.groupby('物流商', as_index=False)['费用金额'].sum()\n"
+            "result_df = result_df.sort_values('费用金额', ascending=False).head(1)"
+        )
+
+        error = CodeGenerationSkill.validate_extreme_evidence(
+            code,
+            "哪个物流商花钱最多",
+            semantics,
+        )
+
+        assert error is not None
+        assert "完整的分组排序结果" in error
+
+    def test_explicit_top_n_contract_allows_requested_head(self):
+        semantics = QuerySemantics(limit=3)
+        code = "result_df = df.sort_values('费用金额', ascending=False).head(3)"
+
+        assert CodeGenerationSkill.validate_extreme_evidence(
+            code,
+            "费用最高的前3个物流商",
+            semantics,
+        ) is None
+
     def test_mixed_currency_prompt_requires_partitioned_aggregation(self):
         router = MockRouter("result_df = df")
         skill = CodeGenerationSkill(router)
@@ -2278,6 +2582,38 @@ result_df = grouped.sort_values('金额（USD）', ascending=False)"""
 
         assert error is None
 
+    @pytest.mark.parametrize("aggregate", [
+        "df.groupby(['币别', '物流商'], as_index=False)['费用金额'].sum()",
+        "df.groupby(['币别', '物流商'], as_index=False).agg(费用金额=('费用金额', 'sum'))",
+    ])
+    def test_result_df_self_reassignment_preserves_groupby_lineage(self, aggregate):
+        code = (
+            f"result_df = {aggregate}\n"
+            "result_df = result_df.sort_values("
+            "['币别', '费用金额'], ascending=[True, False]).reset_index(drop=True)"
+        )
+
+        error = CodeGenerationSkill.validate_required_columns(
+            code,
+            ["物流商", "费用金额"],
+            available_columns=["币别", "物流商", "费用金额"],
+        )
+
+        assert error is None
+
+    def test_result_df_projection_preserves_upstream_groupby_lineage(self):
+        code = """result_df = df[df['店铺'] == '乐天'].groupby('物流商', as_index=False)['费用金额'].sum()
+result_df = result_df.sort_values('费用金额', ascending=False)
+result_df = result_df[['物流商', '费用金额']]"""
+
+        error = CodeGenerationSkill.validate_required_columns(
+            code,
+            ["店铺", "物流商", "费用金额"],
+            available_columns=["店铺", "物流商", "费用金额"],
+        )
+
+        assert error is None
+
 
 # ---------------------------------------------------------------------------
 # SheetMindAgent._build_table_block helper
@@ -2304,6 +2640,32 @@ class TestBuildTableBlock:
         block = SheetMindAgent._build_table_block(df)
         assert block is not None
         assert block.total_rows == 10
+
+    def test_calculation_basis_distinguishes_source_and_result_rows(self):
+        from sheetmind.analysis.agent import SheetMindAgent
+
+        ctx = make_ctx()
+        step = ExecutionStep(
+            step_id="s1",
+            query="按店铺汇总费用",
+            route=RoutingHint.CODE_GEN,
+            execution_report=ExecutionReport(
+                status="success",
+                engine="code",
+                source_rows=23190,
+                result_rows=25,
+                operations=["aggregate"],
+            ),
+        )
+
+        basis = SheetMindAgent._build_calculation_basis(
+            ctx,
+            step,
+            pd.DataFrame({"店铺": [f"店铺{i}" for i in range(25)]}),
+        )
+
+        assert basis.source_row_count == 23190
+        assert basis.result_row_count == 25
 
     def test_column_metadata_numeric(self):
         from sheetmind.analysis.agent import SheetMindAgent
@@ -2891,7 +3253,10 @@ class TestSheetMindAgentPipeline:
         result = run(agent.run(ctx, "在乐天店铺中哪个易仓SKU物流费用最高"))
 
         agent.repair_loop.run.assert_not_awaited()
-        assert result.first_table().rows == [{"易仓SKU": "B", "物流费用": 40.0}]
+        assert result.first_table().rows == [
+            {"易仓SKU": "B", "物流费用": 40.0},
+            {"易仓SKU": "A", "物流费用": 10.0},
+        ]
 
     def test_changed_sheet_scope_forces_reset_instead_of_reusing_previous_scope(self):
         from sheetmind.analysis.agent import SheetMindAgent
@@ -3018,10 +3383,10 @@ class TestSheetMindAgentPipeline:
         agent.sheet_skill.run.assert_awaited_once()
         assert planning_modes == [MultiTurnMode.FOLLOW_UP]
         assert agent.df_loader.run.call_args.kwargs["multiturn_mode"] == MultiTurnMode.RESET
-        assert result.first_table().rows == [{
-            "平台": "亚马逊",
-            "费用金额": 999.0,
-        }]
+        assert result.first_table().rows == [
+            {"平台": "亚马逊", "费用金额": 999.0},
+            {"平台": "乐天", "费用金额": 300.0},
+        ]
 
     def test_followup_reapplies_persisted_filter_lineage_to_detail_rows(self):
         from sheetmind.analysis.agent import SheetMindAgent
@@ -4060,6 +4425,22 @@ class TestDataSourceSelection:
         assert list(df.columns) == ["月份", "平台", "店铺", "费用金额", "平台.1", "店铺.1"]
         assert df.iloc[0]["平台"] == "速卖通"
 
+    def test_dataframe_loader_rejects_analysis_row_caps(self, monkeypatch):
+        import io
+
+        from sheetmind.analysis.tools import dataframe_loader as loader_module
+        from sheetmind.analysis.tools.base import ToolError
+        from sheetmind.analysis.tools.dataframe_loader import DataframeLoaderTool
+
+        source = pd.DataFrame({"金额": range(30)})
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            source.to_excel(writer, sheet_name="数据", index=False)
+        monkeypatch.setattr(loader_module, "MAX_ROWS_PER_SHEET", 25)
+
+        with pytest.raises(ToolError, match="full Sheet"):
+            DataframeLoaderTool._read_sheet(buf.getvalue(), "数据", 0)
+
     def test_dataframe_loader_ignores_unsupported_text_filter_metadata(self):
         import io
         import zipfile
@@ -4120,6 +4501,34 @@ class TestDataSourceSelection:
 # ---------------------------------------------------------------------------
 
 class TestEnhancementAcceptance:
+    def test_execution_contract_validates_sort_within_each_currency(self):
+        from sheetmind.analysis.context import QuerySort
+        from sheetmind.analysis.validators.execution_contract_validator import (
+            ExecutionContractValidator,
+        )
+
+        result_df = pd.DataFrame({
+            "币别": ["美元", "美元", "日元", "日元"],
+            "店铺": ["A", "B", "C", "D"],
+            "费用金额": [100.0, 50.0, 1000.0, 800.0],
+        })
+        step = ExecutionStep(
+            step_id="s1",
+            query="哪个店铺物流费用最贵",
+            route=RoutingHint.CODE_GEN,
+            semantics=QuerySemantics(
+                sort=[QuerySort(field="费用金额", direction="desc")],
+            ),
+        )
+
+        decision = ExecutionContractValidator().validate(
+            step=step,
+            source_df=result_df,
+            result_df=result_df,
+        )
+
+        assert decision.valid is True
+
     def test_exact_base_field_does_not_also_resolve_pandas_duplicate_suffix(self):
         skill = SemanticTypingSkill(MockRouter())
         df = pd.DataFrame({

@@ -70,6 +70,19 @@ def validate_result(
             raise ResultValidationError(
                 f"QuestionResult[{question.question_id}] is successful but has no blocks"
             )
+        report = question.execution_report
+        computed_successfully = (
+            question.status == "success"
+            and report is not None
+            and report.status == "success"
+            and report.engine in {"rule", "code"}
+        )
+        if computed_successfully and not any(
+            _block_kind(block) == "table" for block in question.blocks
+        ):
+            raise ResultValidationError(
+                f"QuestionResult[{question.question_id}] computed successfully but has no table"
+            )
 
     valid_blocks = []
     removed_charts = 0

@@ -28,6 +28,7 @@ export const toAnalysisViewModel = (payload, prompt) => {
           .filter((block) => block.kind === "summary" && block.content)
           .map((block) => block.content),
         executionReport: question.execution_report ?? null,
+        tables: (question.blocks ?? []).filter((block) => block.kind === "table"),
       }))
     : [];
   const needsFieldClarification = fieldResolutions.some(
@@ -65,7 +66,19 @@ export const toAnalysisViewModel = (payload, prompt) => {
           ? "Data + Visualization"
           : "Insight";
   const totalRows = table?.total_rows ?? table?.rows?.length ?? 0;
-  const previews = tables.map((tableBlock, index) => ({
+  const questionTables = questionResults.flatMap((question) =>
+    question.tables.map((tableBlock) => ({
+      tableBlock,
+      questionId: question.questionId,
+      query: question.query,
+    }))
+  );
+  const previewSources = questionTables.length > 0
+    ? questionTables
+    : tables.map((tableBlock) => ({ tableBlock, questionId: null, query: null }));
+  const previews = previewSources.map(({ tableBlock, questionId, query }, index) => ({
+    questionId,
+    query,
     title: tableBlock.title || `Result ${index + 1}`,
     columns: tableBlock.columns ?? [],
     rows: tableBlock.rows ?? [],
@@ -115,7 +128,7 @@ export const toAnalysisViewModel = (payload, prompt) => {
     sheetResolutions,
     runtimeNote:
       table && table.rows.length < totalRows
-        ? `Showing ${table.rows.length.toLocaleString()} preview rows. The backend processed ${totalRows.toLocaleString()} rows.`
+        ? `Showing ${table.rows.length.toLocaleString()} of ${totalRows.toLocaleString()} result rows. Source rows used for computation are listed under Calculation basis.`
         : "",
     previews,
     preview: previews[0] ?? null,
