@@ -19,6 +19,7 @@ def _to_task(row: Any) -> Task:
 
 class TaskService:
     _SELECT = "task_id, project_id, task_number, status, created_at, title"
+    _STATUSES = {"draft", "running", "completed", "failed"}
 
     def create_task(self, project_id: str) -> Task:
         for _ in range(3):
@@ -82,6 +83,16 @@ class TaskService:
         with transaction() as conn:
             cursor = conn.execute(
                 "UPDATE tasks SET title = ? WHERE task_id = ?", (title.strip() or None, task_id)
+            )
+            return cursor.rowcount > 0
+
+    def update_status(self, task_id: str, status: str) -> bool:
+        if status not in self._STATUSES:
+            raise ValueError(f"Unsupported task status: {status}")
+        with transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET status = ? WHERE task_id = ?",
+                (status, task_id),
             )
             return cursor.rowcount > 0
 

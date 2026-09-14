@@ -5,8 +5,10 @@
 import base64
 import io
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
 import pandas as pd
+from sheetmind.config import settings
+from sheetmind.exceptions import FileTooLargeError
 from sheetmind.logging import get_logger
 
 logger = get_logger("file_uploader")
@@ -16,6 +18,13 @@ SUPPORTED_EXCEL_EXTENSIONS = {".xlsx", ".xls"}
 
 class FileUploader:
     """文件上传处理服务"""
+
+    def __init__(self, max_file_size_bytes: Optional[int] = None) -> None:
+        self.max_file_size_bytes = (
+            max_file_size_bytes
+            if max_file_size_bytes is not None
+            else settings.max_excel_file_size_bytes
+        )
 
     def parse_files(self, files: List[Any]) -> List[Dict[str, Any]]:
         """
@@ -31,6 +40,7 @@ class FileUploader:
         files_to_process = files or []
 
         for file_upload in files_to_process:
+            self.validate_base64_size(file_upload.base64, file_upload.fileName)
             file_bytes = self.decode_base64_file(file_upload.base64)
             sheet_names = self.validate_workbook(file_bytes, file_upload.fileName)
             file_info_list.append({
@@ -40,6 +50,20 @@ class FileUploader:
             logger.info(f"成功解析文件: {file_upload.fileName}, 包含 {len(sheet_names)} 个sheet")
 
         return file_info_list
+
+    def validate_base64_size(self, base64_data: str, file_name: str) -> None:
+        """Reject oversized uploads before allocating decoded workbook bytes."""
+        encoded = str(base64_data or "")
+        padding = len(encoded) - len(encoded.rstrip("="))
+        estimated_size = max(0, (len(encoded) * 3) // 4 - padding)
+        if estimated_size <= self.max_file_size_bytes:
+            return
+
+        limit_mb = self.max_file_size_bytes / (1024 * 1024)
+        raise FileTooLargeError(
+            f'File "{file_name}" is too large. The maximum Excel file size is {limit_mb:g} MB.',
+            error_code="FILE_TOO_LARGE",
+        )
 
     def validate_file(self, file_bytes: bytes, file_name: str) -> bool:
         """

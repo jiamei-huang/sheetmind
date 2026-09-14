@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Literal, Optional
 import pandas as pd
 from pydantic import BaseModel, Field
 
+from sheetmind.exceptions import AIQuotaExhaustedError
+
 from ..context import (
     AnalysisContext,
     ExecutionStep,
@@ -111,6 +113,8 @@ class QueryPlanningSkill(Skill):
             )
             source = "llm"
         except Exception as exc:
+            if isinstance(exc, AIQuotaExhaustedError):
+                raise
             logger.warning("[QueryPlanning] planner fallback: %s", exc)
             raw_steps = self._rule_decompose(query, sheet_catalog=sheet_catalog)
             source = "rule_fallback"
@@ -257,7 +261,6 @@ class QueryPlanningSkill(Skill):
         response = await provider.complete(
             messages=[{"role": "user", "content": user_content}],
             system=system,
-            max_tokens=1024,
             temperature=0.0,
             json_mode=True,
         )

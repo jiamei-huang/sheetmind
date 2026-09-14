@@ -123,6 +123,11 @@ function AIDataAnalysis({
           ? {
               ...task,
               prompt: value.slice(0, MAX_ANALYSIS_QUERY_LENGTH),
+              status: value.trim()
+                ? "draft"
+                : task.results?.length
+                  ? "completed"
+                  : "draft",
               classification: task.status === "completed" ? task.classification : null,
             }
           : task
@@ -475,7 +480,7 @@ function AIDataAnalysis({
           if (item.id === targetTaskId) {
             return {
               ...item,
-              status: "draft", // 保持draft状态以便继续对话
+              status: newResult.status === "failed" ? "failed" : "completed",
               results: [...(item.results || []), newResult],
               classification: newResult.classification,
               mode: newResult.mode,
@@ -508,7 +513,7 @@ function AIDataAnalysis({
           || item.id === currentTaskId
             ? {
                 ...item,
-                status: "draft",
+                status: "failed",
                 analysisError: message,
               }
             : item

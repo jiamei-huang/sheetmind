@@ -42,7 +42,7 @@ class ModelRole(str, Enum):
 class ModelConfig(BaseModel):
     provider: str          # "openai" | "anthropic" | "zhipu" | "qwen" | "local"
     model_id: str
-    max_tokens: int = 4096
+    max_tokens: int = 2500
     temperature: float = 0.1
     timeout_seconds: int = 60
     extra: Dict[str, Any] = {}
@@ -58,21 +58,21 @@ DEFAULT_CONFIGS: Dict[ModelRole, ModelConfig] = {
     ModelRole.ROUTING: ModelConfig(
         provider="openai",
         model_id="gpt-4o-mini",
-        max_tokens=256,
+        max_tokens=320,
         temperature=0.0,
         timeout_seconds=15,
     ),
     ModelRole.QUERY_PLANNING: ModelConfig(
         provider="openai",
         model_id="gpt-4o-mini",
-        max_tokens=1024,
+        max_tokens=1600,
         temperature=0.0,
         timeout_seconds=20,
     ),
     ModelRole.SEMANTIC_TYPING: ModelConfig(
         provider="openai",
         model_id="gpt-4o-mini",
-        max_tokens=512,
+        max_tokens=2000,
         temperature=0.0,
         timeout_seconds=20,
     ),
@@ -86,14 +86,14 @@ DEFAULT_CONFIGS: Dict[ModelRole, ModelConfig] = {
     ModelRole.CODE_GENERATION: ModelConfig(
         provider="openai",
         model_id="gpt-4o",
-        max_tokens=2048,
+        max_tokens=2500,
         temperature=0.1,
         timeout_seconds=60,
     ),
     ModelRole.CODE_REPAIR: ModelConfig(
         provider="openai",
         model_id="gpt-4o",
-        max_tokens=2048,
+        max_tokens=2500,
         temperature=0.1,
         timeout_seconds=60,
     ),
@@ -107,7 +107,7 @@ DEFAULT_CONFIGS: Dict[ModelRole, ModelConfig] = {
     ModelRole.LONG_CONTEXT: ModelConfig(
         provider="openai",
         model_id="gpt-4o",
-        max_tokens=4096,
+        max_tokens=2500,
         temperature=0.1,
         timeout_seconds=120,
     ),

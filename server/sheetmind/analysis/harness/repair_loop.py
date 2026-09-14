@@ -27,6 +27,8 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import pandas as pd
 
+from sheetmind.exceptions import AIQuotaExhaustedError
+
 from ..context import AnalysisContext, QuerySemantics
 from ..skills.code_generation import CodeGenerationSkill
 from ..skills.semantic_typing import SemanticFieldMap
@@ -130,6 +132,8 @@ class RepairLoop:
                     semantics=semantics,
                 )
             except Exception as exc:
+                if isinstance(exc, AIQuotaExhaustedError):
+                    raise
                 logger.warning("[RepairLoop] code gen failed attempt=%d: %s", attempt + 1, exc)
                 error_key = f"code_generation:{type(exc).__name__}:{exc}"
                 if error_key in seen_errors:

@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { analyzeStream, buildSelectedFileScope } from "./analysis.js";
+import {
+  analyzeStream,
+  buildSelectedFileScope,
+  toAnalysisErrorMessage,
+} from "./analysis.js";
 
 test("buildSelectedFileScope sends persisted file names and every selected sheet", () => {
   assert.deepEqual(buildSelectedFileScope([
@@ -73,4 +77,10 @@ test("analyzeStream includes anonymous session cookies for cross-origin streamin
   }
 
   assert.equal(fetchOptions.credentials, "include");
+});
+
+test("keeps the backend's localized API quota message", () => {
+  assert.equal(toAnalysisErrorMessage({
+    response: { data: { detail: "API 额度已耗尽，请稍后再试。" } },
+  }), "API 额度已耗尽，请稍后再试。");
 });

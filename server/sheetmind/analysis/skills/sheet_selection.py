@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+from sheetmind.exceptions import AIQuotaExhaustedError
+
 from ..context import AnalysisContext
 from ..models.configs import ModelRole
 from .base import Skill, SkillError
@@ -390,7 +392,6 @@ class SheetSelectionSkill(Skill):
                     ),
                 }],
                 system=system,
-                max_tokens=512,
                 temperature=0.0,
                 json_mode=True,
             )
@@ -405,6 +406,8 @@ class SheetSelectionSkill(Skill):
             confidence = self._safe_confidence(data.get("confidence"))
             return selected, confidence, str(data.get("reason", "semantic sheet ranking"))
         except Exception as exc:
+            if isinstance(exc, AIQuotaExhaustedError):
+                raise
             logger.warning("[SheetSelection] LLM ranking failed; using metadata: %s", exc)
             return None
 

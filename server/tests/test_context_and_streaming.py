@@ -38,7 +38,9 @@ from sheetmind.analysis.context import (
     TableBlock,
     Turn,
 )
-from sheetmind.analysis.models.configs import ModelRole
+from sheetmind.analysis.agent import SheetMindAgent
+from sheetmind.analysis.models.configs import ModelConfig, ModelRole
+from sheetmind.analysis.models.provider import ModelProvider
 from sheetmind.analysis.models.router import ModelRouter
 from sheetmind.analysis.streaming.emitter import (
     StreamEmitter,
@@ -53,6 +55,7 @@ from sheetmind.analysis.tracing.trace import (
     EVT_RESULT_ASSEMBLED,
     Trace,
 )
+from sheetmind.exceptions import AIQuotaExhaustedError, ModelOutputTruncatedError
 
 
 # ---------------------------------------------------------------------------
@@ -512,3 +515,151 @@ class TestModelRouter:
         router = ModelRouter()
 
         assert router.config_for(ModelRole.QUERY_PLANNING).model_id == "deepseek-chat"
+
+    def test_role_token_budgets_are_bounded_by_global_ceiling(self):
+        router = ModelRouter()
+        expected = {
+            ModelRole.ROUTING: 320,
+            ModelRole.QUERY_PLANNING: 1600,
+            ModelRole.SEMANTIC_TYPING: 2000,
+            ModelRole.SHEET_SELECTION: 512,
+            ModelRole.CODE_GENERATION: 2500,
+            ModelRole.CODE_REPAIR: 2500,
+            ModelRole.INSIGHT_WRITING: 1024,
+            ModelRole.LONG_CONTEXT: 2500,
+        }
+
+        assert {role: router.config_for(role).max_tokens for role in ModelRole} == expected
+
+
+class TestModelProviderErrors:
+    def test_requested_tokens_are_clamped_to_global_ceiling(self, monkeypatch):
+        provider = ModelProvider(ModelConfig(provider="openai", model_id="test-model"))
+        requested_limits = []
+
+        async def complete(*_args, **kwargs):
+            requested_limits.append(kwargs["max_tokens"])
+            return "ok"
+
+        monkeypatch.setattr(provider, "_complete_openai", complete)
+        result = asyncio.get_event_loop().run_until_complete(
+            provider.complete([{"role": "user", "content": "test"}], max_tokens=9000)
+        )
+
+        assert result == "ok"
+        assert requested_limits == [2500]
+
+    def test_truncated_output_retries_once_at_global_ceiling(self, monkeypatch):
+        provider = ModelProvider(
+            ModelConfig(provider="openai", model_id="test-model", max_tokens=1024)
+        )
+        requested_limits = []
+
+        async def complete(*_args, **kwargs):
+            requested_limits.append(kwargs["max_tokens"])
+            if len(requested_limits) == 1:
+                raise ModelOutputTruncatedError("truncated")
+            return "complete"
+
+        monkeypatch.setattr(provider, "_complete_openai", complete)
+        result = asyncio.get_event_loop().run_until_complete(
+            provider.complete([{"role": "user", "content": "test"}])
+        )
+
+        assert result == "complete"
+        assert requested_limits == [1024, 2500]
+
+    def test_truncated_output_at_ceiling_is_not_retried(self, monkeypatch):
+        provider = ModelProvider(
+            ModelConfig(provider="openai", model_id="test-model", max_tokens=2500)
+        )
+        calls = 0
+
+        async def complete(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise ModelOutputTruncatedError("truncated")
+
+        monkeypatch.setattr(provider, "_complete_openai", complete)
+        with pytest.raises(ModelOutputTruncatedError):
+            asyncio.get_event_loop().run_until_complete(
+                provider.complete([{"role": "user", "content": "test"}])
+            )
+
+        assert calls == 1
+
+    def test_openai_length_finish_reason_is_detected(self):
+        provider = ModelProvider(
+            ModelConfig(provider="openai", model_id="test-model", max_tokens=2500)
+        )
+
+        class Completions:
+            async def create(self, **_kwargs):
+                message = type("Message", (), {"content": "partial"})()
+                choice = type(
+                    "Choice",
+                    (),
+                    {"message": message, "finish_reason": "length"},
+                )()
+                return type("Response", (), {"choices": [choice]})()
+
+        chat = type("Chat", (), {"completions": Completions()})()
+        provider._client = type("Client", (), {"chat": chat})()
+
+        with pytest.raises(ModelOutputTruncatedError):
+            asyncio.get_event_loop().run_until_complete(
+                provider.complete([{"role": "user", "content": "test"}])
+            )
+
+    def test_http_402_becomes_quota_exhausted_error(self, monkeypatch):
+        provider = ModelProvider(ModelConfig(provider="openai", model_id="test-model"))
+
+        class PaymentRequiredError(Exception):
+            status_code = 402
+
+        async def fail(*_args, **_kwargs):
+            raise PaymentRequiredError("provider balance details")
+
+        monkeypatch.setattr(provider, "_complete_openai", fail)
+
+        with pytest.raises(AIQuotaExhaustedError) as raised:
+            asyncio.get_event_loop().run_until_complete(
+                provider.complete([{"role": "user", "content": "test"}])
+            )
+
+        assert raised.value.error_code == "AI_QUOTA_EXHAUSTED"
+        assert "provider balance details" not in raised.value.message
+
+    @pytest.mark.parametrize(
+        ("query", "expected_message"),
+        [
+            ("哪个店铺最高", "API 额度已耗尽，请稍后再试。"),
+            (
+                "Which store is highest?",
+                "The API quota has been exhausted. Please try again later.",
+            ),
+        ],
+    )
+    def test_streamed_quota_message_matches_query_language(
+        self, monkeypatch, query, expected_message
+    ):
+        agent = SheetMindAgent()
+
+        async def fail(*_args, **_kwargs):
+            raise AIQuotaExhaustedError(
+                "The model API quota has been exhausted.",
+                error_code="AI_QUOTA_EXHAUSTED",
+            )
+
+        monkeypatch.setattr(agent, "_run_pipeline", fail)
+        monkeypatch.setattr(agent.trace_store, "save", lambda _trace: None)
+
+        async def scenario():
+            emitter = StreamEmitter()
+            with pytest.raises(AIQuotaExhaustedError):
+                await agent.run(make_ctx(), query, emitter=emitter)
+            frames = [frame async for frame in emitter.stream()]
+            return [json.loads(frame.strip()[len("data: "):]) for frame in frames]
+
+        events = asyncio.get_event_loop().run_until_complete(scenario())
+        assert events[-1] == {"event": "error", "message": expected_message}

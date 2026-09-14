@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from sheetmind.exceptions import AIQuotaExhaustedError
+
 from .context import (
     AnalysisContext,
     CalculationBasis,
@@ -45,6 +47,7 @@ from .artifacts import get_artifact_store
 from .language import (
     ResponseLanguage,
     infer_response_language,
+    quota_exhausted_message,
     resolve_response_language,
     user_text,
 )
@@ -267,7 +270,12 @@ class SheetMindAgent:
             self.trace_store.save(trace)
 
             if emitter:
-                await emitter.emit_error()
+                if isinstance(exc, AIQuotaExhaustedError):
+                    await emitter.emit_error(
+                        quota_exhausted_message(infer_response_language(query))
+                    )
+                else:
+                    await emitter.emit_error()
 
             raise
         finally:

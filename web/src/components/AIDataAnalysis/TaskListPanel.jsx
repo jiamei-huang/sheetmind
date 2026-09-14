@@ -38,6 +38,7 @@ const TaskListPanel = ({ tasks, activeTaskId, onSelectTask, onRenameTask, onDele
               draft: { dot: "bg-amber-400", label: "Draft" },
               running: { dot: "bg-blue-500 animate-pulse", label: "Running" },
               completed: { dot: "bg-emerald-500", label: "Completed" },
+              failed: { dot: "bg-red-500", label: "Failed" },
             }[task.status] || { dot: "bg-amber-400", label: "Draft" };
 
             return (

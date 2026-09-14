@@ -3,11 +3,17 @@ import asyncio
 import json
 
 import pandas as pd
+import pytest
 
 from sheetmind.analysis.context import AnalysisContext, MultiTurnMode
-from sheetmind.analysis.language import infer_response_language, resolve_response_language
+from sheetmind.analysis.language import (
+    infer_response_language,
+    quota_exhausted_message,
+    resolve_response_language,
+)
 from sheetmind.analysis.skills.insight_writing import InsightWritingSkill
 from sheetmind.analysis.skills.query_planning import QueryPlanningSkill
+from sheetmind.exceptions import AIQuotaExhaustedError
 
 
 class StubProvider:
@@ -28,6 +34,16 @@ class StubRouter:
         return self.provider
 
 
+class QuotaProvider:
+    async def complete(self, *_args, **_kwargs):
+        raise AIQuotaExhaustedError("quota exhausted")
+
+
+class QuotaRouter:
+    def get_provider(self, _role):
+        return QuotaProvider()
+
+
 def run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
@@ -45,6 +61,15 @@ def test_language_detection_uses_query_grammar_not_english_identifiers():
 def test_explicit_language_request_overrides_planner_value():
     assert resolve_response_language("请用英文回答：哪个平台最高", "zh") == "en"
     assert resolve_response_language("Answer in Chinese: which platform leads?", "en") == "zh"
+
+
+def test_quota_exhausted_message_matches_query_language():
+    assert quota_exhausted_message(infer_response_language("请分析哪个店铺最高")) == (
+        "API 额度已耗尽，请稍后再试。"
+    )
+    assert quota_exhausted_message(infer_response_language("Which store is highest?")) == (
+        "The API quota has been exhausted. Please try again later."
+    )
 
 
 def test_semantic_planner_returns_validated_response_language():
@@ -96,3 +121,15 @@ def test_insight_prompt_and_fallback_follow_response_language():
         None,
         response_language="zh",
     ) == "数据处理完成，共 1 行、2 列。"
+
+
+def test_insight_writer_does_not_hide_quota_exhaustion():
+    skill = InsightWritingSkill(QuotaRouter())
+
+    with pytest.raises(AIQuotaExhaustedError):
+        run(skill.run(
+            make_ctx(),
+            "哪个平台最高",
+            result_df=pd.DataFrame({"平台": ["乐天"], "费用": [100]}),
+            response_language="zh",
+        ))

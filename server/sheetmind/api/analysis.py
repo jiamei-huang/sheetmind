@@ -11,7 +11,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from sheetmind.analysis.streaming.emitter import StreamEmitter
-from sheetmind.analysis.language import infer_response_language, user_text
+from sheetmind.analysis.language import (
+    infer_response_language,
+    quota_exhausted_message,
+    user_text,
+)
+from sheetmind.exceptions import AIQuotaExhaustedError
 
 from .dependencies import (
     analysis_agent,
@@ -27,6 +32,16 @@ from .session import current_session_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analysis", tags=["analysis"])
+
+
+def _analysis_failure_message(exc: Exception, response_language: str) -> str:
+    if isinstance(exc, AIQuotaExhaustedError):
+        return quota_exhausted_message(response_language)
+    return user_text(
+        response_language,
+        en="Analysis was interrupted. Submit the question again.",
+        zh="分析意外中断，请重新提交问题。",
+    )
 
 
 def _analysis_context(payload: AnalyzeRequest, session_id: str):
@@ -71,6 +86,10 @@ async def _run_stream(
                 emitter=emitter,
                 run_id=run_id,
             )
+            tasks.update_status(
+                request.taskId,
+                "failed" if result.status == "failed" else "completed",
+            )
             analysis_contexts.set(request.taskId, ctx)
             conversations.add_message(
                 request.taskId,
@@ -80,11 +99,8 @@ async def _run_stream(
             )
     except Exception as exc:
         logger.exception("Analysis failed for task %s", request.taskId)
-        message = user_text(
-            response_language,
-            en="Analysis was interrupted. Submit the question again.",
-            zh="分析意外中断，请重新提交问题。",
-        )
+        tasks.update_status(request.taskId, "failed")
+        message = _analysis_failure_message(exc, response_language)
         conversations.add_message(
             request.taskId,
             "assistant",
@@ -98,6 +114,7 @@ async def _run_stream(
 @router.post("/stream")
 async def analyze_stream(request: Request, payload: AnalyzeRequest):
     ctx = _analysis_context(payload, current_session_id(request))
+    tasks.update_status(payload.taskId, "running")
     run_id = uuid.uuid4().hex
     conversations.add_message(
         payload.taskId,
@@ -121,6 +138,7 @@ async def analyze_stream(request: Request, payload: AnalyzeRequest):
 @router.post("")
 async def analyze(request: Request, payload: AnalyzeRequest) -> dict:
     ctx = _analysis_context(payload, current_session_id(request))
+    tasks.update_status(payload.taskId, "running")
     run_id = uuid.uuid4().hex
     conversations.add_message(
         payload.taskId,
@@ -133,6 +151,10 @@ async def analyze(request: Request, payload: AnalyzeRequest) -> dict:
         async with ctx._run_lock:
             _apply_requested_scope(ctx, payload)
             result = await analysis_agent.run(ctx, payload.query.strip(), run_id=run_id)
+            tasks.update_status(
+                payload.taskId,
+                "failed" if result.status == "failed" else "completed",
+            )
             analysis_contexts.set(payload.taskId, ctx)
             conversations.add_message(
                 payload.taskId,
@@ -141,19 +163,21 @@ async def analyze(request: Request, payload: AnalyzeRequest) -> dict:
                 metadata=_result_metadata(result, run_id),
             )
         return result.model_dump()
-    except Exception:
+    except Exception as exc:
         logger.exception("Analysis failed for task %s", payload.taskId)
-        message = user_text(
-            response_language,
-            en="Analysis was interrupted. Submit the question again.",
-            zh="分析意外中断，请重新提交问题。",
-        )
+        tasks.update_status(payload.taskId, "failed")
+        message = _analysis_failure_message(exc, response_language)
         conversations.add_message(
             payload.taskId,
             "assistant",
             message,
             metadata={"runId": run_id, "status": "failed"},
         )
+        if isinstance(exc, AIQuotaExhaustedError):
+            raise HTTPException(
+                status_code=402,
+                detail=message,
+            ) from exc
         raise
 
 

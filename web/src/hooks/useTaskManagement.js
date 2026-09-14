@@ -133,10 +133,15 @@ export const useTaskManagement = (activeProjectId, projectsReady, suppressTaskRe
           const task = toFrontendTask(item, activeProjectId);
           const prior = previousById.get(task.id);
           const restoredResults = conversationHistoryToResults(histories[index]);
+          const results = prior?.results?.length ? prior.results : restoredResults;
+          const persistedStatus = prior?.status ?? task.status;
           return {
             ...task,
             ...(prior ?? {}),
-            results: prior?.results?.length ? prior.results : restoredResults,
+            results,
+            status: persistedStatus === "draft" && results.length
+              ? "completed"
+              : persistedStatus,
             projectId: activeProjectId,
           };
         });

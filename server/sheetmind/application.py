@@ -11,7 +11,7 @@ load_dotenv()
 
 from sheetmind import __version__
 from sheetmind.database import init_db
-from sheetmind.exceptions import SheetMindException, safe_error_message
+from sheetmind.exceptions import FileTooLargeError, SheetMindException, safe_error_message
 from sheetmind.config import settings
 from sheetmind.logging import configure_logging
 from sheetmind.services.anonymous_sessions import SESSION_COOKIE_NAME
@@ -67,6 +67,13 @@ def create_app() -> FastAPI:
                 expires=session.expires_at,
             )
         return response
+
+    @app.exception_handler(FileTooLargeError)
+    async def handle_file_too_large(_: Request, exc: FileTooLargeError):
+        return JSONResponse(
+            status_code=413,
+            content={"detail": exc.message, "errorCode": exc.error_code},
+        )
 
     @app.exception_handler(SheetMindException)
     async def handle_sheetmind_error(_: Request, exc: SheetMindException):

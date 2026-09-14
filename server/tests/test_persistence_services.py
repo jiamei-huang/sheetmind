@@ -43,6 +43,11 @@ def test_project_and_task_lifecycle(tmp_path, monkeypatch):
     second = tasks.create_task(project_id)
 
     assert [task.task_number for task in tasks.list_tasks(project_id)] == [1, 2]
+    assert first.status == "draft"
+    assert tasks.update_status(first.task_id, "running")
+    assert tasks.get_task(first.task_id).status == "running"
+    assert tasks.update_status(first.task_id, "completed")
+    assert tasks.get_task(first.task_id).status == "completed"
     assert tasks.rename_task(first.task_id, "Regional analysis")
     assert tasks.get_task(first.task_id).title == "Regional analysis"
     assert projects.rename_project(project_id, "Sales 2026")

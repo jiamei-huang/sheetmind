@@ -132,7 +132,8 @@ class CodeGenerationSkill(Skill):
         Returns:
             Generated Python code string (no markdown, no imports).
         """
-        provider = self.router.get_provider(ModelRole.CODE_GENERATION)
+        model_role = ModelRole.CODE_REPAIR if error_feedback else ModelRole.CODE_GENERATION
+        provider = self.router.get_provider(model_role)
 
         # Build the user prompt
         user_msg = self._build_user_prompt(
@@ -151,7 +152,6 @@ class CodeGenerationSkill(Skill):
         response = await provider.complete(
             messages=[{"role": "user", "content": user_msg}],
             system=_SYSTEM_PROMPT,
-            max_tokens=1024,
             temperature=0.1,
         )
 

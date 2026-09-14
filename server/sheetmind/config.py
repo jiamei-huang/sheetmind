@@ -34,6 +34,12 @@ class Settings:
         "ANONYMOUS_SESSION_TTL_DAYS", 30
     )
     claim_legacy_projects: bool = _bool_env("SHEETMIND_CLAIM_LEGACY_PROJECTS")
+    max_excel_file_size_bytes: int = (
+        _positive_int_env("SHEETMIND_MAX_EXCEL_FILE_SIZE_MB", 25) * 1024 * 1024
+    )
+    max_model_output_tokens: int = _positive_int_env(
+        "SHEETMIND_MAX_MODEL_OUTPUT_TOKENS", 2500
+    )
 
 
 settings = Settings()

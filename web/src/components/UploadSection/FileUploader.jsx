@@ -4,6 +4,8 @@ import FileCard from "./FileCard";
 import { deleteExcelFile, uploadExcelFile } from "../../api/files";
 import { isValidBackendProjectId } from "../../utils/validation";
 import {
+  oversizedUploadMessage,
+  oversizedUploadNames,
   unsupportedUploadMessage,
   unsupportedUploadNames,
 } from "../../utils/fileValidation";
@@ -60,6 +62,16 @@ export default function FileUploader({
     onShowErrorModal?.({
       title: "Unsupported file type",
       message: unsupportedUploadMessage(unsupported),
+    });
+    return true;
+  }, [onShowErrorModal]);
+
+  const rejectOversizedFiles = useCallback((files) => {
+    const oversized = oversizedUploadNames(files);
+    if (!oversized.length) return false;
+    onShowErrorModal?.({
+      title: "File too large",
+      message: oversizedUploadMessage(oversized),
     });
     return true;
   }, [onShowErrorModal]);
@@ -136,6 +148,7 @@ export default function FileUploader({
         return;
       }
       if (rejectUnsupportedFiles([file])) return;
+      if (rejectOversizedFiles([file])) return;
 
       const name = file.name;
       if (!isProjectReady) return;
@@ -312,7 +325,7 @@ export default function FileUploader({
         setIsUploading(false);
       }
     },
-    [handleFilesUpdated, onShowToast, onShowErrorModal, activeProjectId, onProjectCreated, suppressTaskReloadRef, projectManagement, isProjectReady, rejectUnsupportedFiles]
+    [handleFilesUpdated, onShowToast, onShowErrorModal, activeProjectId, onProjectCreated, suppressTaskReloadRef, projectManagement, isProjectReady, rejectUnsupportedFiles, rejectOversizedFiles]
   );
 
   const handleFileInputChange = async (event) => {
@@ -322,6 +335,10 @@ export default function FileUploader({
       return;
     }
     if (rejectUnsupportedFiles(files)) {
+      event.target.value = "";
+      return;
+    }
+    if (rejectOversizedFiles(files)) {
       event.target.value = "";
       return;
     }
@@ -351,6 +368,7 @@ export default function FileUploader({
       return;
     }
     if (rejectUnsupportedFiles(droppedFiles)) return;
+    if (rejectOversizedFiles(droppedFiles)) return;
 
     let uploadProjectId = isValidBackendProjectId(activeProjectId)
       ? activeProjectId

@@ -309,7 +309,7 @@ const TaskContentPanel = ({
     );
   }
 
-  const pendingTask = task && task.status !== "completed";
+  const canSubmitTask = task && task.status !== "running";
   const hasResults = task && task.results && task.results.length > 0;
   const promptLength = (task.prompt || "").length;
   const showPromptCounter = promptLength >= ANALYSIS_QUERY_COUNTER_THRESHOLD;
@@ -1175,12 +1175,12 @@ const TaskContentPanel = ({
                   && !event.nativeEvent.isComposing
                 ) {
                   event.preventDefault();
-                  if (pendingTask && isUploadReady && !isAnalyzing && task.prompt?.trim()) {
+                  if (canSubmitTask && isUploadReady && !isAnalyzing && task.prompt?.trim()) {
                     onAnalyzeTask(task.id);
                   }
                 }
               }}
-              disabled={!pendingTask || !isUploadReady || isAnalyzing}
+              disabled={!canSubmitTask || !isUploadReady || isAnalyzing}
               maxLength={MAX_ANALYSIS_QUERY_LENGTH}
               placeholder="Ask a question about your selected sheets..."
               aria-label="Data analysis question"
@@ -1198,7 +1198,7 @@ const TaskContentPanel = ({
               aria-label={isAnalyzing && task.status === "running" ? "Analyzing" : "Analyze"}
               title={isAnalyzing && task.status === "running" ? "Analyzing" : "Analyze"}
               onClick={() => onAnalyzeTask(task.id)}
-              disabled={!pendingTask || !isUploadReady || isAnalyzing || !task.prompt?.trim()}
+              disabled={!canSubmitTask || !isUploadReady || isAnalyzing || !task.prompt?.trim()}
               className="absolute bottom-2 right-2 inline-flex h-9 w-9 items-center justify-center rounded-md bg-blue-600 text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-300"
             >
               {isAnalyzing && task.status === "running" ? (

@@ -50,6 +50,16 @@ class AIAnalysisError(SheetMindException):
     pass
 
 
+class AIQuotaExhaustedError(AIAnalysisError):
+    """上游模型 API 额度已耗尽"""
+    pass
+
+
+class ModelOutputTruncatedError(AIAnalysisError):
+    """模型响应达到输出上限而被截断"""
+    pass
+
+
 class DatabaseError(SheetMindException):
     """数据库操作失败"""
     pass

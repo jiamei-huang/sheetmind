@@ -61,3 +61,11 @@ def language_name(language: ResponseLanguage) -> str:
 
 def user_text(language: ResponseLanguage, *, en: str, zh: str) -> str:
     return zh if language == "zh" else en
+
+
+def quota_exhausted_message(language: ResponseLanguage) -> str:
+    return user_text(
+        language,
+        en="The API quota has been exhausted. Please try again later.",
+        zh="API 额度已耗尽，请稍后再试。",
+    )

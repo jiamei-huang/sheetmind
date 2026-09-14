@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from sheetmind.exceptions import AIQuotaExhaustedError
+
 from ..context import AnalysisContext
 from ..models.configs import ModelRole
 from .base import Skill
@@ -154,6 +156,8 @@ class SemanticTypingSkill(Skill):
                 )
                 self._apply_refinements(result, evidence_map, refinements)
             except Exception as exc:
+                if isinstance(exc, AIQuotaExhaustedError):
+                    raise
                 logger.warning("[SemanticTyping] LLM refinement failed; using rules: %s", exc)
         return result
 
@@ -228,7 +232,6 @@ class SemanticTypingSkill(Skill):
                 ),
             }],
             system=system,
-            max_tokens=1600,
             temperature=0.0,
             json_mode=True,
         )

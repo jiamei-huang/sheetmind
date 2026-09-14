@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from sheetmind.exceptions import AIQuotaExhaustedError
+
 from ..context import AnalysisContext, ChartBlock, TableBlock
 from ..language import ResponseLanguage, language_name, resolve_response_language, user_text
 from ..models.configs import ModelRole
@@ -92,11 +94,12 @@ class InsightWritingSkill(Skill):
             text = await provider.complete(
                 messages=[{"role": "user", "content": user_msg}],
                 system=self._system_prompt(language),
-                max_tokens=512,
                 temperature=0.3,
             )
             summary = text.strip()
         except Exception as exc:
+            if isinstance(exc, AIQuotaExhaustedError):
+                raise
             logger.warning("[InsightWriting] LLM failed: %s", exc)
             # Graceful degradation — build a minimal rule-based summary
             summary = self._fallback_summary(

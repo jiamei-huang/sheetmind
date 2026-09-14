@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from sheetmind.exceptions import AIQuotaExhaustedError
+
 from ..context import AnalysisContext, MultiTurnMode, RoutingHint
 from ..models.configs import ModelRole
 from .base import Skill
@@ -176,6 +178,8 @@ class RoutingClassificationSkill(Skill):
                 )
                 hint, confidence, reasoning = self._decide_route(operation_intent)
             except Exception as exc:
+                if isinstance(exc, AIQuotaExhaustedError):
+                    raise
                 reasoning += f" (LLM intent fallback failed: {exc})"
 
         return RoutingResult(
@@ -521,7 +525,6 @@ class RoutingClassificationSkill(Skill):
         response = await provider.complete(
             messages=[{"role": "user", "content": user_content}],
             system=system,
-            max_tokens=320,
             temperature=0.0,
             json_mode=True,
         )
